@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eXplore-CT-120-fdk-reconstruction"
+version = "0.1.0"
+description = "FDK cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = [
+    "numpy",
+    "torch",
+    "xmltodict",
+    "imageio",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+include = ["ct_core*"]
+
+[tool.setuptools]
+py-modules = ["fdk", "run_recon_on_vff_file"]
