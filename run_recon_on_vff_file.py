@@ -20,6 +20,7 @@ import time
 import os
 from pathlib import Path
 
+import cv2
 import torch
 import numpy as np
 import xmltodict
@@ -104,11 +105,10 @@ Examples:
     )
     parser.add_argument(
         '--total-angle',
-        type=float,
-        default=360.0,
-        help='Total angular coverage of the scan in degrees (default: 360.0). '
-             'Per-projection spacing is auto-computed as total_angle / N_projections.'
-             'Note: The scanner is typically set to have a raw proj spacing of 0.877273 so multiply that by N_proj'
+        default='determined',
+        help='Total angular coverage in degrees. Default: "determined" (reads IncrementAngle '
+             'and ViewCount from scan.xml to compute total angle automatically). '
+             'Specify a numeric value to override (e.g., --total-angle 360.0).'
     )
     parser.add_argument(
         '--projection-pattern',
@@ -158,6 +158,25 @@ Examples:
         '--display',
         action='store_true',
         help='Save reconstruction slice PNGs after completion'
+    )
+    parser.add_argument(
+        '--bilateral-filter',
+        action='store_true',
+        help='Apply bilateral filter to calibrated volume (edge-preserving denoising)'
+    )
+    parser.add_argument(
+        '--bilateral-sigma-spatial',
+        type=float,
+        default=1.5,
+        help='Bilateral filter spatial sigma in mm (default: 1.5). '
+             'Converted to voxels using --voxel-xy.'
+    )
+    parser.add_argument(
+        '--bilateral-sigma-range',
+        type=float,
+        default=50.0,
+        help='Bilateral filter intensity sigma in HU (default: 50.0). '
+             'Controls edge-preservation threshold.'
     )
 
     return parser.parse_args()
@@ -209,7 +228,10 @@ def main():
         else:
             args.projection_pattern = 'acq*'
 
-    # Auto-compute projection spacing from file count and total angle
+    # Parse XML early (needed for total angle determination and geometry)
+    header = xmltodict.parse(open(xml_file).read())
+
+    # Count projection files
     print(f"\nLoading projections (pattern: {args.projection_pattern})...")
     proj_paths = sorted(Path(data_folder).glob(args.projection_pattern))
     # Apply phase filter only to acquisition files (not sequential proj-* files)
@@ -218,8 +240,30 @@ def main():
     if n_files == 0:
         print(f"Error: No projections matching '{args.projection_pattern}' in {data_folder}")
         sys.exit(1)
-    projection_spacing = args.total_angle / n_files
-    print(f"  {n_files} projections, {args.total_angle} deg total -> spacing = {projection_spacing:.6f} deg")
+
+    # Determine total angle
+    if args.total_angle == 'determined':
+        try:
+            increment_angle = float(header['Series']['SeriesParams']['IncrementAngle'])
+            xml_view_count = int(header['Series']['SeriesParams']['ViewCount'])
+        except (KeyError, TypeError) as e:
+            print(f"Error: Could not read IncrementAngle/ViewCount from scan.xml: {e}")
+            print("Please specify --total-angle explicitly.")
+            sys.exit(1)
+
+        total_angle = increment_angle * n_files
+        print(f"  Determined from scan.xml: IncrementAngle = {increment_angle:.6f} deg, "
+              f"ViewCount = {xml_view_count}")
+        if xml_view_count != n_files:
+            print(f"  WARNING: ViewCount in scan.xml ({xml_view_count}) does not match "
+                  f"number of projection files found ({n_files})")
+        print(f"  Total angle = {increment_angle:.6f} x {n_files} projections = {total_angle:.4f} deg")
+    else:
+        total_angle = float(args.total_angle)
+        print(f"  User-specified total angle: {total_angle:.4f} deg")
+
+    projection_spacing = total_angle / n_files
+    print(f"  {n_files} projections, {total_angle:.4f} deg total -> spacing = {projection_spacing:.6f} deg")
 
     dataset = VFFDataset(
         data_folder,
@@ -233,7 +277,6 @@ def main():
     print(f"Loaded {len(angles)} projections, shape: {projections.shape}")
 
     # Define geometry from XML
-    header = xmltodict.parse(open(xml_file).read())
     source_to_isocenter = float(header['Series']['ObjectPosition'])
     detector_to_isocenter = float(header['Series']['DetectorPosition']) - source_to_isocenter
 
@@ -324,8 +367,34 @@ def main():
     vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
     vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
 
+    # Optional bilateral filter (edge-preserving denoising)
+    if args.bilateral_filter:
+        print("\n" + "=" * 60)
+        print("Applying bilateral filter (edge-preserving denoising)")
+        print("=" * 60)
+
+        sigma_spatial_vox = args.bilateral_sigma_spatial / args.voxel_xy
+        print(f"  Spatial sigma: {args.bilateral_sigma_spatial:.2f} mm "
+              f"= {sigma_spatial_vox:.1f} voxels")
+        print(f"  Range sigma: {args.bilateral_sigma_range:.1f} HU")
+
+        t_bf = time.time()
+        Nz_slices = vol_calibrated.shape[2]
+        for z in range(Nz_slices):
+            vol_calibrated[:, :, z] = cv2.bilateralFilter(
+                vol_calibrated[:, :, z],
+                d=-1,
+                sigmaColor=args.bilateral_sigma_range,
+                sigmaSpace=sigma_spatial_vox,
+            )
+        t_bf_end = time.time()
+
+        print(f"  Filtered range: [{vol_calibrated.min():.0f}, {vol_calibrated.max():.0f}] HU")
+        print(f"  Bilateral filter applied in {t_bf_end - t_bf:.1f}s "
+              f"({Nz_slices} slices)")
+
     # Save calibrated VFF using write_vff with transpose/y-flip (matching fdk.py:688)
-    cal_path = output_path + '_calibrated.vff'
+    cal_path = output_path + ('_bilateral.vff' if args.bilateral_filter else '.vff')
     vol_vff = vol_calibrated.astype(np.int16).transpose(2, 1, 0)[:, ::-1, :]
     write_vff(cal_path, {
         'bits': 16,

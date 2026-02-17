@@ -570,251 +570,36 @@ class FDKReconstructor:
 
     def convert_to_hu(self):
         """
-        Convert reconstructed volume to Hounsfield Units.
+        Convert reconstructed volume from true μ (mm⁻¹) to Hounsfield Units.
 
-        Two calibration modes:
-        1. Physical (physical_normalization=True): Output is true μ (mm⁻¹),
-           HU = (μ - μ_water) / μ_water × 1000 using literature μ_water.
-        2. Empirical (default): Uses percentile-based two-point calibration.
+        Uses physics-based conversion: HU = (μ - μ_water) / μ_water × 1000
 
-        Standard HU values for validation:
-            - Air: -1000 HU
-            - Water: 0 HU
-            - Soft tissue: 20-80 HU
-            - Bone: +1000 to +3000 HU
+        This produces approximate HU values. The final polynomial calibration
+        (from phantom insert measurements) is applied in run_recon_on_vff_file.py.
         """
         vol_np = self.reconstructed_volume.cpu().numpy() if hasattr(self.reconstructed_volume, 'cpu') else self.reconstructed_volume
         del self.reconstructed_volume
         torch.cuda.empty_cache()
 
         print("=" * 60)
-        if self.physical_normalization:
-            print("Physics-based HU Calibration (true μ output)")
-        else:
-            print("Empirical HU Calibration")
+        print("Physics-based HU Calibration (true μ output)")
         print("=" * 60)
 
-        # Step 1: Analyze reconstruction statistics
+        mu_water = MU_WATER_80KV  # 0.0184 mm⁻¹
         p1 = float(np.percentile(vol_np, 1))
-        p5 = float(np.percentile(vol_np, 5))
-        p50 = float(np.percentile(vol_np, 50))
         p85 = float(np.percentile(vol_np, 85))
-        p95 = float(np.percentile(vol_np, 95))
-        p99 = float(np.percentile(vol_np, 99))
-        vol_mean = float(vol_np.mean())
-        vol_std = float(vol_np.std())
+        print(f"  μ_water (literature, 80 kVp): {mu_water:.6f} mm⁻¹")
+        print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
 
-        print(f"Pre-HU volume statistics:")
-        print(f"  1st percentile (air):    {p1:.6f}")
-        print(f"  5th percentile:          {p5:.6f}")
-        print(f"  50th percentile (median):{p50:.6f}")
-        print(f"  85th percentile:         {p85:.6f}")
-        print(f"  95th percentile:         {p95:.6f}")
-        print(f"  99th percentile:         {p99:.6f}")
-        print(f"  Mean: {vol_mean:.6f}, Std: {vol_std:.6f}")
-
-        # Step 2: Apply HU conversion based on selected approach
-        if self.physical_normalization:
-            # Physics-based HU: output is already true μ (mm⁻¹)
-            # HU = (μ - μ_water) / μ_water × 1000
-            mu_water = MU_WATER_80KV  # 0.0184 mm⁻¹
-            print(f"\nPhysics-based HU Calibration:")
-            print(f"  μ_water (literature, 80 kVp): {mu_water:.6f} mm⁻¹")
-            print(f"  Expected: air ≈ 0.0 mm⁻¹, water ≈ {mu_water:.4f} mm⁻¹")
-            print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
-            vol_np = (vol_np - mu_water) / mu_water * 1000.0
-
-        else:
-            # Empirical calibration (original approach)
-            air_ref = p1
-            tissue_ref = p85
-            raw_spread = tissue_ref - air_ref
-
-            print(f"\nEmpirical Calibration parameters:")
-            print(f"  Air reference (1st percentile): {air_ref:.6f}")
-            print(f"  Tissue reference (85th percentile): {tissue_ref:.6f}")
-            print(f"  Literature μ_water: {MU_WATER_80KV:.6f} mm⁻¹")
-
-            if raw_spread > 1e-10:
-                # Two-point empirical calibration
-                scale_factor = raw_spread / MU_WATER_80KV
-                print(f"  Empirical scale factor: {scale_factor:.2f}")
-                print(f"  (tissue_ref - air_ref) = {raw_spread:.6f}")
-
-                # Apply HU formula using empirical references
-                # HU = (volume - tissue_ref) / raw_spread × 1000
-                vol_np = (vol_np - tissue_ref) / raw_spread * 1000.0
-            else:
-                # Fallback: Direct literature-based conversion
-                print("  Warning: Insufficient spread for empirical calibration.")
-                print("  Using direct literature μ_water conversion.")
-                vol_np = (vol_np - MU_WATER_80KV) / MU_WATER_80KV * 1000.0
-
-        # Step 3: Clamp to valid CT HU range
-        # Standard CT range: -1024 (air) to +3071 (dense bone/metal)
-        # Extended for metal artifacts: up to 4095
+        vol_np = (vol_np - mu_water) / mu_water * 1000.0
         vol_np = np.clip(vol_np, -1024, 4095)
 
-        # Step 4: Report and validate results
-        vol_min = float(vol_np.min())
-        vol_max = float(vol_np.max())
-        vol_mean = float(vol_np.mean())
-        vol_std = float(vol_np.std())
         hu_p1 = float(np.percentile(vol_np, 1))
-        hu_p50 = float(np.percentile(vol_np, 50))
-        hu_p99 = float(np.percentile(vol_np, 99))
-
-        print(f"\nHU Calibration Validation:")
-        print(f"  1st percentile (expect ~-1000 for air): {hu_p1:.0f} HU")
-        print(f"  50th percentile: {hu_p50:.0f} HU")
-        print(f"  99th percentile: {hu_p99:.0f} HU")
-
-        print(f"\nHU conversion complete:")
-        print(f"  Range: [{vol_min:.0f}, {vol_max:.0f}] HU")
-        print(f"  Mean: {vol_mean:.0f} HU, Std: {vol_std:.0f} HU")
-
-        # Validation warnings
-        if abs(hu_p1 - (-1000)) > 200:
-            print(f"\n  WARNING: Air regions read {hu_p1:.0f} HU (expected ~-1000 HU)")
-            print(f"    This may indicate preprocessing issues or incorrect flat-field.")
-        else:
-            print(f"\n  Air regions calibrated correctly ({hu_p1:.0f} HU)")
-
-        # Check for reasonable phantom values
-        if vol_mean > -700:
-            print(f"  Note: High mean HU ({vol_mean:.0f}). Verify phantom content.")
-        elif vol_mean < -980:
-            print(f"  Note: Very low mean HU ({vol_mean:.0f}). Volume may be mostly air.")
-
-        self.reconstructed_volume = vol_np
+        print(f"  Post-conversion P1 (expect ~-1000 for air): {hu_p1:.0f} HU")
+        print(f"  Range: [{float(vol_np.min()):.0f}, {float(vol_np.max()):.0f}] HU")
         print("=" * 60)
 
-    def save_volume(self, filename=None, data_type=np.dtype('>h'), title="FDK Reconstruction",
-                   subject="CT Reconstruction", water_hu=0.0, air_hu=-1000.0, bone_hu=1000.0):
-        """
-        Save the reconstructed volume as a VFF file.
-
-        Parameters:
-        - filename: string, output filename (if None, auto-generated from folder_name)
-        - data_type: numpy dtype, data type for the output (default: '>h' for 16-bit big-endian)
-        - title: string, title for the VFF file
-        - subject: string, subject description for the VFF file
-        - water_hu: float, Hounsfield Unit value for water calibration
-        - air_hu: float, Hounsfield Unit value for air calibration
-        - bone_hu: float, Hounsfield Unit value for bone calibration
-        """
-        if filename is None:
-            filename = self.folder_name+".vff"
-
-        # Ensure the directory exists (only if filename includes a directory path)
-        dirname = os.path.dirname(filename)
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
-
-        # Convert volume to CPU and numpy if it's still on GPU
-        if isinstance(self.reconstructed_volume, torch.Tensor):
-            volume_np = self.reconstructed_volume.cpu().numpy()
-        else:
-            volume_np = self.reconstructed_volume
-
-        # Get volume dimensions (VFF format expects x, y, z order)
-        Nx, Ny, Nz = volume_np.shape
-
-        # Convert data type if necessary
-        if data_type == np.dtype('>h'):  # 16-bit
-            # Scale to 16-bit range if needed
-            if volume_np.max() <= 1.0:  # Normalized data
-                volume_scaled = (volume_np * 32767).astype(np.int16)
-            else:
-                volume_scaled = volume_np.astype(np.int16)
-            bits = 16
-        elif data_type == np.dtype('>b'):  # 8-bit
-            # Scale to 8-bit range if needed
-            if volume_np.max() <= 1.0:  # Normalized data
-                volume_scaled = (volume_np * 127).astype(np.int8)
-            else:
-                volume_scaled = volume_np.astype(np.int8)
-            bits = 8
-        else:
-            volume_scaled = volume_np.astype(data_type)
-            bits = data_type.itemsize * 8
-
-        # Convert to big-endian format and reshape to (z, y, x) for VFF
-        # Flip y-axis to match VFF coordinate system convention
-        volume_vff = volume_scaled.transpose(2, 1, 0)[:, ::-1, :].astype(data_type)
-
-        # Calculate statistics for the volume
-        vol_min = float(volume_np.min())
-        vol_max = float(volume_np.max())
-
-        # Calculate angle increment if we have multiple angles
-        angle_increment = 0.0
-        if len(self.angles) > 1:
-            angle_increment = float(torch.diff(self.angles).mean().item()) * 180.0 / np.pi  # Convert to degrees
-
-        # Get current timestamp
-        from datetime import datetime
-        current_time = datetime.now().isoformat()
-
-        # Calculate element size (assuming isotropic pixels, convert to appropriate units)
-        elementsize = self.dx / 1000.0  # Convert from mm to meters if needed, or keep as mm
-
-        # Create VFF header with comprehensive information
-        header_lines = [
-            "ncaa",
-            f"rank=3;",
-            f"type=raster;",
-            f"modality=CT;",
-            f"size={Nx} {Ny} {Nz};",
-            f"origin={self.vol_origin[0]:.4f} {self.vol_origin[1]:.4f} {self.vol_origin[2]:.4f};",
-            f"y_bin=1;",
-            f"z_bin=1;",
-            f"bands=1;",
-            f"bits={bits};",
-            f"format=slice;",
-            f"title={title};",
-            f"subject={subject};",
-            f"date={current_time};",
-            f"center_of_rotation={self.central_pixel_a * self.da:.6f};",
-            f"central_slice={Nz//2:.6f};",
-            f"rfan_y={self.R_s:.6f};",
-            f"rfan_z={self.R_s:.6f};",
-            f"angle_increment={angle_increment:.6f};",
-            f"reverse_order=no;",
-            f"min={vol_min:.6f};",
-            f"max={vol_max:.6f};",
-            f"spacing={self.dx:.2f} {self.dx:.2f} {self.dz:.2f};",
-            f"elementsize={elementsize:.6f};",
-            f"water={water_hu:.6f};",
-            f"air={air_hu:.6f};",
-            f"boneHU={bone_hu:.0f};",
-            f"recon_sysid={torch.cuda.get_device_name() if torch.cuda.is_available() else 'CPU'};",
-            f"rawsize={volume_vff.nbytes};",
-            ""
-        ]
-
-        # Write VFF file
-        with open(filename, 'wb') as f:
-            # Write header
-            for line in header_lines:
-                f.write(line.encode('latin-1') + b'\n')
-
-            # Write form feed character to separate header from data
-            f.write(b'\f')
-
-            # Write binary data
-            f.write(volume_vff.tobytes())
-
-        print(f"Volume saved as VFF file: {filename}")
-        print(f"Volume dimensions: {Nx} x {Ny} x {Nz}")
-        print(f"Voxel spacing: {self.dx:.2f} x {self.dx:.2f} x {self.dz:.2f} mm")
-        print(f"Volume origin: ({self.vol_origin[0]:.2f}, {self.vol_origin[1]:.2f}, {self.vol_origin[2]:.2f}) mm")
-        print(f"Data range: [{vol_min:.3f}, {vol_max:.3f}]")
-        print(f"Data type: {data_type}, {bits} bits per voxel")
-        print(f"File size: {os.path.getsize(filename) / (1024**2):.2f} MB")
-        if len(self.angles) > 1:
-            print(f"Angle increment: {angle_increment:.3f} degrees")
-            print(f"Total angles: {len(self.angles)}")
+        self.reconstructed_volume = vol_np
 
     def display_volume(self):
 
@@ -885,11 +670,6 @@ class FDKReconstructor:
         if self.output_hu:
             print("\nConverting to Hounsfield Units...")
             self.convert_to_hu()
-
-        # Step 4: Save results
-        print("\nSaving reconstruction...")
-        self.save_volume()
-        print("Reconstruction saved.")
 
         if display_volume == True:
             self.display_volume()
