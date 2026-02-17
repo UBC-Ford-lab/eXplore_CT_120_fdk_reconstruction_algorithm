@@ -134,19 +134,19 @@ Examples:
         '--voxel-xy',
         type=float,
         default=0.075,
-        help='Reconstruction voxel size in the xy plane in mm (default: 0.085)'
+        help='Reconstruction voxel size in the xy plane in mm (default: 0.075)'
     )
     parser.add_argument(
         '--voxel-z',
         type=float,
-        default=0.4,
-        help='Reconstruction voxel size in the z plane in mm (default: 0.4)'
+        default=0.075,
+        help='Reconstruction voxel size in the z plane in mm (default: 0.075)'
     )
     parser.add_argument(
         '--fov-xy',
         type=float,
-        default=93.5,
-        help='Field of view in the xy plane in mm (default: 93.5)'
+        default=45,
+        help='Field of view in the xy plane in mm (default: 45 (for most mice scans), select 94 for most phantom scanner studies)'
     )
     parser.add_argument(
         '--fov-z',
