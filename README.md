@@ -82,15 +82,18 @@ python -m reconstruction.run_recon_on_vff_file data/scans/Scan_1681 \
 | `data_folder` | *(required)* | Path to folder containing VFF projections and `scan.xml` |
 | `--scan-folder` | auto-detected | Path to original scan folder with `bright.vff` / `dark.vff` |
 | `--output` | auto-generated | Output VFF filename |
-| `--total-angle` | `360.0` | Total angular coverage in degrees |
+| `--total-angle` | `determined` | Total angular coverage in degrees. By default, reads `IncrementAngle` and `ViewCount` from `scan.xml` and computes the total automatically. Specify a numeric value to override. |
 | `--projection-pattern` | auto-detect | Glob pattern for projection files (`proj-*.vff` or `acq*`) |
 | `--filter-type` | `hamming` | Ramp filter window: `ramp`, `shepp-logan`, `cosine`, `hamming` |
 | `--filter-cutoff` | `match` | Bandwidth as fraction of Nyquist, or `match` to auto-compute `da/dx` |
 | `--voxel-xy` | `0.075` | Reconstruction voxel size in the xy plane (mm) |
 | `--voxel-z` | `0.075` | Reconstruction voxel size in z (mm) |
-| `--fov-xy` | `94` | Field of view in xy (mm) |
+| `--fov-xy` | `45` | Field of view in xy (mm). Use `94` for most phantom scanner studies. |
 | `--fov-z` | `120.0` | Field of view in z (mm) |
 | `--display` | off | Save reconstruction slice PNGs |
+| `--bilateral-filter` | off | Apply edge-preserving bilateral filter after HU calibration |
+| `--bilateral-sigma-spatial` | `1.5` | Bilateral filter spatial sigma in mm (converted to voxels internally) |
+| `--bilateral-sigma-range` | `50.0` | Bilateral filter intensity sigma in HU (edge-preservation threshold) |
 
 ### Python API
 

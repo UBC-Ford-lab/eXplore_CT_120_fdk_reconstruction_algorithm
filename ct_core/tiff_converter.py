@@ -4,6 +4,7 @@
 import os
 import numpy as np
 import imageio
+from tqdm import tqdm
 
 def save_vff_to_tiff(vff_data, target_directory=None, filename=None, verbose=True, compute_average_img=True):
     '''
@@ -25,12 +26,10 @@ def save_vff_to_tiff(vff_data, target_directory=None, filename=None, verbose=Tru
 
     # Create the TIFF files
     if vff_data.ndim == 3:
-        for slice_index in range(len(vff_data)):
-            # Save the VFF data as a TIFF image
+        slices = tqdm(range(len(vff_data)), desc='Saving TIFF slices',
+                      unit='slice', disable=not verbose)
+        for slice_index in slices:
             imageio.imwrite(os.path.join(target_directory, f'slice_{slice_index}.tiff'), vff_data[slice_index])
-
-            if verbose:
-                print(f"Saved slice {slice_index} as TIFF image")
 
     elif vff_data.ndim == 2:
         # Save the VFF data as a TIFF image
@@ -70,7 +69,10 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
-    from .vff_io import read_vff
+    try:
+        from .vff_io import read_vff
+    except ImportError:
+        from vff_io import read_vff
     header, data = read_vff(filename=args.input, verbose=not args.quiet)
 
     outdir = args.outdir

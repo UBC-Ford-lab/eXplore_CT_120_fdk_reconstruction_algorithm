@@ -27,6 +27,8 @@ dependencies = [
     "xmltodict",
     "imageio",
     "matplotlib",
+    "cv2",
+    "tqdm",
 ]
 
 [project.urls]
