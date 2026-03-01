@@ -12,11 +12,12 @@ This package implements the complete reconstruction pipeline for cone-beam micro
 
 1. **Flat-field correction** -- normalizes detector response using bright/dark field references
 2. **Log transformation** -- converts transmission to line integrals with soft-clipping to prevent Gibbs ringing
-3. **Cone-beam weighting** -- applies distance-based weighting for cone-beam geometry
-4. **Ramp filtering** -- frequency-domain filtering with selectable windows (Ram-Lak, Shepp-Logan, Cosine, Hamming)
-5. **Parker weighting** -- short-scan redundancy correction (automatically skipped for full 360-degree scans)
-6. **Backprojection** -- voxel-driven cone-beam backprojection with GPU-accelerated bilinear interpolation
-7. **HU calibration** -- physics-based conversion to Hounsfield Units with optional polynomial phantom calibration
+3. **Metal artifact reduction** *(optional)* -- sinogram-domain interpolation of metal-corrupted pixels (LI-MAR)
+4. **Cone-beam weighting** -- applies distance-based weighting for cone-beam geometry
+5. **Ramp filtering** -- frequency-domain filtering with selectable windows (Ram-Lak, Shepp-Logan, Cosine, Hamming)
+6. **Parker weighting** -- short-scan redundancy correction (automatically skipped for full 360-degree scans)
+7. **Backprojection** -- voxel-driven cone-beam backprojection with GPU-accelerated bilinear interpolation
+8. **HU calibration** -- physics-based conversion to Hounsfield Units with optional polynomial phantom calibration
 
 All preprocessing, filtering, and backprojection are GPU-accelerated with automatic memory management (dynamic chunk sizing, CPU fallback for large volumes).
 
@@ -94,6 +95,8 @@ python -m reconstruction.run_recon_on_vff_file data/scans/Scan_1681 \
 | `--bilateral-filter` | off | Apply edge-preserving bilateral filter after HU calibration |
 | `--bilateral-sigma-spatial` | `1.5` | Bilateral filter spatial sigma in mm (converted to voxels internally) |
 | `--bilateral-sigma-range` | `50.0` | Bilateral filter intensity sigma in HU (edge-preservation threshold) |
+| `--metal-artifact-reduction` | off | Enable sinogram-domain metal artifact reduction (LI-MAR) |
+| `--mar-threshold` | `6.0` | Line integral threshold for metal pixel detection. Lower = more aggressive (4.0), higher = more conservative (8.0) |
 
 ### Python API
 
@@ -166,7 +169,10 @@ This implementation is tailored for the **GE eXplore CT 120** micro-CT scanner:
 - VFF file format for projections and reconstructed volumes
 - `scan.xml` metadata (source/detector positions, angular offsets, detector spacing)
 - Bright/dark field calibration files (`bright.vff`, `dark.vff`)
-- Typical scan parameters: ~410 projections over 360 degrees, 0.05 mm detector pixel pitch
+- Typical scan parameters: ~220 projections over ~193 degrees (half-scan), 0.028 mm detector pixel pitch
+- Per-projection gantry angles read from VFF headers (`gantryPosition`), with fallback to synthetic angles from `scan.xml`
+
+**COR convention:** The stored VFF projections are already COR-centered by the acquisition software. The `CentreOfRotation` value in `scan.xml` refers to the raw detector coordinate and is used for cone-beam and Parker weighting, but the backprojection uses zero detector offset (COR at detector center).
 
 The reconstruction algorithm itself (FDK) is general-purpose. Adapting to other cone-beam CT scanners requires only changing the geometry parameters and file I/O.
 

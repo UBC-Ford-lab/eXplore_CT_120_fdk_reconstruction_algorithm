@@ -178,6 +178,21 @@ Examples:
         help='Bilateral filter intensity sigma in HU (default: 50.0). '
              'Controls edge-preservation threshold.'
     )
+    parser.add_argument(
+        '--metal-artifact-reduction',
+        action='store_true',
+        help='Enable sinogram-domain metal artifact reduction (LI-MAR). '
+             'Detects and interpolates metal-corrupted pixels before '
+             'cone-beam weighting and ramp filtering.'
+    )
+    parser.add_argument(
+        '--mar-threshold',
+        type=float,
+        default=6.0,
+        help='Line integral threshold for metal pixel detection (default: 6.0). '
+             'Pixels with -log(T) > threshold are treated as metal-corrupted. '
+             'Lower = more aggressive (4.0), higher = more conservative (8.0).'
+    )
 
     return parser.parse_args()
 
@@ -345,6 +360,8 @@ def main():
         filter_cutoff=filter_cutoff,
         filter_type=args.filter_type,
         parker_weighting=True,
+        metal_artifact_reduction=args.metal_artifact_reduction,
+        mar_threshold=args.mar_threshold,
     )
 
     # Run full reconstruction

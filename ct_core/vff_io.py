@@ -213,14 +213,21 @@ class VFFDataset:
         if tensor_projections:
             self.projections = torch.from_numpy(np.asarray(self.projections, dtype=np.float32))
 
-        # Prepare angles in radians
-        angles = torch.linspace(
-            self.starting_angle_offset,
-            self.starting_angle_offset + self.imaging_angle,
-            steps=self.num_projections,
-            dtype=torch.float32
-        ) % 360
-        self.angles_rad = torch.deg2rad(angles)
+        # Prepare angles in radians — prefer actual gantry positions over synthetic linspace
+        gantry = torch.from_numpy(self.projection_angles)
+        gantry_range = float(gantry.max() - gantry.min())
+        if gantry_range > 1.0:
+            # Gantry positions decrease during acquisition; invert to get increasing angles
+            relative = gantry[0] - gantry
+            angles_deg = (self.starting_angle_offset + relative) % 360
+            print(f"Using actual gantry angles (range {gantry_range:.2f}°)")
+        else:
+            # Fallback: synthetic angles with arange (not linspace — avoids off-by-one)
+            step = self.imaging_angle / self.num_projections
+            angles_deg = (torch.arange(self.num_projections, dtype=torch.float32) * step
+                          + self.starting_angle_offset) % 360
+            print(f"Gantry angles unavailable, using synthetic arange (step={step:.4f}°)")
+        self.angles_rad = torch.deg2rad(angles_deg)
 
     def _read_vff(self, path: Path):
         # Use same header parsing as standalone functions

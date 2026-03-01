@@ -53,6 +53,74 @@ def _build_filter_kernel(N_a, da, filter_cutoff, filter_type,
         kernel = kernel / kernel.max()
     return kernel, f_cutoff
 
+def _interpolate_metal_pixels(sinogram_chunk, mask):
+    """Replace metal-corrupted sinogram pixels by linear interpolation along detector rows.
+
+    For each detector row at each projection angle, connected runs of masked
+    (metal-affected) pixels are replaced by linearly interpolating between
+    the nearest unmasked neighbours on each side.  If a run extends to the
+    edge of the detector (no neighbour on one side), constant extrapolation
+    from the other side is used.
+
+    Operates in-place on sinogram_chunk to avoid doubling GPU memory.
+
+    Args:
+        sinogram_chunk: Tensor of shape (chunk_len, N_b, N_a) — line integrals.
+        mask: Boolean tensor of same shape — True where metal-corrupted.
+    """
+    chunk_np = sinogram_chunk.cpu().numpy()
+    mask_np = mask.cpu().numpy()
+    n_interp_total = 0
+
+    for i in range(chunk_np.shape[0]):          # projection angle
+        for j in range(chunk_np.shape[1]):      # detector row
+            row_mask = mask_np[i, j]            # (N_a,)
+            if not row_mask.any():
+                continue
+
+            row = chunk_np[i, j]                # (N_a,)
+            N_a = len(row)
+
+            # Walk through connected runs of masked pixels
+            k = 0
+            while k < N_a:
+                if not row_mask[k]:
+                    k += 1
+                    continue
+
+                # Start of a masked run
+                run_start = k
+                while k < N_a and row_mask[k]:
+                    k += 1
+                run_end = k  # one past last masked pixel
+
+                n_interp_total += run_end - run_start
+
+                # Find boundary values
+                left_val = row[run_start - 1] if run_start > 0 else None
+                right_val = row[run_end] if run_end < N_a else None
+
+                if left_val is not None and right_val is not None:
+                    # Linear interpolation between boundaries
+                    span = run_end - run_start + 2  # include both boundaries
+                    interp = np.linspace(left_val, right_val, span)
+                    row[run_start:run_end] = interp[1:-1]
+                elif left_val is not None:
+                    # Run extends to right edge — constant extrapolation
+                    row[run_start:run_end] = left_val
+                elif right_val is not None:
+                    # Run extends to left edge — constant extrapolation
+                    row[run_start:run_end] = right_val
+                # else: entire row is masked — leave unchanged
+
+    if n_interp_total > 0:
+        print(f"    MAR: interpolated {n_interp_total} pixels "
+              f"across {chunk_np.shape[0]} projections")
+
+    # Copy corrected data back into the existing GPU tensor (no new allocation)
+    sinogram_chunk.copy_(torch.from_numpy(chunk_np))
+
+
 class FDKReconstructor:
     def __init__(self, projections, angles, geometry, source_locations, folder_name,
                  mu_water=None, output_hu=False,
@@ -60,7 +128,8 @@ class FDKReconstructor:
                  clamp_mode="none", soft_clip_transmission=True,
                  soft_clip_sharpness=50.0, upper_clamp=True, upper_clamp_value=1.05,
                  physical_normalization=False, filter_cutoff=1.0,
-                 filter_type='cosine', parker_weighting=True):
+                 filter_type='cosine', parker_weighting=True,
+                 metal_artifact_reduction=False, mar_threshold=6.0):
         """
         projections: Tensor of shape (N_angles, N_b, N_a) in float32.
         angles: Tensor of shape (N_angles,) in radians.
@@ -106,6 +175,14 @@ class FDKReconstructor:
             for scans covering less than 360°. Automatically skipped for full-circle scans.
             Corrects intensity shading artifacts caused by double-counted rays in short scans.
             (default: True)
+        metal_artifact_reduction: bool, if True, detect and interpolate metal-corrupted
+            sinogram pixels before cone-beam weighting/ramp filtering. Reduces dark
+            streak artifacts behind highly attenuating objects (metal, dense bone).
+            (default: False)
+        mar_threshold: float, line integral threshold for metal pixel detection.
+            Pixels with p = -log(T) > threshold are considered metal-corrupted.
+            Typical values: 4.0 (aggressive), 6.0 (default), 8.0 (conservative).
+            (default: 6.0)
         """
         self.projections = projections # (N_angles, N_b, N_a)
         self.angles = angles.to(device)
@@ -137,6 +214,8 @@ class FDKReconstructor:
         self.filter_cutoff = filter_cutoff
         self.filter_type = filter_type
         self.parker_weighting = parker_weighting
+        self.metal_artifact_reduction = metal_artifact_reduction
+        self.mar_threshold = mar_threshold
 
         # Determine detector dimensions and center indices
         self.N_angles, self.N_b, self.N_a = self.projections.shape
@@ -286,6 +365,8 @@ class FDKReconstructor:
         print(f"Filter: {self.filter_type}, cutoff: {self.filter_cutoff:.2f} × f_Nyquist = {float(f_cutoff):.4f} mm⁻¹")
         if self.physical_normalization:
             print(f"Ramp filter κ (filter_kernel.max) = {float(filter_kernel.max()):.4f} mm⁻¹")
+        if self.metal_artifact_reduction:
+            print(f"Metal artifact reduction: enabled (threshold={self.mar_threshold:.1f})")
 
         # Flat-field constants (only if preprocessing)
         if do_preprocess:
@@ -334,8 +415,10 @@ class FDKReconstructor:
         persistent = 2 * bytes_per_proj  # cone_weight is (N_b, N_a)
         if do_preprocess:
             persistent += 2 * bytes_per_proj  # dark_gpu + I0_gpu (N_b, N_a each)
-        # Peak per-chunk multiplier: chunk + T + FFT complex + margin
-        peak_multiplier = 4 if do_preprocess else 3
+        # Peak per-chunk multiplier: accounts for real→complex→multiply→inverse FFT
+        # pipeline where input + output coexist during each step, plus cuFFT
+        # workspace memory and PyTorch caching allocator holding freed blocks.
+        peak_multiplier = 7 if do_preprocess else 6
         chunk_size = int((budget - persistent) // (peak_multiplier * bytes_per_proj))
         chunk_size = max(1, min(chunk_size, self.N_angles))
 
@@ -373,6 +456,13 @@ class FDKReconstructor:
                 elif self.clamp_mode == "hard":
                     chunk = torch.clamp(chunk, min=0.0)
                 del T
+
+            # 1b. Metal artifact reduction: interpolate metal-corrupted pixels
+            if self.metal_artifact_reduction:
+                metal_mask = chunk > self.mar_threshold
+                if metal_mask.any():
+                    _interpolate_metal_pixels(chunk, metal_mask)
+                del metal_mask
 
             # 2. Cone-beam weighting
             chunk = chunk * cone_weight  # broadcasts over chunk dim
@@ -478,8 +568,11 @@ class FDKReconstructor:
             X_2d, Y_2d = torch.meshgrid(self.x, self.y, indexing='ij')  # (Nx, Ny)
 
             # Pre-compute detector offset constants
-            a_offset = (self.N_a / 2 - self.central_pixel_a) * self.da
-            b_offset = (self.N_b / 2 - self.central_pixel_b) * self.db
+            # NOTE: VFF projections are already COR-centered by the acquisition
+            # software, so the XML CentreOfRotation refers to the raw detector
+            # position, not the stored data. Use zero offset (COR at detector center).
+            a_offset = 0.0
+            b_offset = 0.0
             a_scale = 1.0 / (self.a_length / 2)
             b_scale = 1.0 / (self.b_length / 2)
 
