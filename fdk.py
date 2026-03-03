@@ -129,7 +129,8 @@ class FDKReconstructor:
                  soft_clip_sharpness=50.0, upper_clamp=True, upper_clamp_value=1.05,
                  physical_normalization=False, filter_cutoff=1.0,
                  filter_type='cosine', parker_weighting=True,
-                 metal_artifact_reduction=False, mar_threshold=6.0):
+                 metal_artifact_reduction=False, mar_threshold=6.0,
+                 ring_correction=False, ring_median_width=51):
         """
         projections: Tensor of shape (N_angles, N_b, N_a) in float32.
         angles: Tensor of shape (N_angles,) in radians.
@@ -183,6 +184,14 @@ class FDKReconstructor:
             Pixels with p = -log(T) > threshold are considered metal-corrupted.
             Typical values: 4.0 (aggressive), 6.0 (default), 8.0 (conservative).
             (default: 6.0)
+        ring_correction: bool, if True, apply sinogram-space ring artifact correction
+            after log transform and before cone-beam weighting. Removes fixed-pattern
+            detector column offsets that cause concentric ring artifacts.
+            (default: False)
+        ring_median_width: int, median filter kernel width for ring correction (must be odd).
+            Controls the spatial scale of features preserved in the column profile.
+            Larger values remove broader ring features but risk removing real structure.
+            (default: 51)
         """
         self.projections = projections # (N_angles, N_b, N_a)
         self.angles = angles.to(device)
@@ -216,6 +225,8 @@ class FDKReconstructor:
         self.parker_weighting = parker_weighting
         self.metal_artifact_reduction = metal_artifact_reduction
         self.mar_threshold = mar_threshold
+        self.ring_correction = ring_correction
+        self.ring_median_width = ring_median_width
 
         # Determine detector dimensions and center indices
         self.N_angles, self.N_b, self.N_a = self.projections.shape
@@ -277,7 +288,8 @@ class FDKReconstructor:
 
         # Fan angle for each detector column
         col_idx = torch.arange(self.N_a, dtype=torch.float32)
-        gamma = torch.arctan(((col_idx - self.central_pixel_a) * self.da) / self.SDD)  # (N_a,)
+        # Use detector center (VFF projections are already COR-centered)
+        gamma = torch.arctan(((col_idx - self.N_a / 2) * self.da) / self.SDD)  # (N_a,)
 
         # Max half-fan angle
         gamma_m = float(torch.arctan(torch.tensor((self.N_a / 2) * self.da / self.SDD)))
@@ -352,8 +364,9 @@ class FDKReconstructor:
         # --- Pre-compute constants on GPU (before loop) ---
 
         # Cone-beam weight: w(a,b) = SDD / sqrt(SDD² + a² + b²)
-        a_coords = (torch.arange(self.N_a, device=device) - self.central_pixel_a) * self.da
-        b_coords = (torch.arange(self.N_b, device=device) - self.central_pixel_b) * self.db
+        # Use detector center (VFF projections are already COR-centered)
+        a_coords = (torch.arange(self.N_a, device=device) - self.N_a / 2) * self.da
+        b_coords = (torch.arange(self.N_b, device=device) - self.N_b / 2) * self.db
         B, A = torch.meshgrid(b_coords, a_coords, indexing='ij')
         cone_weight = self.SDD / (torch.sqrt(self.SDD**2 + A**2 + B**2) + 1e-8)  # (N_b, N_a)
 
@@ -367,6 +380,8 @@ class FDKReconstructor:
             print(f"Ramp filter κ (filter_kernel.max) = {float(filter_kernel.max()):.4f} mm⁻¹")
         if self.metal_artifact_reduction:
             print(f"Metal artifact reduction: enabled (threshold={self.mar_threshold:.1f})")
+        if self.ring_correction:
+            print(f"Ring correction: enabled (median width={self.ring_median_width})")
 
         # Flat-field constants (only if preprocessing)
         if do_preprocess:
@@ -407,17 +422,11 @@ class FDKReconstructor:
                 )
 
         # --- Dynamic chunk sizing ---
-        # Budget-based: measure free GPU memory and compute how many projections
-        # fit per chunk given the persistent + per-chunk allocations.
         budget = self._gpu_free_bytes()
         bytes_per_proj = self.N_b * self.N_a * 4  # one float32 projection
-        # Persistent GPU tensors: cone_weight + filter_kernel (+ dark_gpu if HU)
-        persistent = 2 * bytes_per_proj  # cone_weight is (N_b, N_a)
+        persistent = 2 * bytes_per_proj  # cone_weight + filter_kernel
         if do_preprocess:
-            persistent += 2 * bytes_per_proj  # dark_gpu + I0_gpu (N_b, N_a each)
-        # Peak per-chunk multiplier: accounts for real→complex→multiply→inverse FFT
-        # pipeline where input + output coexist during each step, plus cuFFT
-        # workspace memory and PyTorch caching allocator holding freed blocks.
+            persistent += 2 * bytes_per_proj  # dark_gpu + I0_gpu
         peak_multiplier = 7 if do_preprocess else 6
         chunk_size = int((budget - persistent) // (peak_multiplier * bytes_per_proj))
         chunk_size = max(1, min(chunk_size, self.N_angles))
@@ -426,20 +435,23 @@ class FDKReconstructor:
             print(f"  GPU memory: CPU mode — no GPU constraint")
         else:
             total_mem = torch.cuda.mem_get_info()[1]
-            free_mem = budget / 0.85  # undo safety to show raw free
+            free_mem = budget / 0.85
             print(f"  GPU memory: {total_mem / 2**30:.2f} GiB total, "
                   f"{free_mem / 2**30:.2f} GiB free → budget {budget / 2**30:.2f} GiB")
-        print(f"  Preprocessing: chunk_size={chunk_size}")
-        for start in range(0, self.N_angles, chunk_size):
-            end = min(start + chunk_size, self.N_angles)
 
-            # One CPU→GPU transfer
-            chunk = torch.from_numpy(
-                np.array(self.projections[start:end], dtype=np.float32)
-            ).to(device)  # (chunk, N_b, N_a)
+        # When ring correction is enabled, split into two passes:
+        #   Pass 1: flat-field + log + MAR → sinogram on CPU
+        #   Ring correction on full sinogram (needs all angles)
+        #   Pass 2: cone-beam weighting + ramp filter + Parker
+        if self.ring_correction and do_preprocess:
+            # --- Pass 1: flat-field + log + MAR ---
+            print(f"  Pass 1 (flat-field + log): chunk_size={chunk_size}")
+            for start in range(0, self.N_angles, chunk_size):
+                end = min(start + chunk_size, self.N_angles)
+                chunk = torch.from_numpy(
+                    np.array(self.projections[start:end], dtype=np.float32)
+                ).to(device)
 
-            # 1. Flat-field + log (only for HU path)
-            if do_preprocess:
                 T = (chunk - dark_gpu) / (I0_gpu + epsilon)
                 if self.soft_clip_transmission:
                     T = epsilon + F.softplus(T - epsilon, beta=sharpness, threshold=20.0)
@@ -457,35 +469,108 @@ class FDKReconstructor:
                     chunk = torch.clamp(chunk, min=0.0)
                 del T
 
-            # 1b. Metal artifact reduction: interpolate metal-corrupted pixels
-            if self.metal_artifact_reduction:
-                metal_mask = chunk > self.mar_threshold
-                if metal_mask.any():
-                    _interpolate_metal_pixels(chunk, metal_mask)
-                del metal_mask
+                if self.metal_artifact_reduction:
+                    metal_mask = chunk > self.mar_threshold
+                    if metal_mask.any():
+                        _interpolate_metal_pixels(chunk, metal_mask)
+                    del metal_mask
 
-            # 2. Cone-beam weighting
-            chunk = chunk * cone_weight  # broadcasts over chunk dim
+                float_projections[start:end] = chunk.cpu().numpy()
 
-            # 3. Ramp filter (FFT → multiply → IFFT)
-            chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
-            chunk = chunk * filter_kernel
-            chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
+            # Free flat-field GPU memory before ring correction
+            del dark_gpu, I0_gpu
+            torch.cuda.empty_cache()
 
-            # 3b. Parker (short-scan) redundancy weighting — applied AFTER
-            # ramp filter to avoid streak artifacts from sharp weight transitions.
-            # The weight corrects angular redundancy and belongs in the
-            # backprojection integral, not the detector-direction filtering.
-            if parker_weight_gpu is not None:
-                # parker_weight_gpu is (N_angles, N_a); chunk is (chunk_len, N_b, N_a)
-                chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
+            # --- Ring correction on full sinogram ---
+            from scipy.ndimage import median_filter
+            print(f"  Ring correction: computing column profile...")
+            # Mean sinogram across all projection angles: (N_b, N_a)
+            mean_sino = float_projections.mean(axis=0)
+            # Smooth column profile with 1D median filter along detector columns
+            smoothed = median_filter(mean_sino, size=(1, self.ring_median_width))
+            # Ring artifact = difference between mean and smoothed
+            ring_artifact = mean_sino - smoothed
+            # Subtract from every projection (in-place)
+            float_projections -= ring_artifact[np.newaxis, :, :]
+            ring_mag = np.abs(ring_artifact).max()
+            print(f"  Ring correction applied: max correction = {ring_mag:.6f}")
+            del mean_sino, smoothed, ring_artifact
 
-            # One GPU→CPU transfer
-            result_np = chunk.cpu().numpy()
-            if do_preprocess:
-                float_projections[start:end] = result_np
-            else:
-                self.projections[start:end] = result_np
+            # --- Pass 2: cone-beam weighting + ramp filter + Parker ---
+            # Re-measure GPU budget (flat-field tensors freed)
+            budget = self._gpu_free_bytes()
+            persistent = 2 * bytes_per_proj  # cone_weight + filter_kernel
+            chunk_size = int((budget - persistent) // (6 * bytes_per_proj))
+            chunk_size = max(1, min(chunk_size, self.N_angles))
+            print(f"  Pass 2 (weighting + filtering): chunk_size={chunk_size}")
+            for start in range(0, self.N_angles, chunk_size):
+                end = min(start + chunk_size, self.N_angles)
+                chunk = torch.from_numpy(
+                    float_projections[start:end]
+                ).to(device)
+
+                chunk = chunk * cone_weight
+                chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
+                chunk = chunk * filter_kernel
+                chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
+                if parker_weight_gpu is not None:
+                    chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
+
+                float_projections[start:end] = chunk.cpu().numpy()
+
+        else:
+            # --- Single-pass pipeline (no ring correction) ---
+            print(f"  Preprocessing: chunk_size={chunk_size}")
+            for start in range(0, self.N_angles, chunk_size):
+                end = min(start + chunk_size, self.N_angles)
+
+                chunk = torch.from_numpy(
+                    np.array(self.projections[start:end], dtype=np.float32)
+                ).to(device)
+
+                # 1. Flat-field + log (only for HU path)
+                if do_preprocess:
+                    T = (chunk - dark_gpu) / (I0_gpu + epsilon)
+                    if self.soft_clip_transmission:
+                        T = epsilon + F.softplus(T - epsilon, beta=sharpness, threshold=20.0)
+                        if self.upper_clamp:
+                            T = upper_val - F.softplus(upper_val - T, beta=sharpness, threshold=20.0)
+                    else:
+                        if self.upper_clamp:
+                            T = torch.clamp(T, min=epsilon, max=upper_val)
+                        else:
+                            T = torch.clamp(T, min=epsilon)
+                    chunk = -torch.log(T)
+                    if self.clamp_mode == "soft":
+                        chunk = F.softplus(chunk, beta=50.0, threshold=20.0)
+                    elif self.clamp_mode == "hard":
+                        chunk = torch.clamp(chunk, min=0.0)
+                    del T
+
+                # 1b. Metal artifact reduction
+                if self.metal_artifact_reduction:
+                    metal_mask = chunk > self.mar_threshold
+                    if metal_mask.any():
+                        _interpolate_metal_pixels(chunk, metal_mask)
+                    del metal_mask
+
+                # 2. Cone-beam weighting
+                chunk = chunk * cone_weight
+
+                # 3. Ramp filter (FFT → multiply → IFFT)
+                chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
+                chunk = chunk * filter_kernel
+                chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
+
+                # 3b. Parker (short-scan) redundancy weighting
+                if parker_weight_gpu is not None:
+                    chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
+
+                result_np = chunk.cpu().numpy()
+                if do_preprocess:
+                    float_projections[start:end] = result_np
+                else:
+                    self.projections[start:end] = result_np
 
         # Finalize
         if do_preprocess:
@@ -668,7 +753,7 @@ class FDKReconstructor:
         Uses physics-based conversion: HU = (μ - μ_water) / μ_water × 1000
 
         This produces approximate HU values. The final polynomial calibration
-        (from phantom insert measurements) is applied in run_recon_on_vff_file.py.
+        (from phantom insert measurements) is applied in run_fdk_recon.py.
         """
         vol_np = self.reconstructed_volume.cpu().numpy() if hasattr(self.reconstructed_volume, 'cpu') else self.reconstructed_volume
         del self.reconstructed_volume

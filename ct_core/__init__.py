@@ -10,6 +10,8 @@ Core utilities for CT reconstruction project including:
 from . import vff_io
 from . import calibration
 from . import tiff_converter
+from . import scan_setup
+from . import preprocessing
 
 # Convenience re-exports of commonly used functions
 from .vff_io import read_vff, read_vff_header, read_vff_data, VFFDataset, write_vff
@@ -25,12 +27,20 @@ from .calibration import (
     fit_hu_calibration,
 )
 from .tiff_converter import save_vff_to_tiff
+from .preprocessing import preprocess_sinogram
+from .scan_setup import (
+    auto_detect_scan_folder,
+    load_scan_data,
+    build_geometry,
+    postprocess_and_save,
+)
 
 __all__ = [
     # Modules
     'vff_io',
     'calibration',
     'tiff_converter',
+    'scan_setup',
     # VFF I/O
     'read_vff',
     'read_vff_header',
@@ -49,4 +59,12 @@ __all__ = [
     'fit_hu_calibration',
     # TIFF
     'save_vff_to_tiff',
+    # Preprocessing
+    'preprocessing',
+    'preprocess_sinogram',
+    # Scan setup utilities
+    'auto_detect_scan_folder',
+    'load_scan_data',
+    'build_geometry',
+    'postprocess_and_save',
 ]

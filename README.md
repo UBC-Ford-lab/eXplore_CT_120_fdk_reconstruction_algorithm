@@ -1,203 +1,67 @@
-# eXplore CT 120 FDK Reconstruction Algorithm
+# eXplore CT 120 Reconstruction
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-GPU-accelerated FDK (Feldkamp-Davis-Kress) cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner, implemented in PyTorch.
-
-## Overview
-
-This package implements the complete reconstruction pipeline for cone-beam micro-CT data acquired on a GE eXplore CT 120 scanner. It takes raw VFF projection files and produces calibrated Hounsfield Unit (HU) volumes.
-
-### Pipeline
-
-1. **Flat-field correction** -- normalizes detector response using bright/dark field references
-2. **Log transformation** -- converts transmission to line integrals with soft-clipping to prevent Gibbs ringing
-3. **Metal artifact reduction** *(optional)* -- sinogram-domain interpolation of metal-corrupted pixels (LI-MAR)
-4. **Cone-beam weighting** -- applies distance-based weighting for cone-beam geometry
-5. **Ramp filtering** -- frequency-domain filtering with selectable windows (Ram-Lak, Shepp-Logan, Cosine, Hamming)
-6. **Parker weighting** -- short-scan redundancy correction (automatically skipped for full 360-degree scans)
-7. **Backprojection** -- voxel-driven cone-beam backprojection with GPU-accelerated bilinear interpolation
-8. **HU calibration** -- physics-based conversion to Hounsfield Units with optional polynomial phantom calibration
-
-All preprocessing, filtering, and backprojection are GPU-accelerated with automatic memory management (dynamic chunk sizing, CPU fallback for large volumes).
+Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner. Supports FDK (analytic), ASTRA (SIRT, CGLS), and TIGRE (OS-SART) backends, all producing calibrated HU volumes from raw VFF projections.
 
 ## Package Structure
 
 ```
-reconstruction/                 # Package root (also repo root)
-├── __init__.py                 # Re-exports from fdk and ct_core
-├── fdk.py                      # FDKReconstructor class
-├── run_recon_on_vff_file.py    # CLI reconstruction script
-├── ct_core/                    # Core CT utilities
-│   ├── __init__.py
+reconstruction/
+├── fdk.py                      # FDKReconstructor (PyTorch, GPU-accelerated)
+├── astra_iterative.py          # ASTRAReconstructor (optional, requires astra-toolbox)
+├── tigre_iterative.py          # TIGREReconstructor (optional, requires TIGRE)
+├── run_fdk_recon.py            # CLI: FDK reconstruction
+├── run_iterative_recon.py      # CLI: iterative reconstruction (ASTRA / TIGRE)
+├── ct_core/
 │   ├── vff_io.py               # VFF file I/O and VFFDataset loader
 │   ├── calibration.py          # Flat-field correction, HU calibration
+│   ├── preprocessing.py        # Shared sinogram preprocessing
+│   ├── scan_setup.py           # Shared data-loading and geometry utilities
 │   └── tiff_converter.py       # VFF to TIFF export
-├── pyproject.toml
-├── LICENSE
-└── README.md
+└── pyproject.toml
 ```
 
 ## Installation
 
-### As a standalone package
-
 ```bash
-git clone https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_algorithm.git
-cd eXplore_CT_120_fdk_reconstruction_algorithm
+# Core (FDK only -- requires PyTorch)
 pip install -e .
+
+# Optional: ASTRA iterative
+pip install astra-toolbox
+
+# Optional: TIGRE iterative (must build from source)
+git clone --depth=1 https://github.com/CERN/TIGRE.git /tmp/TIGRE
+pip install --no-build-isolation /tmp/TIGRE
 ```
 
-### As a git submodule
+## CLI Usage
 
-When used inside a parent project (e.g., [muPIU-Net](https://github.com/UBC-Ford-lab/muPIU-Net-microCT-sinogram-infilling-network)):
+### FDK
 
 ```bash
-git submodule add https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_algorithm.git reconstruction
+python -m reconstruction.run_fdk_recon data/scans/Scan_1681
+
+python -m reconstruction.run_fdk_recon data/scans/Scan_1681 \
+    --filter-type hamming --filter-cutoff match \
+    --voxel-xy 0.075 --voxel-z 0.075 --fov-xy 45 --fov-z 120
 ```
 
-No `pip install` needed -- just ensure the parent repo root is on `sys.path` (e.g., via `pip install -e .` on the parent).
-
-## Usage
-
-### CLI -- reconstruct a scan
+### Iterative (ASTRA / TIGRE)
 
 ```bash
-python -m reconstruction.run_recon_on_vff_file data/scans/Scan_1681
+# ASTRA SIRT, 100 iterations with non-negativity
+python -m reconstruction.run_iterative_recon data/scans/Scan_1681 \
+    --backend astra --algorithm SIRT3D_CUDA --iterations 100 --min-constraint 0.0
+
+# TIGRE OS-SART, 100 iterations
+python -m reconstruction.run_iterative_recon data/scans/Scan_1681 \
+    --backend tigre --algorithm ossart --iterations 100
 ```
 
-With custom filter settings:
+ASTRA requires the full sinogram on GPU; use `--downsample` for large volumes. TIGRE handles GPU memory splitting internally.
 
-```bash
-python -m reconstruction.run_recon_on_vff_file data/scans/Scan_1681 \
-    --filter-type hamming \
-    --filter-cutoff match \
-    --voxel-xy 0.075 \
-    --voxel-z 0.075
-```
-
-#### CLI Arguments
-
-| Argument | Default | Description |
-|---|---|---|
-| `data_folder` | *(required)* | Path to folder containing VFF projections and `scan.xml` |
-| `--scan-folder` | auto-detected | Path to original scan folder with `bright.vff` / `dark.vff` |
-| `--output` | auto-generated | Output VFF filename |
-| `--total-angle` | `determined` | Total angular coverage in degrees. By default, reads `IncrementAngle` and `ViewCount` from `scan.xml` and computes the total automatically. Specify a numeric value to override. |
-| `--projection-pattern` | auto-detect | Glob pattern for projection files (`proj-*.vff` or `acq*`) |
-| `--filter-type` | `hamming` | Ramp filter window: `ramp`, `shepp-logan`, `cosine`, `hamming` |
-| `--filter-cutoff` | `match` | Bandwidth as fraction of Nyquist, or `match` to auto-compute `da/dx` |
-| `--voxel-xy` | `0.075` | Reconstruction voxel size in the xy plane (mm) |
-| `--voxel-z` | `0.075` | Reconstruction voxel size in z (mm) |
-| `--fov-xy` | `45` | Field of view in xy (mm). Use `94` for most phantom scanner studies. |
-| `--fov-z` | `120.0` | Field of view in z (mm) |
-| `--display` | off | Save reconstruction slice PNGs |
-| `--bilateral-filter` | off | Apply edge-preserving bilateral filter after HU calibration |
-| `--bilateral-sigma-spatial` | `1.5` | Bilateral filter spatial sigma in mm (converted to voxels internally) |
-| `--bilateral-sigma-range` | `50.0` | Bilateral filter intensity sigma in HU (edge-preservation threshold) |
-| `--metal-artifact-reduction` | off | Enable sinogram-domain metal artifact reduction (LI-MAR) |
-| `--mar-threshold` | `6.0` | Line integral threshold for metal pixel detection. Lower = more aggressive (4.0), higher = more conservative (8.0) |
-
-### Python API
-
-```python
-from reconstruction.fdk import FDKReconstructor
-from reconstruction.ct_core.vff_io import VFFDataset
-from reconstruction.ct_core.calibration import load_calibration_fields, MU_WATER_80KV
-
-# Load projections
-dataset = VFFDataset(data_folder, xml_file, paths_str='proj-*.vff',
-                     projection_spacing=0.877)
-bright, dark = load_calibration_fields(scan_folder)
-
-# Define geometry (from scan.xml)
-geometry = {
-    'R_s': 260.0,              # Source-to-isocenter (mm)
-    'R_d': 130.0,              # Detector-to-isocenter (mm)
-    'da': 0.05,                # Detector pixel size (mm)
-    'db': 0.05,
-    'vol_shape': (1248, 1248, 300),
-    'vol_origin': (0, 0, 0),
-    'dx': 0.075,               # Voxel size xy (mm)
-    'dz': 0.4,                 # Voxel size z (mm)
-    'central_pixel_a': 512.0,
-    'central_pixel_b': 256.0,
-}
-
-# Reconstruct
-recon = FDKReconstructor(
-    projections=dataset.projections,
-    angles=dataset.angles_rad,
-    geometry=geometry,
-    source_locations=None,
-    folder_name='output_path',
-    output_hu=True,
-    bright_field=bright,
-    dark_field=dark,
-    mu_water=MU_WATER_80KV,
-    physical_normalization=True,
-    filter_type='hamming',
-    filter_cutoff=geometry['da'] / geometry['dx'],
-    parker_weighting=True,
-)
-recon.reconstruct(display_volume=False)
-# Output: VFF file at output_path.vff
-```
-
-### Reading/writing VFF files
-
-```python
-from reconstruction.ct_core.vff_io import read_vff, write_vff
-
-header, data = read_vff('volume.vff')  # data shape: (z, y, x)
-write_vff('output.vff', {'bits': 16, 'spacing': '0.075 0.075 0.4'}, data)
-```
-
-### Exporting to TIFF
-
-```python
-from reconstruction.ct_core.tiff_converter import save_vff_to_tiff
-
-save_vff_to_tiff(data, target_directory='tiff_slices/')
-```
+Run `--help` on either script for full argument lists.
 
 ## Scanner Specifics
 
-This implementation is tailored for the **GE eXplore CT 120** micro-CT scanner:
-
-- Cone-beam geometry with flat-panel detector
-- VFF file format for projections and reconstructed volumes
-- `scan.xml` metadata (source/detector positions, angular offsets, detector spacing)
-- Bright/dark field calibration files (`bright.vff`, `dark.vff`)
-- Typical scan parameters: ~220 projections over ~193 degrees (half-scan), 0.028 mm detector pixel pitch
-- Per-projection gantry angles read from VFF headers (`gantryPosition`), with fallback to synthetic angles from `scan.xml`
-
-**COR convention:** The stored VFF projections are already COR-centered by the acquisition software. The `CentreOfRotation` value in `scan.xml` refers to the raw detector coordinate and is used for cone-beam and Parker weighting, but the backprojection uses zero detector offset (COR at detector center).
-
-The reconstruction algorithm itself (FDK) is general-purpose. Adapting to other cone-beam CT scanners requires only changing the geometry parameters and file I/O.
-
-## Requirements
-
-- Python >= 3.8
-- PyTorch (CUDA recommended for GPU acceleration, CPU fallback supported)
-- NumPy
-- xmltodict
-- imageio
-- matplotlib
-
-## License
-
-This project is licensed under the MIT License -- see [LICENSE](LICENSE) for details.
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@software{wiegmann2026fdk,
-  author = {Wiegmann, Falk},
-  title = {eXplore CT 120 FDK Reconstruction Algorithm},
-  year = {2026},
-  url = {https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_algorithm}
-}
-```
+Tailored for the **GE eXplore CT 120**: cone-beam geometry, VFF projections, `scan.xml` metadata, `bright.vff`/`dark.vff` calibration. The reconstruction algorithms are general-purpose -- adapting to other scanners requires only changing geometry parameters and file I/O.

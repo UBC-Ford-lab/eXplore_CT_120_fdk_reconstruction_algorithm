@@ -31,6 +31,9 @@ dependencies = [
     "tqdm",
 ]
 
+[project.optional-dependencies]
+iterative = ["astra-toolbox"]
+
 [project.urls]
 Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_algorithm"
 
@@ -38,4 +41,4 @@ Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_
 include = ["ct_core*"]
 
 [tool.setuptools]
-py-modules = ["fdk", "run_recon_on_vff_file"]
+py-modules = ["fdk", "run_fdk_recon", "astra_iterative", "run_iterative_recon"]
