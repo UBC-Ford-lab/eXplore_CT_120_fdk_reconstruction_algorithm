@@ -374,6 +374,65 @@ PHANTOM_CALIBRATION = np.array([
     [118.486, 770],
 ])
 
+# True HU values for each phantom insert (from manufacturer datasheet).
+# Ordered by ascending true HU. Names are descriptive labels.
+PHANTOM_INSERT_TRUE_HU = [
+    ("air",       -940),
+    ("insert_30",   30),
+    ("insert_80",   80),
+    ("insert_130", 130),
+    ("insert_220", 220),
+    ("insert_410", 410),
+    ("insert_770", 770),
+    ("bone",      1460),
+]
+
+
+# =============================================================================
+# Per-method polynomial calibration coefficients
+# =============================================================================
+# Each entry maps a method name to a tuple of (degree-2 polynomial coefficients,
+# RMS residual in HU). Coefficients are for np.polyval: HU_true = polyval(c, HU_raw).
+#
+# These are fitted from phantom self-calibration (--roi-config) and stored here
+# so non-phantom scans can use the correct per-method polynomial without inserts.
+#
+# To regenerate: run a phantom reconstruction with --roi-config, note the printed
+# coefficients, and update this dict.
+#
+# Placeholder entries below — replace after re-running phantom reconstructions
+# with self-calibration.
+CALIBRATION_COEFFICIENTS = {
+    # FDK with physical_normalization=True, hamming filter
+    # Fitted from PHANTOM_CALIBRATION (legacy 8-insert data)
+    "fdk": None,  # None = use PHANTOM_CALIBRATION fallback
+
+    # ASTRA SIRT (100 iterations, min_constraint=0)
+    # TODO: re-run phantom reconstruction with --roi-config to get coefficients
+    "astra_sirt": None,
+
+    # TIGRE OS-SART (100 iterations)
+    # TODO: re-run phantom reconstruction with --roi-config to get coefficients
+    "tigre_ossart": None,
+}
+
+
+def get_calibration_coefficients(method: str):
+    """
+    Look up stored polynomial calibration coefficients for a method.
+
+    Args:
+        method: Method key (e.g., 'fdk', 'astra_sirt', 'tigre_ossart')
+
+    Returns:
+        numpy array of polynomial coefficients for np.polyval, or None if
+        no stored coefficients exist for this method.
+    """
+    coeffs = CALIBRATION_COEFFICIENTS.get(method)
+    if coeffs is not None:
+        return np.array(coeffs)
+    return None
+
 
 def fit_hu_calibration(calibration_data: np.ndarray, degree: int = 2):
     """
@@ -394,6 +453,137 @@ def fit_hu_calibration(calibration_data: np.ndarray, degree: int = 2):
     residuals = expected - predicted
     rms = float(np.sqrt(np.mean(residuals**2)))
     return coeffs, rms, residuals
+
+
+def measure_insert_rois(volume: np.ndarray, insert_rois: list,
+                        z_range: tuple) -> list:
+    """
+    Measure mean pixel value inside each circular insert ROI.
+
+    Args:
+        volume: 3D array (z, y, x)
+        insert_rois: list of dicts with keys 'name', 'cy', 'cx', 'radius', 'true_hu'
+        z_range: (z_start, z_end) slice range to average over
+
+    Returns:
+        List of dicts with 'name', 'cy', 'cx', 'radius', 'true_hu',
+        'measured_mean', 'measured_std'
+    """
+    sl = volume[z_range[0]:z_range[1]].mean(axis=0)
+    results = []
+    for roi in insert_rois:
+        cy, cx, r = roi['cy'], roi['cx'], roi['radius']
+        yy, xx = np.ogrid[cy - r:cy + r, cx - r:cx + r]
+        mask = ((yy - cy) ** 2 + (xx - cx) ** 2) < r ** 2
+        vals = sl[cy - r:cy + r, cx - r:cx + r][mask]
+        results.append({
+            **roi,
+            'measured_mean': float(vals.mean()),
+            'measured_std': float(vals.std()),
+        })
+    return results
+
+
+def calibrate_volume_polynomial(volume: np.ndarray,
+                                calibration_data: np.ndarray,
+                                degree: int = 2,
+                                clip_range: tuple = (-1024, 4095)
+                                ) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Fit polynomial from calibration pairs and apply to entire volume.
+
+    Args:
+        volume: 3D array (z, y, x) in uncalibrated values
+        calibration_data: Nx2 array of (measured, true_hu) pairs
+        degree: polynomial degree
+        clip_range: (min, max) HU clipping range
+
+    Returns:
+        (calibrated_volume, poly_coeffs, rms_residual)
+    """
+    coeffs, rms, _ = fit_hu_calibration(calibration_data, degree)
+    calibrated = np.polyval(coeffs, volume).astype(np.float32)
+    if clip_range is not None:
+        calibrated = np.clip(calibrated, clip_range[0], clip_range[1])
+    return calibrated, coeffs, rms
+
+
+def plot_calibration_diagnostic(insert_measurements: list,
+                                coeffs: np.ndarray,
+                                volume_slice: np.ndarray,
+                                output_path: str):
+    """
+    Generate a diagnostic figure showing ROI placement and polynomial fit.
+
+    Args:
+        insert_measurements: list of dicts from measure_insert_rois()
+        coeffs: polynomial coefficients from fit
+        volume_slice: 2D slice for background image
+        output_path: where to save the figure (without extension)
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # (a) ROI overlay on phantom slice
+    ax = axes[0]
+    vmin = float(np.percentile(volume_slice, 1))
+    vmax = float(np.percentile(volume_slice, 99))
+    ax.imshow(volume_slice, cmap='gray', vmin=vmin, vmax=vmax)
+    for m in insert_measurements:
+        circle = Circle((m['cx'], m['cy']), m['radius'],
+                         fill=False, edgecolor='cyan', linewidth=1.5)
+        ax.add_patch(circle)
+        ax.text(m['cx'] + m['radius'] + 5, m['cy'],
+                f"{m['name']}\n{m['measured_mean']:.0f}",
+                fontsize=6, color='yellow', fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.15',
+                          facecolor='black', alpha=0.7))
+    ax.set_title('(a) Insert ROI placement', fontweight='bold')
+
+    # (b) Measured vs True with polynomial fit
+    ax = axes[1]
+    measured = np.array([m['measured_mean'] for m in insert_measurements])
+    true_hu = np.array([m['true_hu'] for m in insert_measurements])
+
+    ax.scatter(measured, true_hu, c='blue', s=60, zorder=5, label='Insert measurements')
+    for m in insert_measurements:
+        ax.annotate(m['name'], (m['measured_mean'], m['true_hu']),
+                    textcoords='offset points', xytext=(5, 5), fontsize=7)
+
+    x_fit = np.linspace(measured.min() - 100, measured.max() + 100, 200)
+    y_fit = np.polyval(coeffs, x_fit)
+    ax.plot(x_fit, y_fit, 'r-', linewidth=1.5, label=f'Poly deg {len(coeffs)-1} fit')
+    ax.plot(x_fit, x_fit, 'k--', linewidth=0.8, alpha=0.5, label='Identity (y=x)')
+
+    ax.set_xlabel('Measured (uncalibrated)')
+    ax.set_ylabel('True HU (datasheet)')
+    ax.set_title('(b) Calibration curve', fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # (c) Residuals
+    ax = axes[2]
+    predicted = np.polyval(coeffs, measured)
+    residuals = true_hu - predicted
+    rms = float(np.sqrt(np.mean(residuals ** 2)))
+
+    ax.bar(range(len(insert_measurements)),
+           residuals, color='steelblue', edgecolor='black', linewidth=0.5)
+    ax.set_xticks(range(len(insert_measurements)))
+    ax.set_xticklabels([m['name'] for m in insert_measurements],
+                       rotation=45, ha='right', fontsize=7)
+    ax.axhline(0, color='black', linewidth=0.8)
+    ax.set_ylabel('Residual (True - Predicted) [HU]')
+    ax.set_title(f'(c) Residuals (RMS = {rms:.1f} HU)', fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    for ext in ('.png', '.pdf'):
+        fig.savefig(output_path + ext, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Diagnostic saved: {output_path}.png/.pdf")
 
 
 if __name__ == '__main__':

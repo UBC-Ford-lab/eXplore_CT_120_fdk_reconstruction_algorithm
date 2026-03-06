@@ -174,6 +174,37 @@ Examples:
              'Reduces GPU memory usage. Factor 2 halves each detector dimension.'
     )
 
+    # Calibration arguments
+    parser.add_argument(
+        '--roi-config',
+        default=None,
+        help='JSON file with phantom insert ROI definitions for self-calibration. '
+             'When provided (with --cal-z-range), the pipeline measures inserts in '
+             'this volume and fits a per-method polynomial instead of using the '
+             'hardcoded FDK calibration. Recommended for iterative methods.'
+    )
+    parser.add_argument(
+        '--cal-z-range',
+        type=int,
+        nargs=2,
+        metavar=('Z_START', 'Z_END'),
+        default=None,
+        help='Z-slice range for phantom insert measurements (required with --roi-config)'
+    )
+    parser.add_argument(
+        '--cal-degree',
+        type=int,
+        default=2,
+        help='Polynomial degree for self-calibration fit (default: 2)'
+    )
+    parser.add_argument(
+        '--calibration-method',
+        default=None,
+        help='Method key for stored calibration coefficients (e.g., "astra_sirt", '
+             '"tigre_ossart"). Used for non-phantom scans to apply the correct '
+             'per-method polynomial. Auto-detected from backend/algorithm if not set.'
+    )
+
     # TIGRE-specific arguments
     parser.add_argument(
         '--blocksize',
@@ -369,7 +400,15 @@ def main():
     # Run reconstruction
     reconstructor.reconstruct()
 
+    # Auto-detect calibration method key from backend + algorithm
+    if args.calibration_method:
+        cal_method = args.calibration_method
+    else:
+        algo_short = args.algorithm.lower().replace('3d_cuda', '').replace('_cuda', '')
+        cal_method = f"{args.backend}_{algo_short}"
+
     # Post-process and save using shared utility
+    cal_plot = output_path + '_calibration_diagnostic' if args.roi_config else None
     postprocess_and_save(
         volume=reconstructor.reconstructed_volume,
         geometry=geometry,
@@ -378,6 +417,11 @@ def main():
         bilateral_sigma_spatial=args.bilateral_sigma_spatial,
         bilateral_sigma_range=args.bilateral_sigma_range,
         voxel_xy=args.voxel_xy,
+        roi_config=args.roi_config,
+        cal_z_range=tuple(args.cal_z_range) if args.cal_z_range else None,
+        cal_degree=args.cal_degree,
+        cal_plot_path=cal_plot,
+        calibration_method=cal_method,
     )
 
     end = time.time()

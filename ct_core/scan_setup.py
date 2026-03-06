@@ -19,6 +19,8 @@ from .vff_io import VFFDataset, write_vff
 from .calibration import (
     load_calibration_fields, MU_WATER_80KV,
     PHANTOM_CALIBRATION, fit_hu_calibration,
+    measure_insert_rois, calibrate_volume_polynomial,
+    plot_calibration_diagnostic, get_calibration_coefficients,
 )
 
 
@@ -224,9 +226,22 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z):
 
 def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
-                         voxel_xy=0.075):
+                         voxel_xy=0.075, roi_config=None, cal_z_range=None,
+                         cal_degree=2, cal_plot_path=None,
+                         calibration_method=None):
     """
     Apply polynomial HU calibration, optional bilateral filter, and save as VFF.
+
+    Calibration modes (in priority order):
+      1. Self-calibration (roi_config + cal_z_range provided):
+         Measures phantom inserts in THIS volume and fits a polynomial to
+         its own scale. Use for phantom scans to derive new coefficients.
+      2. Stored per-method coefficients (calibration_method provided):
+         Uses pre-fitted polynomial from CALIBRATION_COEFFICIENTS dict.
+         Use for non-phantom scans (e.g., mouse data).
+      3. Legacy fallback (neither provided):
+         Uses PHANTOM_CALIBRATION fitted from FDK physical normalization.
+         Only accurate for FDK with physical_normalization=True.
 
     Args:
         volume: Reconstructed volume as numpy array (x, y, z) in uncalibrated HU
@@ -236,25 +251,103 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         bilateral_sigma_spatial: Bilateral filter spatial sigma in mm
         bilateral_sigma_range: Bilateral filter intensity sigma in HU
         voxel_xy: Voxel size in xy plane in mm (for bilateral filter conversion)
+        roi_config: Path to JSON file with phantom insert ROI definitions,
+                    or list of insert dicts. Enables self-calibration mode.
+        cal_z_range: (z_start, z_end) slice range for phantom insert measurements.
+                     Required when roi_config is provided.
+        cal_degree: Polynomial degree for calibration fit (default: 2)
+        cal_plot_path: If set, save calibration diagnostic plot to this path
+                       (without extension). Only used in self-calibration mode.
+        calibration_method: Method key for stored coefficients (e.g., 'fdk',
+                           'astra_sirt', 'tigre_ossart'). Used when roi_config
+                           is not provided to select the correct per-method
+                           polynomial for non-phantom scans.
 
     Returns:
         Path to saved VFF file
     """
-    # Apply polynomial HU calibration
-    print("\n" + "=" * 60)
-    print("Applying polynomial HU calibration (phantom insert data)")
-    print("=" * 60)
-
-    coeffs, rms, residuals = fit_hu_calibration(PHANTOM_CALIBRATION, degree=2)
-    print(f"  Degree-2 polynomial coefficients: {coeffs}")
-    print(f"  RMS residual: {rms:.1f} HU")
+    import json
 
     # Extract volume as numpy (x, y, z)
     vol_np = volume.cpu().numpy() if hasattr(volume, 'cpu') else volume
 
-    # Apply calibration
-    vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
-    vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
+    print("\n" + "=" * 60)
+    print("Applying polynomial HU calibration")
+    print("=" * 60)
+
+    if roi_config is not None:
+        # --- Mode 1: Self-calibration from phantom inserts ---
+        if cal_z_range is None:
+            raise ValueError("cal_z_range is required when roi_config is provided")
+
+        # Load ROI config if it's a file path
+        if isinstance(roi_config, (str, Path)):
+            print(f"  Loading ROI config: {roi_config}")
+            with open(roi_config) as f:
+                insert_rois = json.load(f)["inserts"]
+        else:
+            insert_rois = roi_config
+
+        # The volume is (x, y, z) but measure_insert_rois expects (z, y, x)
+        # Transpose temporarily for measurement
+        vol_zyx = vol_np.transpose(2, 1, 0)  # (x, y, z) -> (z, y, x)
+
+        print(f"  Self-calibration: measuring {len(insert_rois)} inserts "
+              f"at z={cal_z_range[0]}-{cal_z_range[1]}")
+        measurements = measure_insert_rois(vol_zyx, insert_rois, cal_z_range)
+
+        print(f"\n  {'Name':<18s}  {'Measured':>10s}  {'Std':>7s}  {'True HU':>8s}")
+        print("  " + "-" * 50)
+        for m in measurements:
+            print(f"  {m['name']:<18s}  {m['measured_mean']:10.1f}  "
+                  f"{m['measured_std']:7.1f}  {m['true_hu']:8d}")
+
+        # Build calibration pairs and fit
+        cal_data = np.array([[m['measured_mean'], m['true_hu']]
+                             for m in measurements])
+        vol_calibrated, coeffs, rms = calibrate_volume_polynomial(
+            vol_zyx, cal_data, degree=cal_degree)
+
+        print(f"\n  Degree-{cal_degree} polynomial coefficients: {coeffs}")
+        print(f"  RMS residual: {rms:.1f} HU")
+        print(f"\n  To store these coefficients, add to CALIBRATION_COEFFICIENTS in calibration.py:")
+        method_key = calibration_method or "<method>"
+        print(f'    "{method_key}": {coeffs.tolist()},')
+
+        # Diagnostic plot
+        if cal_plot_path:
+            sl = vol_zyx[cal_z_range[0]:cal_z_range[1]].mean(axis=0)
+            plot_calibration_diagnostic(measurements, coeffs, sl, cal_plot_path)
+
+        # Transpose back to (x, y, z)
+        vol_calibrated = vol_calibrated.transpose(2, 1, 0)
+
+    elif calibration_method is not None:
+        # --- Mode 2: Stored per-method coefficients ---
+        coeffs = get_calibration_coefficients(calibration_method)
+        if coeffs is not None:
+            print(f"  Mode: stored coefficients for '{calibration_method}'")
+            print(f"  Polynomial coefficients: {coeffs}")
+            vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
+            vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
+        else:
+            print(f"  WARNING: No stored coefficients for '{calibration_method}'.")
+            print(f"  Run a phantom scan with --roi-config first to derive them.")
+            print(f"  Falling back to legacy PHANTOM_CALIBRATION (FDK-only).")
+            coeffs, rms, _ = fit_hu_calibration(PHANTOM_CALIBRATION, degree=2)
+            print(f"  Degree-2 polynomial coefficients: {coeffs}")
+            print(f"  RMS residual: {rms:.1f} HU")
+            vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
+            vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
+
+    else:
+        # --- Mode 3: Legacy fallback (FDK-only) ---
+        print("  Mode: legacy PHANTOM_CALIBRATION (FDK physical normalization)")
+        coeffs, rms, _ = fit_hu_calibration(PHANTOM_CALIBRATION, degree=2)
+        print(f"  Degree-2 polynomial coefficients: {coeffs}")
+        print(f"  RMS residual: {rms:.1f} HU")
+        vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
+        vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
 
     # Optional bilateral filter (edge-preserving denoising)
     if bilateral_filter:

@@ -142,6 +142,36 @@ Examples:
              'Pixels with -log(T) > threshold are treated as metal-corrupted. '
              'Lower = more aggressive (4.0), higher = more conservative (8.0).'
     )
+    # Calibration arguments
+    parser.add_argument(
+        '--roi-config',
+        default=None,
+        help='JSON file with phantom insert ROI definitions for self-calibration. '
+             'When provided (with --cal-z-range), the pipeline measures inserts in '
+             'this volume and fits a per-method polynomial instead of using the '
+             'hardcoded FDK calibration.'
+    )
+    parser.add_argument(
+        '--cal-z-range',
+        type=int,
+        nargs=2,
+        metavar=('Z_START', 'Z_END'),
+        default=None,
+        help='Z-slice range for phantom insert measurements (required with --roi-config)'
+    )
+    parser.add_argument(
+        '--cal-degree',
+        type=int,
+        default=2,
+        help='Polynomial degree for self-calibration fit (default: 2)'
+    )
+    parser.add_argument(
+        '--calibration-method',
+        default='fdk',
+        help='Method key for stored calibration coefficients (default: "fdk"). '
+             'Used for non-phantom scans to apply the correct polynomial.'
+    )
+
     parser.add_argument(
         '--ring-correction',
         action='store_true',
@@ -249,6 +279,7 @@ def main():
     reconstructor.reconstruct(display_volume=args.display)
 
     # Post-process and save using shared utility
+    cal_plot = output_path + '_calibration_diagnostic' if args.roi_config else None
     postprocess_and_save(
         volume=reconstructor.reconstructed_volume,
         geometry=geometry,
@@ -257,6 +288,11 @@ def main():
         bilateral_sigma_spatial=args.bilateral_sigma_spatial,
         bilateral_sigma_range=args.bilateral_sigma_range,
         voxel_xy=args.voxel_xy,
+        roi_config=args.roi_config,
+        cal_z_range=tuple(args.cal_z_range) if args.cal_z_range else None,
+        cal_degree=args.cal_degree,
+        cal_plot_path=cal_plot,
+        calibration_method=args.calibration_method,
     )
 
     end = time.time()
