@@ -289,12 +289,15 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
             insert_rois = roi_config
 
         # The volume is (x, y, z) but measure_insert_rois expects (z, y, x)
-        # Transpose temporarily for measurement
         vol_zyx = vol_np.transpose(2, 1, 0)  # (x, y, z) -> (z, y, x)
+
+        # ROI coordinates are defined in VFF viewer space (y-flipped).
+        # Create a y-flipped view for measurement and plotting.
+        vol_zyx_vff = vol_zyx[:, ::-1, :]
 
         print(f"  Self-calibration: measuring {len(insert_rois)} inserts "
               f"at z={cal_z_range[0]}-{cal_z_range[1]}")
-        measurements = measure_insert_rois(vol_zyx, insert_rois, cal_z_range)
+        measurements = measure_insert_rois(vol_zyx_vff, insert_rois, cal_z_range)
 
         print(f"\n  {'Name':<18s}  {'Measured':>10s}  {'Std':>7s}  {'True HU':>8s}")
         print("  " + "-" * 50)
@@ -302,7 +305,7 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
             print(f"  {m['name']:<18s}  {m['measured_mean']:10.1f}  "
                   f"{m['measured_std']:7.1f}  {m['true_hu']:8d}")
 
-        # Build calibration pairs and fit
+        # Build calibration pairs and fit — apply to original (un-flipped) volume
         cal_data = np.array([[m['measured_mean'], m['true_hu']]
                              for m in measurements])
         vol_calibrated, coeffs, rms = calibrate_volume_polynomial(
@@ -314,9 +317,9 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         method_key = calibration_method or "<method>"
         print(f'    "{method_key}": {coeffs.tolist()},')
 
-        # Diagnostic plot
+        # Diagnostic plot (use VFF-oriented slice so circles match inserts)
         if cal_plot_path:
-            sl = vol_zyx[cal_z_range[0]:cal_z_range[1]].mean(axis=0)
+            sl = vol_zyx_vff[cal_z_range[0]:cal_z_range[1]].mean(axis=0)
             plot_calibration_diagnostic(measurements, coeffs, sl, cal_plot_path)
 
         # Transpose back to (x, y, z)
@@ -375,13 +378,20 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         print(f"  Bilateral filter applied in {t_bf_end - t_bf:.1f}s "
               f"({Nz_slices} slices)")
 
+    # Save uncalibrated VFF (physics-based HU only, no polynomial)
+    vff_meta = {
+        'bits': 16,
+        'spacing': f"{geometry['dx']} {geometry['dx']} {geometry['dz']}",
+    }
+    uncal_path = output_path + '_uncalibrated.vff'
+    vol_uncal_vff = vol_np.astype(np.int16).transpose(2, 1, 0)[:, ::-1, :]
+    write_vff(uncal_path, vff_meta, vol_uncal_vff)
+    print(f"Uncalibrated VFF saved to: {uncal_path}")
+
     # Save calibrated VFF using write_vff with transpose/y-flip (matching fdk.py:688)
     cal_path = output_path + ('_bilateral.vff' if bilateral_filter else '.vff')
     vol_vff = vol_calibrated.astype(np.int16).transpose(2, 1, 0)[:, ::-1, :]
-    write_vff(cal_path, {
-        'bits': 16,
-        'spacing': f"{geometry['dx']} {geometry['dx']} {geometry['dz']}",
-    }, vol_vff)
+    write_vff(cal_path, vff_meta, vol_vff)
     print(f"Calibrated VFF saved to: {cal_path}")
 
     return cal_path
