@@ -403,17 +403,17 @@ PHANTOM_INSERT_TRUE_HU = [
 # Placeholder entries below — replace after re-running phantom reconstructions
 # with self-calibration.
 CALIBRATION_COEFFICIENTS = {
-    # FDK with physical_normalization=True, hamming filter
-    # Fitted from PHANTOM_CALIBRATION (legacy 8-insert data)
-    "fdk": None,  # None = use PHANTOM_CALIBRATION fallback
+    # Coefficients from Scan_1988 phantom self-calibration (7 inserts, degree-2)
+    # Maps physics-based HU → true HU for each reconstruction method
 
-    # ASTRA SIRT (100 iterations, min_constraint=0)
-    # TODO: re-run phantom reconstruction with --roi-config to get coefficients
-    "astra_sirt": None,
+    # FDK with physical_normalization=True, hamming filter (RMS 36.5 HU)
+    "fdk": [-0.0007731470245859063, 2.0721379225714807, 1896.265131169654],
 
-    # TIGRE OS-SART (100 iterations)
-    # TODO: re-run phantom reconstruction with --roi-config to get coefficients
-    "tigre_ossart": None,
+    # ASTRA SIRT (100 iterations, min_constraint=0) (RMS 36.2 HU)
+    "astra_sirt": [-3.6050254803021966e-05, 1.3530360794967076, -92.19078961741268],
+
+    # TIGRE OS-SART (100 iterations) (RMS 35.2 HU)
+    "tigre_ossart": [-4.135028143804179e-05, 1.1690824907050639, -116.2569444229479],
 }
 
 
