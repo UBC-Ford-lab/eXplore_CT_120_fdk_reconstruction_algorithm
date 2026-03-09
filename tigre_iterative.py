@@ -104,6 +104,16 @@ def build_tigre_geometry(geometry, N_b, N_a):
     Nx, Ny, Nz = geometry['vol_shape']
     dx = geometry['dx']
     dz = geometry['dz']
+
+    # TIGRE CUDA kernels hang when Nxy < Nz. Pad xy dimensions to Nz.
+    if min(Nx, Ny) < Nz:
+        Nx_orig, Ny_orig = Nx, Ny
+        Nx = max(Nx, Nz)
+        Ny = max(Ny, Nz)
+        print(f"  WARNING: TIGRE requires Nxy >= Nz to avoid CUDA hang.")
+        print(f"  Auto-padding volume from ({Nx_orig}, {Ny_orig}, {Nz}) "
+              f"to ({Nx}, {Ny}, {Nz}).")
+
     geo.nVoxel = np.array([Nz, Ny, Nx], dtype=np.int64)
     geo.dVoxel = np.array([dz, dx, dx], dtype=np.float64)
     geo.sVoxel = geo.nVoxel * geo.dVoxel
@@ -208,14 +218,14 @@ class TIGREReconstructor:
         # Detector dimensions
         self.N_angles, self.N_b, self.N_a = self.projections.shape
 
-    def _estimate_gpu_memory(self):
+    def _estimate_gpu_memory(self, geo):
         """
         Print informational GPU memory estimate.
 
         Unlike ASTRA, TIGRE handles memory splitting internally, so this
         is informational only (no hard OOM check).
         """
-        Nx, Ny, Nz = self.geometry['vol_shape']
+        Nz, Ny, Nx = geo.nVoxel  # TIGRE convention: [z, y, x]
         f32 = 4  # bytes per float32
 
         vol_bytes = Nx * Ny * Nz * f32
@@ -278,7 +288,8 @@ class TIGREReconstructor:
             upper_clamp_value=self.upper_clamp_value,
         )
 
-        # Step 2: Build TIGRE geometry
+        # Step 2: Build TIGRE geometry (may pad Nxy to avoid CUDA hang)
+        Nx_orig, Ny_orig, Nz_orig = self.geometry['vol_shape']
         print("\nBuilding TIGRE geometry...")
         geo = build_tigre_geometry(self.geometry, self.N_b, self.N_a)
         print(f"  DSD={float(geo.DSD):.2f} mm, DSO={float(geo.DSO):.2f} mm")
@@ -291,8 +302,8 @@ class TIGREReconstructor:
               f"range [{np.rad2deg(tigre_angles.min()):.1f}, "
               f"{np.rad2deg(tigre_angles.max()):.1f}] deg (TIGRE convention)")
 
-        # Step 4: GPU memory estimate
-        self._estimate_gpu_memory()
+        # Step 4: GPU memory estimate (uses actual TIGRE geo, including padding)
+        self._estimate_gpu_memory(geo)
 
         # Step 5: Run TIGRE algorithm
         # TIGRE expects (N_angles, N_b, N_a) — same shape as FDK, but
@@ -341,6 +352,20 @@ class TIGREReconstructor:
 
         self.reconstructed_volume = vol_tigre.transpose(2, 1, 0).astype(np.float32)
         del vol_tigre
+
+        # Crop back to original requested dimensions if volume was padded
+        Nx_pad, Ny_pad, Nz_pad = self.reconstructed_volume.shape
+        if Nx_pad != Nx_orig or Ny_pad != Ny_orig:
+            # Center-crop: the padded volume is centered at the origin,
+            # so the original FOV is in the center
+            x0 = (Nx_pad - Nx_orig) // 2
+            y0 = (Ny_pad - Ny_orig) // 2
+            self.reconstructed_volume = self.reconstructed_volume[
+                x0:x0 + Nx_orig, y0:y0 + Ny_orig, :
+            ]
+            print(f"  Cropped padded volume ({Nx_pad}, {Ny_pad}, {Nz_pad}) "
+                  f"to original ({Nx_orig}, {Ny_orig}, {Nz_orig})")
+
         print(f"  Reordered to FDK convention: {self.reconstructed_volume.shape} (x, y, z)")
 
         # Step 7: Optional HU conversion
