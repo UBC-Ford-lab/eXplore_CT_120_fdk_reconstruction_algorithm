@@ -230,16 +230,17 @@ class ASTRAReconstructor:
 
         # Volume geometry with physical coordinates
         Nx, Ny, Nz = self.geometry['vol_shape']
+        ox, oy, oz = self.geometry['vol_origin']
         dx = self.geometry['dx']
         dz = self.geometry['dz']
 
-        # Volume bounds: centered at origin, matching FDK convention
-        x_min = -(Nx / 2) * dx
-        x_max = (Nx / 2) * dx
-        y_min = -(Ny / 2) * dx
-        y_max = (Ny / 2) * dx
-        z_min = -(Nz / 2) * dz
-        z_max = (Nz / 2) * dz
+        # Volume bounds: centered at vol_origin (supports ROI reconstruction)
+        x_min = ox - (Nx / 2) * dx
+        x_max = ox + (Nx / 2) * dx
+        y_min = oy - (Ny / 2) * dx
+        y_max = oy + (Ny / 2) * dx
+        z_min = oz - (Nz / 2) * dz
+        z_max = oz + (Nz / 2) * dz
 
         vol_geom = astra.create_vol_geom(
             Ny, Nx, Nz,

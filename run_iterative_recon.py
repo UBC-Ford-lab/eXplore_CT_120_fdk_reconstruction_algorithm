@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -27,6 +28,7 @@ from .ct_core.scan_setup import (
     auto_detect_scan_folder,
     load_scan_data,
     build_geometry,
+    parse_crop_boundary,
     postprocess_and_save,
 )
 
@@ -228,6 +230,17 @@ Examples:
              'Lambda decays as lmbda * lmbda_red^iter, annealing toward zero.'
     )
 
+    # ROI-based reconstruction
+    parser.add_argument(
+        '--roi',
+        nargs='+',
+        default=None,
+        help='ROI-based reconstruction. Use "auto" to load from '
+             'SubVolumeCoordinates.xml in the scan folder, or specify 6 values: '
+             'x_min x_max y_min y_max z_min z_max (mm, isocenter-centered). '
+             'When active, --fov-xy and --fov-z are ignored.'
+    )
+
     return parser.parse_args()
 
 
@@ -319,10 +332,32 @@ def main():
     bright_field = scan_data['bright_field']
     dark_field = scan_data['dark_field']
 
+    # Parse ROI bounds if requested
+    roi_bounds = None
+    if args.roi is not None:
+        if args.roi == ['auto']:
+            roi_bounds = parse_crop_boundary(scan_folder, scan_data['xml_header'])
+            if roi_bounds is None:
+                print("Error: SubVolumeCoordinates.xml not found or invalid in scan folder.")
+                print("  Looked in: " + os.path.join(scan_folder, 'Volumes', 'SubVolumeCoordinates.xml'))
+                sys.exit(1)
+        elif len(args.roi) == 6:
+            vals = [float(v) for v in args.roi]
+            roi_bounds = {
+                'x_min': vals[0], 'x_max': vals[1],
+                'y_min': vals[2], 'y_max': vals[3],
+                'z_min': vals[4], 'z_max': vals[5],
+            }
+        else:
+            print("Error: --roi requires 'auto' or exactly 6 values "
+                  "(x_min x_max y_min y_max z_min z_max)")
+            sys.exit(1)
+
     # Build geometry using shared utility
     geometry = build_geometry(
         scan_data['xml_header'],
         args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
+        roi_bounds=roi_bounds,
     )
 
     # Downsample if requested

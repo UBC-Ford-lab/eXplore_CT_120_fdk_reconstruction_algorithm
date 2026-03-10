@@ -105,12 +105,15 @@ def build_tigre_geometry(geometry, N_b, N_a):
     dx = geometry['dx']
     dz = geometry['dz']
 
-    # TIGRE CUDA kernels hang when Nxy < Nz. Pad xy dimensions to Nz.
-    if min(Nx, Ny) < Nz:
+    # TIGRE CUDA kernels hang when Nxy is too small relative to Nz.
+    # FOV sweep (Nz=933) showed: Nxy=900 hangs, Nxy=1000 passes.
+    # Padding to exactly Nz is NOT enough — use 15% margin beyond Nz.
+    Nxy_min = int(np.ceil(Nz * 1.15))
+    if min(Nx, Ny) < Nxy_min:
         Nx_orig, Ny_orig = Nx, Ny
-        Nx = max(Nx, Nz)
-        Ny = max(Ny, Nz)
-        print(f"  WARNING: TIGRE requires Nxy >= Nz to avoid CUDA hang.")
+        Nx = max(Nx, Nxy_min)
+        Ny = max(Ny, Nxy_min)
+        print(f"  WARNING: TIGRE requires Nxy >= ~1.15*Nz to avoid CUDA hang.")
         print(f"  Auto-padding volume from ({Nx_orig}, {Ny_orig}, {Nz}) "
               f"to ({Nx}, {Ny}, {Nz}).")
 
@@ -118,8 +121,10 @@ def build_tigre_geometry(geometry, N_b, N_a):
     geo.dVoxel = np.array([dz, dx, dx], dtype=np.float64)
     geo.sVoxel = geo.nVoxel * geo.dVoxel
 
-    # Offsets (centered at origin, matching FDK convention)
-    geo.offOrigin = np.array([0.0, 0.0, 0.0])
+    # Volume origin offset for ROI reconstruction (TIGRE uses [z, y, x] ordering)
+    vol_origin = geometry.get('vol_origin', (0, 0, 0))
+    ox, oy, oz = vol_origin
+    geo.offOrigin = np.array([oz, oy, ox])
     geo.offDetector = np.array([0.0, 0.0])
 
     # No detector rotation

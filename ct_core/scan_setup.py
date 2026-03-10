@@ -178,7 +178,70 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle):
     }
 
 
-def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z):
+def parse_crop_boundary(scan_folder, xml_header):
+    """
+    Parse GEHC SubVolumeCoordinates.xml and convert to isocenter-centered ROI bounds.
+
+    The CropBoundary defines a physical bounding box in GEHC's scanner-absolute
+    coordinate system. We convert to isocenter-centered coordinates by subtracting
+    the LandmarkOffsetVector from scan.xml.
+
+    Args:
+        scan_folder: Path to scan folder containing Volumes/SubVolumeCoordinates.xml
+        xml_header: Parsed scan.xml dict (for LandmarkOffsetVector)
+
+    Returns:
+        dict with keys: x_min, x_max, y_min, y_max, z_min, z_max (mm, isocenter-centered)
+        or None if SubVolumeCoordinates.xml not found
+    """
+    xml_path = os.path.join(scan_folder, 'Volumes', 'SubVolumeCoordinates.xml')
+    if not os.path.exists(xml_path):
+        return None
+
+    # Parse CropBoundary
+    with open(xml_path) as f:
+        crop_doc = xmltodict.parse(f.read())
+    values = crop_doc['CropBoundary'].split()
+    if len(values) != 6:
+        print(f"  WARNING: CropBoundary has {len(values)} values, expected 6. Skipping ROI.")
+        return None
+
+    x_min, x_max, y_min, y_max, z_min, z_max = [float(v) for v in values]
+
+    # Get LandmarkOffsetVector for coordinate conversion
+    try:
+        landmark_str = xml_header['Series']['LandmarkOffsetVector']
+        lx, ly, lz = [float(v) for v in landmark_str.split()]
+    except (KeyError, ValueError) as e:
+        print(f"  WARNING: Could not parse LandmarkOffsetVector: {e}. Skipping ROI.")
+        return None
+
+    # Convert to isocenter-centered coordinates
+    # x is already isocenter-centered, y and z have scanner-absolute offsets
+    roi = {
+        'x_min': x_min - lx,
+        'x_max': x_max - lx,
+        'y_min': y_min - ly,
+        'y_max': y_max - ly,
+        'z_min': z_min - lz,
+        'z_max': z_max - lz,
+    }
+
+    print(f"\nROI from SubVolumeCoordinates.xml:")
+    print(f"  GEHC CropBoundary: x=[{x_min:.2f}, {x_max:.2f}], "
+          f"y=[{y_min:.2f}, {y_max:.2f}], z=[{z_min:.2f}, {z_max:.2f}] mm")
+    print(f"  LandmarkOffsetVector: ({lx:.2f}, {ly:.2f}, {lz:.2f}) mm")
+    print(f"  Isocenter-centered: x=[{roi['x_min']:.2f}, {roi['x_max']:.2f}], "
+          f"y=[{roi['y_min']:.2f}, {roi['y_max']:.2f}], "
+          f"z=[{roi['z_min']:.2f}, {roi['z_max']:.2f}] mm")
+    print(f"  ROI size: {roi['x_max']-roi['x_min']:.1f} x "
+          f"{roi['y_max']-roi['y_min']:.1f} x "
+          f"{roi['z_max']-roi['z_min']:.1f} mm")
+
+    return roi
+
+
+def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None):
     """
     Construct geometry dict from XML header fields and FOV/voxel parameters.
 
@@ -188,6 +251,10 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z):
         fov_z: Field of view in the z direction in mm
         voxel_xy: Voxel size in the xy plane in mm
         voxel_z: Voxel size in the z direction in mm
+        roi_bounds: Optional dict with x_min/x_max/y_min/y_max/z_min/z_max (mm,
+                    isocenter-centered) from parse_crop_boundary(). When provided,
+                    fov_xy and fov_z are ignored and the volume is sized/positioned
+                    to match the ROI.
 
     Returns:
         geometry dict with keys: R_d, R_s, da, db, vol_shape, vol_origin,
@@ -196,17 +263,31 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z):
     source_to_isocenter = float(xml_header['Series']['ObjectPosition'])
     detector_to_isocenter = float(xml_header['Series']['DetectorPosition']) - source_to_isocenter
 
-    # Compute volume shape from FOV and voxel size
-    Nxy = round(fov_xy / voxel_xy)
-    Nz = round(fov_z / voxel_z)
+    if roi_bounds is not None:
+        # ROI-based reconstruction: volume sized and positioned from ROI bounds
+        Nx = round((roi_bounds['x_max'] - roi_bounds['x_min']) / voxel_xy)
+        Ny = round((roi_bounds['y_max'] - roi_bounds['y_min']) / voxel_xy)
+        Nz = round((roi_bounds['z_max'] - roi_bounds['z_min']) / voxel_z)
+        vol_shape = (Nx, Ny, Nz)
+        vol_origin = (
+            (roi_bounds['x_min'] + roi_bounds['x_max']) / 2,
+            (roi_bounds['y_min'] + roi_bounds['y_max']) / 2,
+            (roi_bounds['z_min'] + roi_bounds['z_max']) / 2,
+        )
+    else:
+        # Standard full-FOV reconstruction centered at isocenter
+        Nxy = round(fov_xy / voxel_xy)
+        Nz = round(fov_z / voxel_z)
+        vol_shape = (Nxy, Nxy, Nz)
+        vol_origin = (0, 0, 0)
 
     geometry = {
         'R_d': detector_to_isocenter,
         'R_s': source_to_isocenter,
         'da': float(xml_header['Series']['DetectorSpacing']),
         'db': float(xml_header['Series']['DetectorSpacing']),
-        'vol_shape': (Nxy, Nxy, Nz),
-        'vol_origin': (0, 0, 0),
+        'vol_shape': vol_shape,
+        'vol_origin': vol_origin,
         'dx': voxel_xy,
         'dz': voxel_z,
         'central_pixel_a': float(xml_header['Series']['CentreOfRotation']),
@@ -218,6 +299,7 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z):
     print(f"  Detector-to-isocenter: {geometry['R_d']:.2f} mm")
     print(f"  Detector pixel size: {geometry['da']:.4f} mm")
     print(f"  Volume shape: {geometry['vol_shape']}")
+    print(f"  Volume origin: ({vol_origin[0]:.2f}, {vol_origin[1]:.2f}, {vol_origin[2]:.2f}) mm")
     print(f"  Voxel size (xy): {geometry['dx']:.4f} mm")
     print(f"  Voxel size (z): {geometry['dz']:.4f} mm")
 
