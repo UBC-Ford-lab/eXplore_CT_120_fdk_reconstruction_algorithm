@@ -12,6 +12,8 @@ The geometry mapping translates the FDK backprojection coordinate convention
 Requires: tigre (optional dependency, built from source)
 """
 
+import os
+import threading
 import time
 
 import numpy as np
@@ -105,15 +107,17 @@ def build_tigre_geometry(geometry, N_b, N_a):
     dx = geometry['dx']
     dz = geometry['dz']
 
-    # TIGRE CUDA kernels hang when Nxy is too small relative to Nz.
-    # FOV sweep (Nz=933) showed: Nxy=900 hangs, Nxy=1000 passes.
-    # Padding to exactly Nz is NOT enough — use 15% margin beyond Nz.
-    Nxy_min = int(np.ceil(Nz * 1.15))
+    # TIGRE CUDA kernels hang when Nxy is below an empirical threshold.
+    # Tested on 3500x2296 detector, 0.075mm voxels:
+    #   Nxy=879 (Nz=764) → HANG, Nxy=900 (Nz=933) → HANG,
+    #   Nxy=933 (Nz=933) → HANG, Nxy=1000 (Nz=933) → PASS.
+    # The threshold is NOT purely relative to Nz. Use 1000 as empirical floor.
+    Nxy_min = max(1000, Nz)
     if min(Nx, Ny) < Nxy_min:
         Nx_orig, Ny_orig = Nx, Ny
         Nx = max(Nx, Nxy_min)
         Ny = max(Ny, Nxy_min)
-        print(f"  WARNING: TIGRE requires Nxy >= ~1.15*Nz to avoid CUDA hang.")
+        print(f"  WARNING: TIGRE CUDA kernels hang for Nxy < ~1000.")
         print(f"  Auto-padding volume from ({Nx_orig}, {Ny_orig}, {Nz}) "
               f"to ({Nx}, {Ny}, {Nz}).")
 
@@ -330,10 +334,41 @@ class TIGREReconstructor:
         if self.gpu_index != 0:
             kwargs['gpuids'] = tigre.utilities.gpu.GpuIds(self.gpu_index)
 
-        # Time estimate: run 1 calibration iteration, then extrapolate
-        print(f"\nCalibrating iteration speed...")
+        # Time estimate: run 1 calibration iteration with timeout to detect hangs.
+        # TIGRE CUDA kernels can hang indefinitely for certain volume sizes.
+        # If 1 iteration doesn't finish in 5 minutes, it's stuck.
+        CALIBRATION_TIMEOUT = 300  # seconds
+        print(f"\nCalibrating iteration speed (timeout: {CALIBRATION_TIMEOUT}s)...")
+
+        cal_result = [None]
+        cal_error = [None]
+
+        def _run_calibration():
+            try:
+                cal_result[0] = alg_func(
+                    sinogram, geo, tigre_angles, 1,
+                    **{**kwargs, 'verbose': False},
+                )
+            except Exception as e:
+                cal_error[0] = e
+
+        cal_thread = threading.Thread(target=_run_calibration)
         t0 = time.time()
-        _ = alg_func(sinogram, geo, tigre_angles, 1, **{**kwargs, 'verbose': False})
+        cal_thread.start()
+        cal_thread.join(timeout=CALIBRATION_TIMEOUT)
+
+        if cal_thread.is_alive():
+            Nz_v, Ny_v, Nx_v = geo.nVoxel
+            print(f"\n  FATAL: TIGRE calibration timed out after {CALIBRATION_TIMEOUT}s.")
+            print(f"  The CUDA kernel is hung (volume: {Nx_v}x{Ny_v}x{Nz_v}).")
+            print(f"  This is a known TIGRE bug with certain volume dimensions.")
+            print(f"  Try: increase --fov-xy, or use --backend astra instead.")
+            # Thread can't be killed cleanly, force-exit the process
+            os._exit(1)
+
+        if cal_error[0] is not None:
+            raise cal_error[0]
+
         dt_one = time.time() - t0
         est_total = dt_one * self.iterations
         print(f"  1 iteration: {dt_one:.1f}s → "
