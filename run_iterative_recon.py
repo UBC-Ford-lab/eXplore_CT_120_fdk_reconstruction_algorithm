@@ -206,6 +206,14 @@ Examples:
              '"tigre_ossart"). Used for non-phantom scans to apply the correct '
              'per-method polynomial. Auto-detected from backend/algorithm if not set.'
     )
+    parser.add_argument(
+        '--scan-type',
+        choices=['half_scan', 'full_scan'],
+        default=None,
+        help='Scan type for selecting stored calibration coefficients. '
+             'Half-scan and full-scan acquisitions have different uncalibrated '
+             'value ranges. Default: half_scan.'
+    )
 
     # TIGRE-specific arguments
     parser.add_argument(
@@ -457,6 +465,7 @@ def main():
         cal_degree=args.cal_degree,
         cal_plot_path=cal_plot,
         calibration_method=cal_method,
+        scan_type=args.scan_type,
     )
 
     end = time.time()

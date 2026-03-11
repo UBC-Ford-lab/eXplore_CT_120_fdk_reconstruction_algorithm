@@ -173,6 +173,14 @@ Examples:
         help='Method key for stored calibration coefficients (default: "fdk"). '
              'Used for non-phantom scans to apply the correct polynomial.'
     )
+    parser.add_argument(
+        '--scan-type',
+        choices=['half_scan', 'full_scan'],
+        default=None,
+        help='Scan type for selecting stored calibration coefficients. '
+             'Half-scan and full-scan acquisitions have different uncalibrated '
+             'value ranges. Default: half_scan.'
+    )
 
     parser.add_argument(
         '--ring-correction',
@@ -328,6 +336,7 @@ def main():
         cal_degree=args.cal_degree,
         cal_plot_path=cal_plot,
         calibration_method=args.calibration_method,
+        scan_type=args.scan_type,
     )
 
     end = time.time()

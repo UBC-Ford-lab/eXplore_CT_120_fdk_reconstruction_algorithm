@@ -310,7 +310,7 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
                          voxel_xy=0.075, roi_config=None, cal_z_range=None,
                          cal_degree=2, cal_plot_path=None,
-                         calibration_method=None):
+                         calibration_method=None, scan_type=None):
     """
     Apply polynomial HU calibration, optional bilateral filter, and save as VFF.
 
@@ -344,6 +344,9 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
                            'astra_sirt', 'tigre_ossart'). Used when roi_config
                            is not provided to select the correct per-method
                            polynomial for non-phantom scans.
+        scan_type: 'half_scan' or 'full_scan'. Selects which set of stored
+                   calibration coefficients to use. If None, uses the default
+                   (half_scan for backward compatibility).
 
     Returns:
         Path to saved VFF file
@@ -409,9 +412,10 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
 
     elif calibration_method is not None:
         # --- Mode 2: Stored per-method coefficients ---
-        coeffs = get_calibration_coefficients(calibration_method)
+        coeffs = get_calibration_coefficients(calibration_method, scan_type=scan_type)
         if coeffs is not None:
-            print(f"  Mode: stored coefficients for '{calibration_method}'")
+            st_label = scan_type or "default"
+            print(f"  Mode: stored coefficients for '{calibration_method}' ({st_label})")
             print(f"  Polynomial coefficients: {coeffs}")
             vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
             vol_calibrated = np.clip(vol_calibrated, -1024, 4095)

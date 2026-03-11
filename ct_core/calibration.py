@@ -391,44 +391,75 @@ PHANTOM_INSERT_TRUE_HU = [
 # =============================================================================
 # Per-method polynomial calibration coefficients
 # =============================================================================
-# Each entry maps a method name to a tuple of (degree-2 polynomial coefficients,
-# RMS residual in HU). Coefficients are for np.polyval: HU_true = polyval(c, HU_raw).
+# Nested by scan type ("half_scan" or "full_scan"), then by reconstruction
+# method.  Coefficients are for np.polyval: HU_true = polyval(c, HU_raw).
 #
 # These are fitted from phantom self-calibration (--roi-config) and stored here
 # so non-phantom scans can use the correct per-method polynomial without inserts.
 #
-# To regenerate: run a phantom reconstruction with --roi-config, note the printed
-# coefficients, and update this dict.
+# Half-scan and full-scan acquisitions have different numbers of projections,
+# leading to different backprojection normalizations and thus different
+# uncalibrated value ranges.  A polynomial fitted on one scan type does NOT
+# transfer to the other.
 #
-# Placeholder entries below — replace after re-running phantom reconstructions
-# with self-calibration.
+# To regenerate: run a phantom reconstruction with --roi-config, note the
+# printed coefficients, and update this dict.
 CALIBRATION_COEFFICIENTS = {
-    # Coefficients from Scan_1988 phantom self-calibration (7 inserts, degree-2)
-    # Maps physics-based HU → true HU for each reconstruction method
+    # ---------------------------------------------------------------
+    # Half-scan coefficients  (from Scan_1988, QRM phantom, 7 inserts, degree-2)
+    # ---------------------------------------------------------------
+    "half_scan": {
+        # FDK with physical_normalization=True, hamming filter (RMS 36.5 HU)
+        "fdk": [-0.0007731470245859063, 2.0721379225714807, 1896.265131169654],
 
-    # FDK with physical_normalization=True, hamming filter (RMS 36.5 HU)
-    "fdk": [-0.0007731470245859063, 2.0721379225714807, 1896.265131169654],
+        # ASTRA SIRT (100 iterations, min_constraint=0) (RMS 36.2 HU)
+        "astra_sirt": [-3.6050254803021966e-05, 1.3530360794967076, -92.19078961741268],
 
-    # ASTRA SIRT (100 iterations, min_constraint=0) (RMS 36.2 HU)
-    "astra_sirt": [-3.6050254803021966e-05, 1.3530360794967076, -92.19078961741268],
+        # TIGRE OS-SART (100 iterations) (RMS 35.2 HU)
+        "tigre_ossart": [-4.135028143804179e-05, 1.1690824907050639, -116.2569444229479],
+    },
 
-    # TIGRE OS-SART (100 iterations) (RMS 35.2 HU)
-    "tigre_ossart": [-4.135028143804179e-05, 1.1690824907050639, -116.2569444229479],
+    # ---------------------------------------------------------------
+    # Full-scan coefficients  (from Scan_1989, QRM phantom, 7 inserts, degree-2)
+    # ---------------------------------------------------------------
+    "full_scan": {
+        # FDK with physical_normalization=True, hamming filter (RMS 31.8 HU)
+        "fdk": [-0.00016957771890721148, 1.4068691691082866, 634.9725504813525],
+
+        # ASTRA SIRT (100 iterations, min_constraint=0) (RMS 47.2 HU)
+        "astra_sirt": [-5.6346843901515365e-05, 1.402740763274877, -109.83505093406858],
+
+        # TIGRE OS-SART (100 iterations) (RMS 36.9 HU)
+        "tigre_ossart": [-4.8887881440773636e-05, 1.2077501396636758, -77.80945440483856],
+    },
 }
 
+# Default scan type when not specified (backward compatibility)
+DEFAULT_SCAN_TYPE = "half_scan"
 
-def get_calibration_coefficients(method: str):
+
+def get_calibration_coefficients(method: str, scan_type: str = None):
     """
     Look up stored polynomial calibration coefficients for a method.
 
     Args:
         method: Method key (e.g., 'fdk', 'astra_sirt', 'tigre_ossart')
+        scan_type: 'half_scan' or 'full_scan'. If None, uses DEFAULT_SCAN_TYPE.
 
     Returns:
         numpy array of polynomial coefficients for np.polyval, or None if
-        no stored coefficients exist for this method.
+        no stored coefficients exist for this method/scan_type combination.
     """
-    coeffs = CALIBRATION_COEFFICIENTS.get(method)
+    if scan_type is None:
+        scan_type = DEFAULT_SCAN_TYPE
+
+    scan_dict = CALIBRATION_COEFFICIENTS.get(scan_type)
+    if scan_dict is None:
+        print(f"  WARNING: Unknown scan_type '{scan_type}'. "
+              f"Available: {list(CALIBRATION_COEFFICIENTS.keys())}")
+        return None
+
+    coeffs = scan_dict.get(method)
     if coeffs is not None:
         return np.array(coeffs)
     return None
