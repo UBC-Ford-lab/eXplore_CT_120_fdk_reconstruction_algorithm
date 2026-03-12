@@ -12,8 +12,6 @@ The geometry mapping translates the FDK backprojection coordinate convention
 Requires: tigre (optional dependency, built from source)
 """
 
-import os
-import threading
 import time
 
 import numpy as np
@@ -107,28 +105,42 @@ def build_tigre_geometry(geometry, N_b, N_a):
     dx = geometry['dx']
     dz = geometry['dz']
 
+    # TIGRE CUDA kernels hang with non-zero geo.offOrigin. Workaround:
+    # always reconstruct a centered volume (offOrigin=[0,0,0]) large enough
+    # to contain the ROI, then crop to the ROI region after reconstruction.
+    vol_origin = geometry.get('vol_origin', (0, 0, 0))
+    ox, oy, oz = vol_origin
+
+    if ox != 0 or oy != 0 or oz != 0:
+        Nx_roi, Ny_roi, Nz_roi = Nx, Ny, Nz
+        Nx = Nx_roi + 2 * int(np.ceil(abs(ox) / dx))
+        Ny = Ny_roi + 2 * int(np.ceil(abs(oy) / dx))
+        Nz = Nz_roi + 2 * int(np.ceil(abs(oz) / dz))
+        print(f"  TIGRE offOrigin bug workaround: expanding to centered volume")
+        print(f"    ROI center: ({ox:.2f}, {oy:.2f}, {oz:.2f}) mm")
+        print(f"    ROI dims:   ({Nx_roi}, {Ny_roi}, {Nz_roi})")
+        print(f"    Expanded:   ({Nx}, {Ny}, {Nz}) (centered at isocenter)")
+
     # TIGRE CUDA kernels hang when Nxy is below an empirical threshold.
     # Tested on 3500x2296 detector, 0.075mm voxels:
     #   Nxy=879 (Nz=764) → HANG, Nxy=900 (Nz=933) → HANG,
     #   Nxy=933 (Nz=933) → HANG, Nxy=1000 (Nz=933) → PASS.
-    # The threshold is NOT purely relative to Nz. Use 1000 as empirical floor.
     Nxy_min = max(1000, Nz)
     if min(Nx, Ny) < Nxy_min:
-        Nx_orig, Ny_orig = Nx, Ny
+        Nx_before_pad, Ny_before_pad = Nx, Ny
         Nx = max(Nx, Nxy_min)
         Ny = max(Ny, Nxy_min)
         print(f"  WARNING: TIGRE CUDA kernels hang for Nxy < ~1000.")
-        print(f"  Auto-padding volume from ({Nx_orig}, {Ny_orig}, {Nz}) "
+        print(f"  Auto-padding volume from ({Nx_before_pad}, {Ny_before_pad}, {Nz}) "
               f"to ({Nx}, {Ny}, {Nz}).")
 
     geo.nVoxel = np.array([Nz, Ny, Nx], dtype=np.int64)
     geo.dVoxel = np.array([dz, dx, dx], dtype=np.float64)
     geo.sVoxel = geo.nVoxel * geo.dVoxel
 
-    # Volume origin offset for ROI reconstruction (TIGRE uses [z, y, x] ordering)
-    vol_origin = geometry.get('vol_origin', (0, 0, 0))
-    ox, oy, oz = vol_origin
-    geo.offOrigin = np.array([oz, oy, ox])
+    # Always zero offOrigin — non-zero values cause TIGRE CUDA hangs.
+    # ROI offset is handled by expanding the centered volume and cropping after.
+    geo.offOrigin = np.array([0.0, 0.0, 0.0])
     geo.offDetector = np.array([0.0, 0.0])
 
     # No detector rotation
@@ -334,41 +346,13 @@ class TIGREReconstructor:
         if self.gpu_index != 0:
             kwargs['gpuids'] = tigre.utilities.gpu.GpuIds(self.gpu_index)
 
-        # Time estimate: run 1 calibration iteration with timeout to detect hangs.
-        # TIGRE CUDA kernels can hang indefinitely for certain volume sizes.
-        # If 1 iteration doesn't finish in 5 minutes, it's stuck.
-        CALIBRATION_TIMEOUT = 300  # seconds
-        print(f"\nCalibrating iteration speed (timeout: {CALIBRATION_TIMEOUT}s)...")
-
-        cal_result = [None]
-        cal_error = [None]
-
-        def _run_calibration():
-            try:
-                cal_result[0] = alg_func(
-                    sinogram, geo, tigre_angles, 1,
-                    **{**kwargs, 'verbose': False},
-                )
-            except Exception as e:
-                cal_error[0] = e
-
-        cal_thread = threading.Thread(target=_run_calibration)
+        # Run 1 calibration iteration for time estimate.
+        # NOTE: Python threading timeouts don't work for TIGRE hang detection
+        # because TIGRE's C extension holds the GIL. Use bash-level 'timeout'
+        # command to detect hangs (e.g., 'timeout 3600 python -m ...').
+        print(f"\nCalibrating iteration speed (1 iteration)...")
         t0 = time.time()
-        cal_thread.start()
-        cal_thread.join(timeout=CALIBRATION_TIMEOUT)
-
-        if cal_thread.is_alive():
-            Nz_v, Ny_v, Nx_v = geo.nVoxel
-            print(f"\n  FATAL: TIGRE calibration timed out after {CALIBRATION_TIMEOUT}s.")
-            print(f"  The CUDA kernel is hung (volume: {Nx_v}x{Ny_v}x{Nz_v}).")
-            print(f"  This is a known TIGRE bug with certain volume dimensions.")
-            print(f"  Try: increase --fov-xy, or use --backend astra instead.")
-            # Thread can't be killed cleanly, force-exit the process
-            os._exit(1)
-
-        if cal_error[0] is not None:
-            raise cal_error[0]
-
+        alg_func(sinogram, geo, tigre_angles, 1, **{**kwargs, 'verbose': False})
         dt_one = time.time() - t0
         est_total = dt_one * self.iterations
         print(f"  1 iteration: {dt_one:.1f}s → "
@@ -393,18 +377,25 @@ class TIGREReconstructor:
         self.reconstructed_volume = vol_tigre.transpose(2, 1, 0).astype(np.float32)
         del vol_tigre
 
-        # Crop back to original requested dimensions if volume was padded
+        # Crop from centered volume to original ROI dimensions.
+        # The reconstructed volume is centered at isocenter (offOrigin=0).
+        # For ROI reconstruction, the ROI may be off-center, so crop indices
+        # account for the ROI offset: idx = (N_big - N_roi)/2 + offset/voxel_size
+        # For full-FOV (vol_origin=0), this degenerates to a simple center-crop.
         Nx_pad, Ny_pad, Nz_pad = self.reconstructed_volume.shape
-        if Nx_pad != Nx_orig or Ny_pad != Ny_orig:
-            # Center-crop: the padded volume is centered at the origin,
-            # so the original FOV is in the center
-            x0 = (Nx_pad - Nx_orig) // 2
-            y0 = (Ny_pad - Ny_orig) // 2
+        if Nx_pad != Nx_orig or Ny_pad != Ny_orig or Nz_pad != Nz_orig:
+            ox, oy, oz = self.geometry.get('vol_origin', (0, 0, 0))
+            dx = self.geometry['dx']
+            dz = self.geometry['dz']
+            x0 = round((Nx_pad - Nx_orig) / 2 + ox / dx)
+            y0 = round((Ny_pad - Ny_orig) / 2 + oy / dx)
+            z0 = round((Nz_pad - Nz_orig) / 2 + oz / dz)
             self.reconstructed_volume = self.reconstructed_volume[
-                x0:x0 + Nx_orig, y0:y0 + Ny_orig, :
+                x0:x0 + Nx_orig, y0:y0 + Ny_orig, z0:z0 + Nz_orig
             ]
-            print(f"  Cropped padded volume ({Nx_pad}, {Ny_pad}, {Nz_pad}) "
-                  f"to original ({Nx_orig}, {Ny_orig}, {Nz_orig})")
+            print(f"  Cropped ({Nx_pad}, {Ny_pad}, {Nz_pad}) → "
+                  f"({Nx_orig}, {Ny_orig}, {Nz_orig}) "
+                  f"[start: ({x0}, {y0}, {z0})]")
 
         print(f"  Reordered to FDK convention: {self.reconstructed_volume.shape} (x, y, z)")
 
