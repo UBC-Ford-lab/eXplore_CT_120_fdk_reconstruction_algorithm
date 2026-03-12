@@ -409,8 +409,8 @@ CALIBRATION_COEFFICIENTS = {
     # Half-scan coefficients  (from Scan_1988, QRM phantom, 7 inserts, degree-2)
     # ---------------------------------------------------------------
     "half_scan": {
-        # FDK with physical_normalization=True, hamming filter (RMS 36.5 HU)
-        "fdk": [-0.0007731470245859063, 2.0721379225714807, 1896.265131169654],
+        # FDK with physical_normalization=True, hamming filter (RMS 39.2 HU)
+        "fdk": [-0.0007132818094142021, 2.128889255893252, 1896.855740800915],
 
         # ASTRA SIRT (100 iterations, min_constraint=0) (RMS 36.2 HU)
         "astra_sirt": [-3.6050254803021966e-05, 1.3530360794967076, -92.19078961741268],

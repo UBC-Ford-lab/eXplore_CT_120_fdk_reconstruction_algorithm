@@ -301,9 +301,9 @@ class FDKReconstructor:
         beta = beta_rel.unsqueeze(1)  # (N_angles, 1)
         g = gamma.unsqueeze(0)        # (1, N_a)
 
-        # Transition widths at scan boundaries
-        denom_lo = epsilon - 2.0 * g   # (1, N_a) — width of ramp-up region
-        denom_hi = epsilon + 2.0 * g   # (1, N_a) — width of ramp-down region
+        # Transition width — same d for ramp-up and ramp-down ensures
+        # continuity at every boundary: sin²(π/2) = 1.
+        d = epsilon - 2.0 * g          # (1, N_a)
 
         # Boundary between full-weight and ramp-down: β = π + 2γ
         boundary = np.pi + 2.0 * g     # (1, N_a)
@@ -311,26 +311,26 @@ class FDKReconstructor:
         # Initialize weights to 1.0 (full weight)
         weights = torch.ones(self.N_angles, self.N_a, dtype=torch.float32)
 
-        # For columns where there IS redundancy (denom_lo > 0):
-        has_redundancy = (denom_lo > 0)  # (1, N_a) broadcast to (N_angles, N_a)
+        # Only columns with d > 0 have redundancy and need weighting
+        has_redundancy = (d > 0)        # (1, N_a) broadcast to (N_angles, N_a)
+        safe_d = torch.where(has_redundancy, d, torch.ones_like(d))
 
-        # Region 1: Ramp-up at scan start — 0 ≤ β < denom_lo
-        in_rampup = has_redundancy & (beta >= 0) & (beta < denom_lo)
-        # sin²(π/2 · β/denom_lo) — safe division (denom_lo > 0 where has_redundancy)
+        # Region 1: Ramp-up at scan start — 0 ≤ β < d
+        in_rampup = has_redundancy & (beta >= 0) & (beta < d)
         rampup_arg = torch.where(
             has_redundancy,
-            (np.pi / 2.0) * beta / denom_lo.clamp(min=1e-10),
+            (np.pi / 2.0) * beta / safe_d,
             torch.zeros_like(beta),
         )
         weights = torch.where(in_rampup, torch.sin(rampup_arg) ** 2, weights)
 
-        # Region 2: Full weight — denom_lo ≤ β ≤ π + 2γ (already 1.0)
+        # Region 2: Full weight — d ≤ β ≤ π + 2γ (already 1.0)
 
         # Region 3: Ramp-down at scan end — π + 2γ < β ≤ Λ
         in_rampdown = has_redundancy & (beta > boundary) & (beta <= Lambda)
         rampdown_arg = torch.where(
             has_redundancy,
-            (np.pi / 2.0) * (Lambda - beta) / denom_hi.clamp(min=1e-10),
+            (np.pi / 2.0) * (Lambda - beta) / safe_d,
             torch.zeros_like(beta),
         )
         weights = torch.where(in_rampdown, torch.sin(rampdown_arg) ** 2, weights)
