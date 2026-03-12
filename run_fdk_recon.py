@@ -319,7 +319,7 @@ def main():
         physical_normalization=True,
         filter_cutoff=filter_cutoff,
         filter_type=args.filter_type,
-        parker_weighting=False,
+        parker_weighting=True,
         metal_artifact_reduction=args.metal_artifact_reduction,
         mar_threshold=args.mar_threshold,
         ring_correction=args.ring_correction,

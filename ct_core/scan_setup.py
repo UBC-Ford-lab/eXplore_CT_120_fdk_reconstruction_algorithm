@@ -216,11 +216,13 @@ def parse_crop_boundary(scan_folder, xml_header):
         print(f"  WARNING: Could not parse LandmarkOffsetVector: {e}. Skipping ROI.")
         return None
 
-    # Convert to isocenter-centered coordinates
-    # x is already isocenter-centered, y and z have scanner-absolute offsets
+    # Convert GEHC scanner coordinates to our reconstruction coordinates.
+    # The CropBoundary x-axis is negated relative to our FDK/ASTRA/TIGRE
+    # x-axis (confirmed by comparing tissue centering with GEHC output).
+    # y and z are shifted by the LandmarkOffsetVector.
     roi = {
-        'x_min': x_min - lx,
-        'x_max': x_max - lx,
+        'x_min': -(x_max - lx),
+        'x_max': -(x_min - lx),
         'y_min': y_min - ly,
         'y_max': y_max - ly,
         'z_min': z_min - lz,
