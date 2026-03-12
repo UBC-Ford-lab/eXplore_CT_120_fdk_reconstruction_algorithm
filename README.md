@@ -46,6 +46,8 @@ python -m reconstruction.run_fdk_recon data/scans/Scan_1681 \
     --voxel-xy 0.075 --voxel-z 0.075 --fov-xy 45 --fov-z 120
 ```
 
+Ring artifact correction is enabled by default (sinogram-space median filter, width 51). Disable with `--no-ring-correction`.
+
 ### Iterative (ASTRA / TIGRE)
 
 ```bash

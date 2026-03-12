@@ -185,9 +185,17 @@ Examples:
     parser.add_argument(
         '--ring-correction',
         action='store_true',
-        help='Enable sinogram-space ring artifact correction. '
+        default=True,
+        dest='ring_correction',
+        help='Enable sinogram-space ring artifact correction (default: enabled). '
              'Removes fixed-pattern detector column offsets that cause '
              'concentric ring artifacts in the reconstruction.'
+    )
+    parser.add_argument(
+        '--no-ring-correction',
+        action='store_false',
+        dest='ring_correction',
+        help='Disable ring artifact correction.'
     )
     parser.add_argument(
         '--ring-median-width',
@@ -311,7 +319,7 @@ def main():
         physical_normalization=True,
         filter_cutoff=filter_cutoff,
         filter_type=args.filter_type,
-        parker_weighting=True,
+        parker_weighting=False,
         metal_artifact_reduction=args.metal_artifact_reduction,
         mar_threshold=args.mar_threshold,
         ring_correction=args.ring_correction,
