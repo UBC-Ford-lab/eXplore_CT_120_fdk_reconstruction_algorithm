@@ -8,32 +8,46 @@ Core utilities for CT reconstruction project including:
 """
 
 from . import vff_io
-from . import calibration
-from . import tiff_converter
-from . import scan_setup
 from . import preprocessing
 
 # Convenience re-exports of commonly used functions
 from .vff_io import read_vff, read_vff_header, read_vff_data, VFFDataset, write_vff
-from .calibration import (
-    parse_calibration_from_xml,
-    load_calibration_fields,
-    flat_field_correction,
-    log_transform_transmission,
-    convert_to_hounsfield_units,
-    MU_WATER_80KV,
-    MU_AIR,
-    PHANTOM_CALIBRATION,
-    fit_hu_calibration,
-)
-from .tiff_converter import save_vff_to_tiff
 from .preprocessing import preprocess_sinogram
-from .scan_setup import (
-    auto_detect_scan_folder,
-    load_scan_data,
-    build_geometry,
-    postprocess_and_save,
-)
+
+# Optional modules with heavier dependencies (xmltodict, cv2, imageio)
+# Wrapped so consumers that only need vff_io aren't blocked.
+try:
+    from . import calibration
+    from .calibration import (
+        parse_calibration_from_xml,
+        load_calibration_fields,
+        flat_field_correction,
+        log_transform_transmission,
+        convert_to_hounsfield_units,
+        MU_WATER_80KV,
+        MU_AIR,
+        PHANTOM_CALIBRATION,
+        fit_hu_calibration,
+    )
+except ImportError:
+    pass
+
+try:
+    from . import tiff_converter
+    from .tiff_converter import save_vff_to_tiff
+except ImportError:
+    pass
+
+try:
+    from . import scan_setup
+    from .scan_setup import (
+        auto_detect_scan_folder,
+        load_scan_data,
+        build_geometry,
+        postprocess_and_save,
+    )
+except ImportError:
+    pass
 
 __all__ = [
     # Modules
