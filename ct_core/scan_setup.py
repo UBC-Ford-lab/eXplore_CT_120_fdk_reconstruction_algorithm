@@ -16,11 +16,7 @@ import numpy as np
 import xmltodict
 
 from .vff_io import VFFDataset, write_vff
-from .calibration import (
-    load_calibration_fields, MU_WATER_80KV,
-    measure_insert_rois, calibrate_volume_polynomial,
-    plot_calibration_diagnostic,
-)
+from .calibration import load_calibration_fields, MU_WATER_80KV
 
 
 def auto_detect_scan_folder(data_folder: str) -> str:
@@ -309,21 +305,14 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None
 
 def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
-                         voxel_xy=0.075, roi_config=None, cal_z_range=None,
-                         cal_degree=2, cal_plot_path=None,
-                         calibration_method='two_point'):
+                         voxel_xy=0.075):
     """
-    Apply HU calibration, optional bilateral filter, and save as VFF.
+    Apply two-point HU calibration, optional bilateral filter, and save as VFF.
 
-    Calibration modes (in priority order):
-      1. Self-calibration (roi_config + cal_z_range provided):
-         Measures phantom inserts in THIS volume and fits a polynomial to
-         its own scale. Use for phantom scans to derive new coefficients.
-      2. Two-point linear (calibration_method='two_point', the default):
-         Measures air and water/tissue from the volume itself, then applies
-         the standard CT HU formula:
-           HU = (raw - water) / (water - air) × 1000
-         Self-calibrating — works regardless of BHC, filter, or normalization.
+    Two-point calibration measures air and water/tissue from the volume itself,
+    then applies the standard CT HU formula:
+        HU = (raw - water) / (water - air) × 1000
+    Self-calibrating — works regardless of BHC, filter, or normalization.
 
     Args:
         volume: Reconstructed volume as numpy array (x, y, z) in uncalibrated HU
@@ -333,76 +322,18 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         bilateral_sigma_spatial: Bilateral filter spatial sigma in mm
         bilateral_sigma_range: Bilateral filter intensity sigma in HU
         voxel_xy: Voxel size in xy plane in mm (for bilateral filter conversion)
-        roi_config: Path to JSON file with phantom insert ROI definitions,
-                    or list of insert dicts. Enables self-calibration mode.
-        cal_z_range: (z_start, z_end) slice range for phantom insert measurements.
-                     Required when roi_config is provided.
-        cal_degree: Polynomial degree for calibration fit (default: 2)
-        cal_plot_path: If set, save calibration diagnostic plot to this path
-                       (without extension). Only used in self-calibration mode.
-        calibration_method: 'two_point' (default). Measures air/water from the
-                           volume and applies standard CT HU formula.
 
     Returns:
         Path to saved VFF file
     """
-    import json
-
     # Extract volume as numpy (x, y, z)
     vol_np = volume.cpu().numpy() if hasattr(volume, 'cpu') else volume
 
     print("\n" + "=" * 60)
-    print("Applying polynomial HU calibration")
+    print("Applying two-point HU calibration")
     print("=" * 60)
 
-    if roi_config is not None:
-        # --- Mode 1: Self-calibration from phantom inserts ---
-        if cal_z_range is None:
-            raise ValueError("cal_z_range is required when roi_config is provided")
-
-        # Load ROI config if it's a file path
-        if isinstance(roi_config, (str, Path)):
-            print(f"  Loading ROI config: {roi_config}")
-            with open(roi_config) as f:
-                insert_rois = json.load(f)["inserts"]
-        else:
-            insert_rois = roi_config
-
-        # The volume is (x, y, z) but measure_insert_rois expects (z, y, x)
-        vol_zyx = vol_np.transpose(2, 1, 0)  # (x, y, z) -> (z, y, x)
-
-        # ROI coordinates are defined in VFF viewer space (y-flipped).
-        # Create a y-flipped view for measurement and plotting.
-        vol_zyx_vff = vol_zyx[:, ::-1, :]
-
-        print(f"  Self-calibration: measuring {len(insert_rois)} inserts "
-              f"at z={cal_z_range[0]}-{cal_z_range[1]}")
-        measurements = measure_insert_rois(vol_zyx_vff, insert_rois, cal_z_range)
-
-        print(f"\n  {'Name':<18s}  {'Measured':>10s}  {'Std':>7s}  {'True HU':>8s}")
-        print("  " + "-" * 50)
-        for m in measurements:
-            print(f"  {m['name']:<18s}  {m['measured_mean']:10.1f}  "
-                  f"{m['measured_std']:7.1f}  {m['true_hu']:8d}")
-
-        # Build calibration pairs and fit — apply to original (un-flipped) volume
-        cal_data = np.array([[m['measured_mean'], m['true_hu']]
-                             for m in measurements])
-        vol_calibrated, coeffs, rms = calibrate_volume_polynomial(
-            vol_zyx, cal_data, degree=cal_degree)
-
-        print(f"\n  Degree-{cal_degree} polynomial coefficients: {coeffs}")
-        print(f"  RMS residual: {rms:.1f} HU")
-
-        # Diagnostic plot (use VFF-oriented slice so circles match inserts)
-        if cal_plot_path:
-            sl = vol_zyx_vff[cal_z_range[0]:cal_z_range[1]].mean(axis=0)
-            plot_calibration_diagnostic(measurements, coeffs, sl, cal_plot_path)
-
-        # Transpose back to (x, y, z)
-        vol_calibrated = vol_calibrated.transpose(2, 1, 0)
-
-    elif calibration_method == 'two_point':
+    if True:
         # --- Mode 2: Two-point linear calibration (standard CT formula) ---
         # Measures air and water/tissue peaks from the volume histogram,
         # then maps: HU = (raw - water_peak) / (water_peak - air_peak) * 1000
@@ -461,12 +392,6 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
               f"{(hu_air - hu_water) * scale:.0f} HU")
         print(f"  Verification: water ({hu_water:.1f}) → "
               f"{(hu_water - hu_water) * scale:.0f} HU")
-
-    else:
-        raise ValueError(
-            f"Unknown calibration_method '{calibration_method}'. "
-            f"Use 'two_point' or provide --roi-config for self-calibration."
-        )
 
     # Optional bilateral filter (edge-preserving denoising)
     if bilateral_filter:

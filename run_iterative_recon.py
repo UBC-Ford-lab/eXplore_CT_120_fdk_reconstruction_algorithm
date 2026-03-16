@@ -124,9 +124,17 @@ Examples:
         '--bhc-coeffs',
         type=float,
         nargs='+',
-        default=None,
-        help='Sinogram-domain BHC polynomial coefficients (e.g., --bhc-coeffs 0.856 0.21). '
-             'Applied after log transform: p_corrected = c1*p + c2*p^2 + ...'
+        default=[0.856, 0.21],
+        help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
+             'beam hardening correction. Default: 0.856 0.21 (80 kVp). '
+             'Use --no-bhc to disable.'
+    )
+    parser.add_argument(
+        '--no-bhc',
+        dest='bhc_coeffs',
+        action='store_const',
+        const=None,
+        help='Disable sinogram-domain beam hardening correction'
     )
     parser.add_argument(
         '--ring-correction',
@@ -204,29 +212,6 @@ Examples:
              'Reduces GPU memory usage. Factor 2 halves each detector dimension.'
     )
 
-    # Calibration arguments
-    parser.add_argument(
-        '--roi-config',
-        default=None,
-        help='JSON file with phantom insert ROI definitions for self-calibration. '
-             'When provided (with --cal-z-range), the pipeline measures inserts in '
-             'this volume and fits a per-method polynomial instead of using the '
-             'hardcoded FDK calibration. Recommended for iterative methods.'
-    )
-    parser.add_argument(
-        '--cal-z-range',
-        type=int,
-        nargs=2,
-        metavar=('Z_START', 'Z_END'),
-        default=None,
-        help='Z-slice range for phantom insert measurements (required with --roi-config)'
-    )
-    parser.add_argument(
-        '--cal-degree',
-        type=int,
-        default=2,
-        help='Polynomial degree for self-calibration fit (default: 2)'
-    )
     parser.add_argument(
         '--calibration-method',
         default='two_point',
@@ -470,7 +455,6 @@ def main():
     reconstructor.reconstruct()
 
     # Post-process and save using shared utility
-    cal_plot = output_path + '_calibration_diagnostic' if args.roi_config else None
     postprocess_and_save(
         volume=reconstructor.reconstructed_volume,
         geometry=geometry,
@@ -479,11 +463,6 @@ def main():
         bilateral_sigma_spatial=args.bilateral_sigma_spatial,
         bilateral_sigma_range=args.bilateral_sigma_range,
         voxel_xy=args.voxel_xy,
-        roi_config=args.roi_config,
-        cal_z_range=tuple(args.cal_z_range) if args.cal_z_range else None,
-        cal_degree=args.cal_degree,
-        cal_plot_path=cal_plot,
-        calibration_method=args.calibration_method,
     )
 
     end = time.time()

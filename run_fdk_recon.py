@@ -146,37 +146,6 @@ Examples:
              'Pixels with -log(T) > threshold are treated as metal-corrupted. '
              'Lower = more aggressive (4.0), higher = more conservative (8.0).'
     )
-    # Calibration arguments
-    parser.add_argument(
-        '--roi-config',
-        default=None,
-        help='JSON file with phantom insert ROI definitions for self-calibration. '
-             'When provided (with --cal-z-range), the pipeline measures inserts in '
-             'this volume and fits a per-method polynomial instead of using the '
-             'hardcoded FDK calibration.'
-    )
-    parser.add_argument(
-        '--cal-z-range',
-        type=int,
-        nargs=2,
-        metavar=('Z_START', 'Z_END'),
-        default=None,
-        help='Z-slice range for phantom insert measurements (required with --roi-config)'
-    )
-    parser.add_argument(
-        '--cal-degree',
-        type=int,
-        default=2,
-        help='Polynomial degree for self-calibration fit (default: 2)'
-    )
-    parser.add_argument(
-        '--calibration-method',
-        default='two_point',
-        help='HU calibration method (default: "two_point"). '
-             'Measures air/water from the volume and applies the standard '
-             'CT HU formula. Self-calibrating, works with any BHC/filter config.'
-    )
-
     parser.add_argument(
         '--ring-correction',
         action='store_true',
@@ -205,17 +174,18 @@ Examples:
         '--bhc-coeffs',
         nargs='+',
         type=float,
-        default=None,
+        default=[0.856, 0.21],
         help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
              'beam hardening correction: p_corrected = c1*p + c2*p^2 + ... '
-             'Calibrate from water phantom using bhc_calibration.py. '
-             'Example: --bhc-coeffs 3.4 0.09'
+             'Default: 0.856 0.21 (calibrated from water phantom at 80 kVp). '
+             'Use --no-bhc to disable.'
     )
     parser.add_argument(
-        '--bhc-file',
-        default=None,
-        help='Path to .npz file containing BHC coefficients (from bhc_calibration.py). '
-             'Must contain a "coeffs" key. Overridden by --bhc-coeffs if both given.'
+        '--no-bhc',
+        dest='bhc_coeffs',
+        action='store_const',
+        const=None,
+        help='Disable sinogram-domain beam hardening correction'
     )
 
     # Bone beam hardening correction (Joseph & Spital two-pass)
@@ -337,15 +307,12 @@ def main():
 
     print(f"\nOutput path: {output_path}")
 
-    # Resolve BHC coefficients
-    bhc_coeffs = None
-    if args.bhc_coeffs is not None:
-        bhc_coeffs = args.bhc_coeffs
-        print(f"\n  BHC coefficients (CLI): {bhc_coeffs}")
-    elif args.bhc_file is not None:
-        bhc_data = np.load(args.bhc_file)
-        bhc_coeffs = bhc_data['coeffs'].tolist()
-        print(f"\n  BHC coefficients ({args.bhc_file}): {bhc_coeffs}")
+    # BHC coefficients (default: 80 kVp water BHC from calibration)
+    bhc_coeffs = args.bhc_coeffs
+    if bhc_coeffs is not None:
+        print(f"\n  BHC coefficients: {bhc_coeffs}")
+    else:
+        print(f"\n  BHC: disabled (--no-bhc)")
 
     # Initialize reconstructor with verified settings
     reconstructor = FDKReconstructor(
@@ -381,7 +348,6 @@ def main():
     reconstructor.reconstruct(display_volume=args.display)
 
     # Post-process and save using shared utility
-    cal_plot = output_path + '_calibration_diagnostic' if args.roi_config else None
     postprocess_and_save(
         volume=reconstructor.reconstructed_volume,
         geometry=geometry,
@@ -390,11 +356,6 @@ def main():
         bilateral_sigma_spatial=args.bilateral_sigma_spatial,
         bilateral_sigma_range=args.bilateral_sigma_range,
         voxel_xy=args.voxel_xy,
-        roi_config=args.roi_config,
-        cal_z_range=tuple(args.cal_z_range) if args.cal_z_range else None,
-        cal_degree=args.cal_degree,
-        cal_plot_path=cal_plot,
-        calibration_method=args.calibration_method,
     )
 
     end = time.time()

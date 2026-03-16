@@ -12,26 +12,25 @@ Raw projections → flat-field + log → BHC → ring correction
   → physics HU → two-point calibration (air→-1000, water→0) → VFF
 ```
 
-Sinogram preprocessing (flat-field, BHC, ring correction) is shared across all backends. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula). Self-calibrating — works regardless of BHC or filter settings.
+BHC (water, 80 kVp) and ring correction are on by default. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula) — self-calibrating regardless of filter or BHC settings.
 
 ## Usage
 
 ```bash
-# FDK with water BHC
+# Standard FDK (BHC + ring correction + two-point HU are all defaults)
 python -m reconstruction.run_fdk_recon data/scans/Scan_1988 \
-    --bhc-coeffs 0.856 0.21 --fov-xy 93.5 --fov-z 70 --total-angle 193.00006
+    --fov-xy 93.5 --fov-z 70
 
 # Add bone BHC (Joseph & Spital two-pass)
 python -m reconstruction.run_fdk_recon data/scans/Scan_1988 \
-    --bhc-coeffs 0.856 0.21 --bone-bhc --fov-xy 93.5 --fov-z 70 --total-angle 193.00006
+    --bone-bhc --fov-xy 93.5 --fov-z 70
 
 # ROI reconstruction (mouse lung)
-python -m reconstruction.run_fdk_recon data/scans/Scan_1510 \
-    --bhc-coeffs 0.856 0.21 --roi auto
+python -m reconstruction.run_fdk_recon data/scans/Scan_1510 --roi auto
 
-# Iterative (ASTRA SIRT) with BHC
+# Iterative (ASTRA SIRT)
 python -m reconstruction.run_iterative_recon data/scans/Scan_1988 \
-    --bhc-coeffs 0.856 0.21 --backend astra --algorithm SIRT3D_CUDA --iterations 100
+    --backend astra --algorithm SIRT3D_CUDA --iterations 100
 ```
 
 Run `--help` for full argument lists.
@@ -40,11 +39,11 @@ Run `--help` for full argument lists.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--bhc-coeffs c1 c2` | None | Sinogram-domain water BHC polynomial |
-| `--bone-bhc` | off | Two-pass bone BHC (Joseph & Spital) |
+| `--bhc-coeffs c1 c2` | `0.856 0.21` | Sinogram-domain water BHC polynomial (80 kVp) |
+| `--no-bhc` | | Disable BHC |
+| `--bone-bhc` | off | Two-pass bone BHC (Joseph & Spital, FDK only) |
 | `--bone-bhc-threshold` | 1500 | HU threshold for bone segmentation |
 | `--bone-bhc-hu` | 3100 | Monochromatic bone HU (from scan.xml `BoneHU`) |
-| `--calibration-method` | `two_point` | HU calibration method |
 | `--ring-correction` | on | Sinogram-space ring artifact correction |
 | `--roi auto` | off | ROI from SubVolumeCoordinates.xml |
 

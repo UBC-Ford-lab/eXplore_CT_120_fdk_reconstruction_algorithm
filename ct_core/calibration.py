@@ -90,6 +90,12 @@ MU_WATER_80KV = 0.0184  # mm⁻¹
 # Linear attenuation coefficient of air (effectively zero)
 MU_AIR = 0.0  # mm⁻¹
 
+# Sinogram-domain BHC polynomial for the GE eXplore CT 120 at 80 kVp.
+# Calibrated from water phantom (Scan_1680) using bhc_sinogram_calibration.py.
+# Applied as: p_corrected = c1*p + c2*p² (no constant term).
+# Scanner-specific (depends on X-ray spectrum), NOT scan-specific.
+BHC_COEFFICIENTS_80KV = [0.856, 0.21]
+
 
 def parse_calibration_from_xml(xml_path: str) -> Dict[str, float]:
     """
