@@ -119,6 +119,34 @@ Examples:
         help='Bilateral filter intensity sigma in HU (default: 50.0)'
     )
 
+    # Beam hardening correction
+    parser.add_argument(
+        '--bhc-coeffs',
+        type=float,
+        nargs='+',
+        default=None,
+        help='Sinogram-domain BHC polynomial coefficients (e.g., --bhc-coeffs 0.856 0.21). '
+             'Applied after log transform: p_corrected = c1*p + c2*p^2 + ...'
+    )
+    parser.add_argument(
+        '--ring-correction',
+        action='store_true',
+        default=True,
+        help='Enable sinogram-space ring artifact correction (default: on)'
+    )
+    parser.add_argument(
+        '--no-ring-correction',
+        dest='ring_correction',
+        action='store_false',
+        help='Disable ring artifact correction'
+    )
+    parser.add_argument(
+        '--ring-median-width',
+        type=int,
+        default=51,
+        help='Median filter width for ring correction (odd int, default: 51)'
+    )
+
     # Backend selection
     parser.add_argument(
         '--backend',
@@ -201,18 +229,10 @@ Examples:
     )
     parser.add_argument(
         '--calibration-method',
-        default=None,
-        help='Method key for stored calibration coefficients (e.g., "astra_sirt", '
-             '"tigre_ossart"). Used for non-phantom scans to apply the correct '
-             'per-method polynomial. Auto-detected from backend/algorithm if not set.'
-    )
-    parser.add_argument(
-        '--scan-type',
-        choices=['half_scan', 'full_scan'],
-        default=None,
-        help='Scan type for selecting stored calibration coefficients. '
-             'Half-scan and full-scan acquisitions have different uncalibrated '
-             'value ranges. Default: half_scan.'
+        default='two_point',
+        help='HU calibration method (default: "two_point"). '
+             'Measures air/water from the volume and applies the standard '
+             'CT HU formula. Self-calibrating, works with any config.'
     )
 
     # TIGRE-specific arguments
@@ -422,6 +442,9 @@ def main():
             dark_field=dark_field,
             mu_water=MU_WATER_80KV,
             output_hu=True,
+            bhc_coeffs=args.bhc_coeffs,
+            ring_correction=args.ring_correction,
+            ring_median_width=args.ring_median_width,
         )
     elif args.backend == 'tigre':
         reconstructor = TIGREReconstructor(
@@ -438,17 +461,13 @@ def main():
             dark_field=dark_field,
             mu_water=MU_WATER_80KV,
             output_hu=True,
+            bhc_coeffs=args.bhc_coeffs,
+            ring_correction=args.ring_correction,
+            ring_median_width=args.ring_median_width,
         )
 
     # Run reconstruction
     reconstructor.reconstruct()
-
-    # Auto-detect calibration method key from backend + algorithm
-    if args.calibration_method:
-        cal_method = args.calibration_method
-    else:
-        algo_short = args.algorithm.lower().replace('3d_cuda', '').replace('_cuda', '')
-        cal_method = f"{args.backend}_{algo_short}"
 
     # Post-process and save using shared utility
     cal_plot = output_path + '_calibration_diagnostic' if args.roi_config else None
@@ -464,8 +483,7 @@ def main():
         cal_z_range=tuple(args.cal_z_range) if args.cal_z_range else None,
         cal_degree=args.cal_degree,
         cal_plot_path=cal_plot,
-        calibration_method=cal_method,
-        scan_type=args.scan_type,
+        calibration_method=args.calibration_method,
     )
 
     end = time.time()

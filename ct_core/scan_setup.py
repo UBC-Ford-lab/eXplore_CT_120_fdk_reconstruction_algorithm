@@ -18,9 +18,8 @@ import xmltodict
 from .vff_io import VFFDataset, write_vff
 from .calibration import (
     load_calibration_fields, MU_WATER_80KV,
-    PHANTOM_CALIBRATION, fit_hu_calibration,
     measure_insert_rois, calibrate_volume_polynomial,
-    plot_calibration_diagnostic, get_calibration_coefficients,
+    plot_calibration_diagnostic,
 )
 
 
@@ -312,20 +311,19 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
                          voxel_xy=0.075, roi_config=None, cal_z_range=None,
                          cal_degree=2, cal_plot_path=None,
-                         calibration_method=None, scan_type=None):
+                         calibration_method='two_point'):
     """
-    Apply polynomial HU calibration, optional bilateral filter, and save as VFF.
+    Apply HU calibration, optional bilateral filter, and save as VFF.
 
     Calibration modes (in priority order):
       1. Self-calibration (roi_config + cal_z_range provided):
          Measures phantom inserts in THIS volume and fits a polynomial to
          its own scale. Use for phantom scans to derive new coefficients.
-      2. Stored per-method coefficients (calibration_method provided):
-         Uses pre-fitted polynomial from CALIBRATION_COEFFICIENTS dict.
-         Use for non-phantom scans (e.g., mouse data).
-      3. Legacy fallback (neither provided):
-         Uses PHANTOM_CALIBRATION fitted from FDK physical normalization.
-         Only accurate for FDK with physical_normalization=True.
+      2. Two-point linear (calibration_method='two_point', the default):
+         Measures air and water/tissue from the volume itself, then applies
+         the standard CT HU formula:
+           HU = (raw - water) / (water - air) × 1000
+         Self-calibrating — works regardless of BHC, filter, or normalization.
 
     Args:
         volume: Reconstructed volume as numpy array (x, y, z) in uncalibrated HU
@@ -342,13 +340,8 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         cal_degree: Polynomial degree for calibration fit (default: 2)
         cal_plot_path: If set, save calibration diagnostic plot to this path
                        (without extension). Only used in self-calibration mode.
-        calibration_method: Method key for stored coefficients (e.g., 'fdk',
-                           'astra_sirt', 'tigre_ossart'). Used when roi_config
-                           is not provided to select the correct per-method
-                           polynomial for non-phantom scans.
-        scan_type: 'half_scan' or 'full_scan'. Selects which set of stored
-                   calibration coefficients to use. If None, uses the default
-                   (half_scan for backward compatibility).
+        calibration_method: 'two_point' (default). Measures air/water from the
+                           volume and applies standard CT HU formula.
 
     Returns:
         Path to saved VFF file
@@ -400,9 +393,6 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
 
         print(f"\n  Degree-{cal_degree} polynomial coefficients: {coeffs}")
         print(f"  RMS residual: {rms:.1f} HU")
-        print(f"\n  To store these coefficients, add to CALIBRATION_COEFFICIENTS in calibration.py:")
-        method_key = calibration_method or "<method>"
-        print(f'    "{method_key}": {coeffs.tolist()},')
 
         # Diagnostic plot (use VFF-oriented slice so circles match inserts)
         if cal_plot_path:
@@ -412,33 +402,71 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         # Transpose back to (x, y, z)
         vol_calibrated = vol_calibrated.transpose(2, 1, 0)
 
-    elif calibration_method is not None:
-        # --- Mode 2: Stored per-method coefficients ---
-        coeffs = get_calibration_coefficients(calibration_method, scan_type=scan_type)
-        if coeffs is not None:
-            st_label = scan_type or "default"
-            print(f"  Mode: stored coefficients for '{calibration_method}' ({st_label})")
-            print(f"  Polynomial coefficients: {coeffs}")
-            vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
-            vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
+    elif calibration_method == 'two_point':
+        # --- Mode 2: Two-point linear calibration (standard CT formula) ---
+        # Measures air and water/tissue peaks from the volume histogram,
+        # then maps: HU = (raw - water_peak) / (water_peak - air_peak) * 1000
+        # This is the standard CT HU definition and works regardless of
+        # BHC, filter, or normalization settings.
+        print("  Mode: two-point linear calibration (air/water from histogram)")
+
+        # --- Measure air value: median of voxels below -500 HU ---
+        air_voxels = vol_np[vol_np < -500.0]
+        if len(air_voxels) > 0:
+            hu_air = float(np.median(air_voxels))
         else:
-            print(f"  WARNING: No stored coefficients for '{calibration_method}'.")
-            print(f"  Run a phantom scan with --roi-config first to derive them.")
-            print(f"  Falling back to legacy PHANTOM_CALIBRATION (FDK-only).")
-            coeffs, rms, _ = fit_hu_calibration(PHANTOM_CALIBRATION, degree=2)
-            print(f"  Degree-2 polynomial coefficients: {coeffs}")
-            print(f"  RMS residual: {rms:.1f} HU")
-            vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
-            vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
+            print("  WARNING: no air voxels found — using -1000")
+            hu_air = -1000.0
+
+        # --- Measure water/tissue value from central ROI ---
+        # Small central ROI (30×30 voxels ≈ 2.25 mm), only z-slices
+        # where the center is inside the object (not air).
+        # Volume is (x, y, z).
+        Nx, Ny, Nz = vol_np.shape
+        cx, cy = Nx // 2, Ny // 2
+        h = min(15, Nx // 10, Ny // 10)
+        center_line = vol_np[cx - h:cx + h, cy - h:cy + h, :]
+        z_means = center_line.mean(axis=(0, 1))
+        inside_mask = z_means > -500.0  # z-slices where center is object
+        n_inside = int(inside_mask.sum())
+
+        if n_inside > 10:
+            center_inside = center_line[:, :, inside_mask]
+            p25, p75 = np.percentile(center_inside, [25, 75])
+            water_voxels = center_inside[
+                (center_inside > p25) & (center_inside < p75)]
+            hu_water = float(np.median(water_voxels))
+            print(f"  Water/tissue ROI: {n_inside} z-slices inside object")
+        else:
+            print("  WARNING: could not segment inside/outside — using 0")
+            hu_water = 0.0
+
+        print(f"  Air value:   {hu_air:.1f} HU")
+        print(f"  Water value: {hu_water:.1f} HU")
+
+        if abs(hu_water - hu_air) < 1.0:
+            print("  WARNING: air and water peaks are too close — "
+                  "falling back to literature values")
+            hu_air = -1000.0
+            hu_water = 0.0
+
+        # Standard CT HU formula: water → 0, air → -1000
+        scale = 1000.0 / (hu_water - hu_air)
+        vol_calibrated = ((vol_np - hu_water) * scale).astype(np.float32)
+        vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
+
+        # Verify calibration
+        print(f"  Scale factor: {scale:.4f}")
+        print(f"  Verification: air ({hu_air:.1f}) → "
+              f"{(hu_air - hu_water) * scale:.0f} HU")
+        print(f"  Verification: water ({hu_water:.1f}) → "
+              f"{(hu_water - hu_water) * scale:.0f} HU")
 
     else:
-        # --- Mode 3: Legacy fallback (FDK-only) ---
-        print("  Mode: legacy PHANTOM_CALIBRATION (FDK physical normalization)")
-        coeffs, rms, _ = fit_hu_calibration(PHANTOM_CALIBRATION, degree=2)
-        print(f"  Degree-2 polynomial coefficients: {coeffs}")
-        print(f"  RMS residual: {rms:.1f} HU")
-        vol_calibrated = np.polyval(coeffs, vol_np).astype(np.float32)
-        vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
+        raise ValueError(
+            f"Unknown calibration_method '{calibration_method}'. "
+            f"Use 'two_point' or provide --roi-config for self-calibration."
+        )
 
     # Optional bilateral filter (edge-preserving denoising)
     if bilateral_filter:

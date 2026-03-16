@@ -18,6 +18,8 @@ import os
 import sys
 import time
 
+import numpy as np
+
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
 from .ct_core.calibration import MU_WATER_80KV
 from .ct_core.scan_setup import (
@@ -169,17 +171,10 @@ Examples:
     )
     parser.add_argument(
         '--calibration-method',
-        default='fdk',
-        help='Method key for stored calibration coefficients (default: "fdk"). '
-             'Used for non-phantom scans to apply the correct polynomial.'
-    )
-    parser.add_argument(
-        '--scan-type',
-        choices=['half_scan', 'full_scan'],
-        default=None,
-        help='Scan type for selecting stored calibration coefficients. '
-             'Half-scan and full-scan acquisitions have different uncalibrated '
-             'value ranges. Default: half_scan.'
+        default='two_point',
+        help='HU calibration method (default: "two_point"). '
+             'Measures air/water from the volume and applies the standard '
+             'CT HU formula. Self-calibrating, works with any BHC/filter config.'
     )
 
     parser.add_argument(
@@ -203,6 +198,48 @@ Examples:
         default=51,
         help='Median filter width for ring correction (default: 51, must be odd). '
              'Controls the scale of features removed. Larger = more aggressive.'
+    )
+
+    # Beam hardening correction
+    parser.add_argument(
+        '--bhc-coeffs',
+        nargs='+',
+        type=float,
+        default=None,
+        help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
+             'beam hardening correction: p_corrected = c1*p + c2*p^2 + ... '
+             'Calibrate from water phantom using bhc_calibration.py. '
+             'Example: --bhc-coeffs 3.4 0.09'
+    )
+    parser.add_argument(
+        '--bhc-file',
+        default=None,
+        help='Path to .npz file containing BHC coefficients (from bhc_calibration.py). '
+             'Must contain a "coeffs" key. Overridden by --bhc-coeffs if both given.'
+    )
+
+    # Bone beam hardening correction (Joseph & Spital two-pass)
+    parser.add_argument(
+        '--bone-bhc',
+        action='store_true',
+        help='Enable two-pass bone BHC (Joseph & Spital method). '
+             'Requires physical_normalization (always on in this pipeline). '
+             'Segments bone from pass-1 reconstruction, forward-projects bone '
+             'contribution, and corrects sinogram before pass-2 backprojection.'
+    )
+    parser.add_argument(
+        '--bone-bhc-threshold',
+        type=float,
+        default=1500,
+        help='HU threshold for bone segmentation in pass-1 volume (default: 1500). '
+             'Voxels above this threshold are classified as bone.'
+    )
+    parser.add_argument(
+        '--bone-bhc-hu',
+        type=float,
+        default=3100,
+        help='Monochromatic bone HU value for correction (default: 3100). '
+             'Used to compute the ideal monochromatic bone attenuation.'
     )
 
     # ROI-based reconstruction
@@ -300,6 +337,16 @@ def main():
 
     print(f"\nOutput path: {output_path}")
 
+    # Resolve BHC coefficients
+    bhc_coeffs = None
+    if args.bhc_coeffs is not None:
+        bhc_coeffs = args.bhc_coeffs
+        print(f"\n  BHC coefficients (CLI): {bhc_coeffs}")
+    elif args.bhc_file is not None:
+        bhc_data = np.load(args.bhc_file)
+        bhc_coeffs = bhc_data['coeffs'].tolist()
+        print(f"\n  BHC coefficients ({args.bhc_file}): {bhc_coeffs}")
+
     # Initialize reconstructor with verified settings
     reconstructor = FDKReconstructor(
         projections=projections,
@@ -324,6 +371,10 @@ def main():
         mar_threshold=args.mar_threshold,
         ring_correction=args.ring_correction,
         ring_median_width=args.ring_median_width,
+        bhc_coeffs=bhc_coeffs,
+        bone_bhc=args.bone_bhc,
+        bone_bhc_threshold=args.bone_bhc_threshold,
+        bone_bhc_hu=args.bone_bhc_hu,
     )
 
     # Run full reconstruction
@@ -344,7 +395,6 @@ def main():
         cal_degree=args.cal_degree,
         cal_plot_path=cal_plot,
         calibration_method=args.calibration_method,
-        scan_type=args.scan_type,
     )
 
     end = time.time()

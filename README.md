@@ -1,69 +1,60 @@
 # eXplore CT 120 Reconstruction
 
-Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner. Supports FDK (analytic), ASTRA (SIRT, CGLS), and TIGRE (OS-SART) backends, all producing calibrated HU volumes from raw VFF projections.
+Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner. Supports FDK (analytic), ASTRA (SIRT, CGLS), and TIGRE (OS-SART) backends.
 
-## Package Structure
+## Pipeline
 
 ```
-reconstruction/
-├── fdk.py                      # FDKReconstructor (PyTorch, GPU-accelerated)
-├── astra_iterative.py          # ASTRAReconstructor (optional, requires astra-toolbox)
-├── tigre_iterative.py          # TIGREReconstructor (optional, requires TIGRE)
-├── run_fdk_recon.py            # CLI: FDK reconstruction
-├── run_iterative_recon.py      # CLI: iterative reconstruction (ASTRA / TIGRE)
-├── ct_core/
-│   ├── vff_io.py               # VFF file I/O and VFFDataset loader
-│   ├── calibration.py          # Flat-field correction, HU calibration
-│   ├── preprocessing.py        # Shared sinogram preprocessing
-│   ├── scan_setup.py           # Shared data-loading and geometry utilities
-│   └── tiff_converter.py       # VFF to TIFF export
-└── pyproject.toml
+Raw projections → flat-field + log → BHC → ring correction
+  → FDK: cone-weight + ramp filter + Parker + backprojection
+    OR iterative: ASTRA SIRT / TIGRE OS-SART
+  → [bone BHC (FDK only): segment → forward-project → re-reconstruct]
+  → physics HU → two-point calibration (air→-1000, water→0) → VFF
 ```
+
+Sinogram preprocessing (flat-field, BHC, ring correction) is shared across all backends. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula). Self-calibrating — works regardless of BHC or filter settings.
+
+## Usage
+
+```bash
+# FDK with water BHC
+python -m reconstruction.run_fdk_recon data/scans/Scan_1988 \
+    --bhc-coeffs 0.856 0.21 --fov-xy 93.5 --fov-z 70 --total-angle 193.00006
+
+# Add bone BHC (Joseph & Spital two-pass)
+python -m reconstruction.run_fdk_recon data/scans/Scan_1988 \
+    --bhc-coeffs 0.856 0.21 --bone-bhc --fov-xy 93.5 --fov-z 70 --total-angle 193.00006
+
+# ROI reconstruction (mouse lung)
+python -m reconstruction.run_fdk_recon data/scans/Scan_1510 \
+    --bhc-coeffs 0.856 0.21 --roi auto
+
+# Iterative (ASTRA SIRT) with BHC
+python -m reconstruction.run_iterative_recon data/scans/Scan_1988 \
+    --bhc-coeffs 0.856 0.21 --backend astra --algorithm SIRT3D_CUDA --iterations 100
+```
+
+Run `--help` for full argument lists.
+
+## Key Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bhc-coeffs c1 c2` | None | Sinogram-domain water BHC polynomial |
+| `--bone-bhc` | off | Two-pass bone BHC (Joseph & Spital) |
+| `--bone-bhc-threshold` | 1500 | HU threshold for bone segmentation |
+| `--bone-bhc-hu` | 3100 | Monochromatic bone HU (from scan.xml `BoneHU`) |
+| `--calibration-method` | `two_point` | HU calibration method |
+| `--ring-correction` | on | Sinogram-space ring artifact correction |
+| `--roi auto` | off | ROI from SubVolumeCoordinates.xml |
 
 ## Installation
 
 ```bash
-# Core (FDK only -- requires PyTorch)
-pip install -e .
-
-# Optional: ASTRA iterative
-pip install astra-toolbox
-
-# Optional: TIGRE iterative (must build from source)
-git clone --depth=1 https://github.com/CERN/TIGRE.git /tmp/TIGRE
-pip install --no-build-isolation /tmp/TIGRE
+pip install -e .                # Core (FDK, requires PyTorch)
+pip install astra-toolbox       # Optional: ASTRA iterative
 ```
-
-## CLI Usage
-
-### FDK
-
-```bash
-python -m reconstruction.run_fdk_recon data/scans/Scan_1681
-
-python -m reconstruction.run_fdk_recon data/scans/Scan_1681 \
-    --filter-type hamming --filter-cutoff match \
-    --voxel-xy 0.075 --voxel-z 0.075 --fov-xy 45 --fov-z 120
-```
-
-Ring artifact correction is enabled by default (sinogram-space median filter, width 51). Disable with `--no-ring-correction`.
-
-### Iterative (ASTRA / TIGRE)
-
-```bash
-# ASTRA SIRT, 100 iterations with non-negativity
-python -m reconstruction.run_iterative_recon data/scans/Scan_1681 \
-    --backend astra --algorithm SIRT3D_CUDA --iterations 100 --min-constraint 0.0
-
-# TIGRE OS-SART, 100 iterations
-python -m reconstruction.run_iterative_recon data/scans/Scan_1681 \
-    --backend tigre --algorithm ossart --iterations 100
-```
-
-ASTRA requires the full sinogram on GPU; use `--downsample` for large volumes. TIGRE handles GPU memory splitting internally.
-
-Run `--help` on either script for full argument lists.
 
 ## Scanner Specifics
 
-Tailored for the **GE eXplore CT 120**: cone-beam geometry, VFF projections, `scan.xml` metadata, `bright.vff`/`dark.vff` calibration. The reconstruction algorithms are general-purpose -- adapting to other scanners requires only changing geometry parameters and file I/O.
+Tailored for the **GE eXplore CT 120**: cone-beam geometry, VFF projections, `scan.xml` metadata, `bright.vff`/`dark.vff` flat-field. Algorithms are general-purpose — adapting to other scanners requires only changing geometry and file I/O.

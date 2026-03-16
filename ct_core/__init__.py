@@ -26,7 +26,6 @@ try:
         convert_to_hounsfield_units,
         MU_WATER_80KV,
         MU_AIR,
-        PHANTOM_CALIBRATION,
         fit_hu_calibration,
     )
 except ImportError:
@@ -69,7 +68,6 @@ __all__ = [
     'convert_to_hounsfield_units',
     'MU_WATER_80KV',
     'MU_AIR',
-    'PHANTOM_CALIBRATION',
     'fit_hu_calibration',
     # TIFF
     'save_vff_to_tiff',

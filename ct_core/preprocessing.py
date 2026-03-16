@@ -1,26 +1,32 @@
 """
-Shared sinogram preprocessing: flat-field correction + log transform.
+Shared sinogram preprocessing for iterative backends (ASTRA, TIGRE).
 
-Extracted from astra_iterative.py to share between ASTRA and TIGRE backends.
-Both iterative backends need identical preprocessing (flat-field → transmission
-→ log transform) but skip cone-beam weighting and ramp filtering (those are
-FDK-specific; iterative algorithms model the forward operator internally).
+Pipeline: flat-field → log → BHC → ring correction.
+Cone-beam weighting and ramp filtering are FDK-specific and not applied here
+(iterative algorithms model the forward operator internally).
 """
 
 import numpy as np
 
 
+def _apply_bhc(chunk, bhc_coeffs):
+    """Apply BHC polynomial: p_corrected = c1*p + c2*p^2 + ..."""
+    result = bhc_coeffs[0] * chunk
+    for k in range(1, len(bhc_coeffs)):
+        result = result + bhc_coeffs[k] * chunk ** (k + 1)
+    return result
+
+
 def preprocess_sinogram(projections, bright_field, dark_field,
                         clamp_mode='none', soft_clip_transmission=True,
                         soft_clip_sharpness=50.0, upper_clamp=True,
-                        upper_clamp_value=1.05, chunk_angles=20):
+                        upper_clamp_value=1.05, chunk_angles=20,
+                        bhc_coeffs=None,
+                        ring_correction=False, ring_median_width=51):
     """
-    Apply flat-field correction and log transform to raw projections.
+    Apply flat-field correction, log transform, BHC, and ring correction.
 
-    Processes in chunks along the angle dimension to avoid creating
-    multiple full-sized intermediate arrays (which can easily exceed
-    system RAM for large detectors). Peak memory is approximately:
-        output_sinogram + chunk_angles * N_b * N_a * ~3 intermediates
+    Processes in chunks along the angle dimension to limit peak memory.
 
     Args:
         projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -33,8 +39,11 @@ def preprocess_sinogram(projections, bright_field, dark_field,
         soft_clip_sharpness: Sharpness of soft clip transition
         upper_clamp: Clamp transmission from above
         upper_clamp_value: Maximum allowed transmission value
-        chunk_angles: Number of projection angles per chunk (default 20).
-            Smaller = less RAM, larger = slightly faster.
+        chunk_angles: Number of projection angles per chunk (default 20)
+        bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None.
+            Applied after log transform: p_corrected = c1*p + c2*p^2 + ...
+        ring_correction: Apply sinogram-space ring artifact correction
+        ring_median_width: Median filter width for ring correction (odd int)
 
     Returns:
         np.ndarray of line integrals, shape (N_angles, N_b, N_a), float32
@@ -43,7 +52,13 @@ def preprocess_sinogram(projections, bright_field, dark_field,
         print("No bright/dark fields — using projections as-is (assumed pre-processed)")
         return np.array(projections, dtype=np.float32)
 
-    print("Preprocessing: flat-field correction + log transform (chunked)...")
+    print("Preprocessing: flat-field + log", end="")
+    if bhc_coeffs is not None:
+        coeff_str = ", ".join(f"c{k+1}={c:.6f}" for k, c in enumerate(bhc_coeffs))
+        print(f" + BHC ({coeff_str})", end="")
+    if ring_correction:
+        print(f" + ring correction (width={ring_median_width})", end="")
+    print(" ...")
 
     N_angles, N_b, N_a = projections.shape
 
@@ -60,7 +75,7 @@ def preprocess_sinogram(projections, bright_field, dark_field,
     sinogram = np.empty((N_angles, N_b, N_a), dtype=np.float32)
 
     bytes_per_proj = N_b * N_a * 4
-    chunk_mem = chunk_angles * bytes_per_proj * 3  # ~3 intermediates per chunk
+    chunk_mem = chunk_angles * bytes_per_proj * 3
     print(f"  Chunk size: {chunk_angles} angles, "
           f"~{chunk_mem / 2**30:.2f} GiB peak per chunk")
 
@@ -112,7 +127,22 @@ def preprocess_sinogram(projections, bright_field, dark_field,
         elif clamp_mode == "hard":
             np.maximum(chunk, 0.0, out=chunk)
 
+        # Beam hardening correction
+        if bhc_coeffs is not None:
+            chunk = _apply_bhc(chunk, bhc_coeffs)
+
         sinogram[start:end] = chunk
+
+    # Ring correction (needs full sinogram — applied after chunked loop)
+    if ring_correction:
+        from scipy.ndimage import median_filter
+        print(f"  Ring correction: computing column profile...")
+        mean_sino = sinogram.mean(axis=0)
+        smoothed = median_filter(mean_sino, size=(1, ring_median_width))
+        ring_artifact = mean_sino - smoothed
+        sinogram -= ring_artifact[np.newaxis, :, :]
+        ring_mag = np.abs(ring_artifact).max()
+        print(f"  Ring correction applied: max correction = {ring_mag:.6f}")
 
     print(f"  Sinogram range: [{sinogram.min():.4f}, {sinogram.max():.4f}]")
     return sinogram

@@ -360,22 +360,9 @@ def validate_hu_calibration(
 # Phantom Insert Calibration Data
 # =============================================================================
 
-# Measured HU values from physical normalization vs true HU from phantom datasheet.
-# Used to fit a polynomial correction that maps uncalibrated physical HU to
-# correct HU values. Columns: (measured_HU_physical, true_HU_datasheet)
-PHANTOM_CALIBRATION = np.array([
-    [708.345, 1460],
-    [-984.921, -940],
-    [-454.535, 30],
-    [-414.576, 80],
-    [-374.798, 130],
-    [-309.299, 220],
-    [-168.703, 410],
-    [118.486, 770],
-])
-
 # True HU values for each phantom insert (from manufacturer datasheet).
 # Ordered by ascending true HU. Names are descriptive labels.
+# Used by self-calibration mode (--roi-config) for phantom scans.
 PHANTOM_INSERT_TRUE_HU = [
     ("air",       -940),
     ("insert_30",   30),
@@ -386,83 +373,6 @@ PHANTOM_INSERT_TRUE_HU = [
     ("insert_770", 770),
     ("bone",      1460),
 ]
-
-
-# =============================================================================
-# Per-method polynomial calibration coefficients
-# =============================================================================
-# Nested by scan type ("half_scan" or "full_scan"), then by reconstruction
-# method.  Coefficients are for np.polyval: HU_true = polyval(c, HU_raw).
-#
-# These are fitted from phantom self-calibration (--roi-config) and stored here
-# so non-phantom scans can use the correct per-method polynomial without inserts.
-#
-# Half-scan and full-scan acquisitions have different numbers of projections,
-# leading to different backprojection normalizations and thus different
-# uncalibrated value ranges.  A polynomial fitted on one scan type does NOT
-# transfer to the other.
-#
-# To regenerate: run a phantom reconstruction with --roi-config, note the
-# printed coefficients, and update this dict.
-CALIBRATION_COEFFICIENTS = {
-    # ---------------------------------------------------------------
-    # Half-scan coefficients  (from Scan_1988, QRM phantom, 7 inserts, degree-2)
-    # ---------------------------------------------------------------
-    "half_scan": {
-        # FDK with physical_normalization=True, hamming filter (RMS 39.2 HU)
-        "fdk": [-0.0007132818094142021, 2.128889255893252, 1896.855740800915],
-
-        # ASTRA SIRT (100 iterations, min_constraint=0) (RMS 36.2 HU)
-        "astra_sirt": [-3.6050254803021966e-05, 1.3530360794967076, -92.19078961741268],
-
-        # TIGRE OS-SART (100 iterations) (RMS 35.2 HU)
-        "tigre_ossart": [-4.135028143804179e-05, 1.1690824907050639, -116.2569444229479],
-    },
-
-    # ---------------------------------------------------------------
-    # Full-scan coefficients  (from Scan_1989, QRM phantom, 7 inserts, degree-2)
-    # ---------------------------------------------------------------
-    "full_scan": {
-        # FDK with physical_normalization=True, hamming filter (RMS 31.8 HU)
-        "fdk": [-0.00016957771890721148, 1.4068691691082866, 634.9725504813525],
-
-        # ASTRA SIRT (100 iterations, min_constraint=0) (RMS 47.2 HU)
-        "astra_sirt": [-5.6346843901515365e-05, 1.402740763274877, -109.83505093406858],
-
-        # TIGRE OS-SART (100 iterations) (RMS 36.9 HU)
-        "tigre_ossart": [-4.8887881440773636e-05, 1.2077501396636758, -77.80945440483856],
-    },
-}
-
-# Default scan type when not specified (backward compatibility)
-DEFAULT_SCAN_TYPE = "half_scan"
-
-
-def get_calibration_coefficients(method: str, scan_type: str = None):
-    """
-    Look up stored polynomial calibration coefficients for a method.
-
-    Args:
-        method: Method key (e.g., 'fdk', 'astra_sirt', 'tigre_ossart')
-        scan_type: 'half_scan' or 'full_scan'. If None, uses DEFAULT_SCAN_TYPE.
-
-    Returns:
-        numpy array of polynomial coefficients for np.polyval, or None if
-        no stored coefficients exist for this method/scan_type combination.
-    """
-    if scan_type is None:
-        scan_type = DEFAULT_SCAN_TYPE
-
-    scan_dict = CALIBRATION_COEFFICIENTS.get(scan_type)
-    if scan_dict is None:
-        print(f"  WARNING: Unknown scan_type '{scan_type}'. "
-              f"Available: {list(CALIBRATION_COEFFICIENTS.keys())}")
-        return None
-
-    coeffs = scan_dict.get(method)
-    if coeffs is not None:
-        return np.array(coeffs)
-    return None
 
 
 def fit_hu_calibration(calibration_data: np.ndarray, degree: int = 2):
@@ -626,18 +536,12 @@ if __name__ == '__main__':
     print("=" * 60)
 
     # Parse calibration
-    calibration = parse_calibration_from_xml(str(xml_path))
+    cal = parse_calibration_from_xml(str(xml_path))
     print(f"\nCalibration values from XML:")
-    print(f"  Air Value:   {calibration['air_value']}")
-    print(f"  Water Value: {calibration['water_value']}")
-    print(f"  Bone HU:     {calibration['bone_hu']}")
+    print(f"  Air Value:   {cal['air_value']}")
+    print(f"  Water Value: {cal['water_value']}")
+    print(f"  Bone HU:     {cal['bone_hu']}")
     print(f"  Literature mu_water at 80 keV: {MU_WATER_80KV} mm⁻¹")
-
-    # Test polynomial calibration fit
-    coeffs, rms, _ = fit_hu_calibration(PHANTOM_CALIBRATION)
-    print(f"\nPolynomial calibration fit (degree 2):")
-    print(f"  Coefficients: {coeffs}")
-    print(f"  RMS residual: {rms:.1f} HU")
 
     print("\n" + "=" * 60)
     print("Module test complete.")

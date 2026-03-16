@@ -176,7 +176,9 @@ class TIGREReconstructor:
                  clamp_mode='none', soft_clip_transmission=True,
                  soft_clip_sharpness=50.0, upper_clamp=True,
                  upper_clamp_value=1.05,
-                 mu_water=MU_WATER_80KV, output_hu=True):
+                 mu_water=MU_WATER_80KV, output_hu=True,
+                 bhc_coeffs=None,
+                 ring_correction=False, ring_median_width=51):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -201,6 +203,9 @@ class TIGREReconstructor:
             upper_clamp_value: Maximum allowed transmission value
             mu_water: Linear attenuation coefficient of water (mm^-1)
             output_hu: Convert output to Hounsfield Units
+            bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None
+            ring_correction: Apply sinogram-space ring artifact correction
+            ring_median_width: Median filter width for ring correction (odd int)
         """
         _check_tigre_available()
 
@@ -233,6 +238,11 @@ class TIGREReconstructor:
         # HU conversion parameters
         self.mu_water = mu_water
         self.output_hu = output_hu
+
+        # BHC and ring correction
+        self.bhc_coeffs = bhc_coeffs
+        self.ring_correction = ring_correction
+        self.ring_median_width = ring_median_width
 
         self.reconstructed_volume = None
 
@@ -307,6 +317,9 @@ class TIGREReconstructor:
             soft_clip_sharpness=self.soft_clip_sharpness,
             upper_clamp=self.upper_clamp,
             upper_clamp_value=self.upper_clamp_value,
+            bhc_coeffs=self.bhc_coeffs,
+            ring_correction=self.ring_correction,
+            ring_median_width=self.ring_median_width,
         )
 
         # Step 2: Build TIGRE geometry (may pad Nxy to avoid CUDA hang)
