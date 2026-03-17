@@ -147,6 +147,19 @@ Examples:
              'Lower = more aggressive (4.0), higher = more conservative (8.0).'
     )
     parser.add_argument(
+        '--parker-weighting',
+        action='store_true',
+        default=True,
+        dest='parker_weighting',
+        help='Enable Parker (short-scan) redundancy weighting (default: enabled).'
+    )
+    parser.add_argument(
+        '--no-parker',
+        action='store_false',
+        dest='parker_weighting',
+        help='Disable Parker weighting (for comparison experiments).'
+    )
+    parser.add_argument(
         '--ring-correction',
         action='store_true',
         default=True,
@@ -333,7 +346,7 @@ def main():
         physical_normalization=True,
         filter_cutoff=filter_cutoff,
         filter_type=args.filter_type,
-        parker_weighting=False,
+        parker_weighting=args.parker_weighting,
         metal_artifact_reduction=args.metal_artifact_reduction,
         mar_threshold=args.mar_threshold,
         ring_correction=args.ring_correction,
