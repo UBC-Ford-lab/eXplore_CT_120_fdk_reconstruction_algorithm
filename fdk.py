@@ -963,16 +963,25 @@ class FDKReconstructor:
             delta_beta = 2 * np.pi  # Single projection edge case
         if self.physical_normalization:
             parker_applied = getattr(self, '_parker_applied', False)
+            angle_range_deg = abs(float(self.angles[-1] - self.angles[0])) * 180 / np.pi
+            is_full_scan = angle_range_deg >= 350.0
+
             if parker_applied:
                 # Parker weights (conjugate pairs sum to 1) already ensure each
                 # ray is counted exactly once → no 1/2 prefactor needed.
                 self.reconstructed_volume *= delta_beta
                 print(f"Applied angular normalization (Parker, no 1/2): Δβ = {float(delta_beta):.6f}")
-            else:
-                # Full scan: each ray counted twice → 1/2 prefactor required.
+            elif is_full_scan:
+                # Full scan without Parker: each ray counted twice → 1/2 prefactor.
                 # μ = (1/2) ∫₀²π [R_s²/U²] g̃(β,a) dβ
                 self.reconstructed_volume *= delta_beta / 2.0
-                print(f"Applied angular normalization with FDK 1/2 prefactor: Δβ/2 = {float(delta_beta)/2.0:.6f}")
+                print(f"Applied angular normalization (full scan, 1/2): Δβ/2 = {float(delta_beta)/2.0:.6f}")
+            else:
+                # Short scan without Parker: rays are NOT uniformly redundant,
+                # so no 1/2 prefactor. Result will have shading artifacts but
+                # correct overall scale.
+                self.reconstructed_volume *= delta_beta
+                print(f"Applied angular normalization (short scan, no Parker, no 1/2): Δβ = {float(delta_beta):.6f}")
         else:
             self.reconstructed_volume *= delta_beta
         print(f"Angular step: Δβ = {float(delta_beta):.6f} rad ({float(delta_beta) * 180 / np.pi:.4f}°)")

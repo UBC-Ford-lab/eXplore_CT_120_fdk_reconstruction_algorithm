@@ -305,7 +305,7 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None
 
 def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
-                         voxel_xy=0.075):
+                         voxel_xy=0.075, skip_calibration=False):
     """
     Apply two-point HU calibration, optional bilateral filter, and save as VFF.
 
@@ -322,6 +322,9 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         bilateral_sigma_spatial: Bilateral filter spatial sigma in mm
         bilateral_sigma_range: Bilateral filter intensity sigma in HU
         voxel_xy: Voxel size in xy plane in mm (for bilateral filter conversion)
+        skip_calibration: If True, skip two-point calibration and save the
+            physics-based HU output directly. Useful when comparing filter
+            settings where the auto-measured water peak varies with noise.
 
     Returns:
         Path to saved VFF file
@@ -329,11 +332,12 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
     # Extract volume as numpy (x, y, z)
     vol_np = volume.cpu().numpy() if hasattr(volume, 'cpu') else volume
 
-    print("\n" + "=" * 60)
-    print("Applying two-point HU calibration")
-    print("=" * 60)
-
-    if True:
+    if skip_calibration:
+        print("\n" + "=" * 60)
+        print("Skipping two-point calibration (physics HU only)")
+        print("=" * 60)
+        vol_calibrated = np.clip(vol_np, -1024, 4095).astype(np.float32)
+    elif True:
         # --- Mode 2: Two-point linear calibration (standard CT formula) ---
         # Measures air and water/tissue peaks from the volume histogram,
         # then maps: HU = (raw - water_peak) / (water_peak - air_peak) * 1000
