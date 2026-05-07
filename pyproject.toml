@@ -27,7 +27,7 @@ dependencies = [
     "xmltodict",
     "imageio",
     "matplotlib",
-    "cv2",
+    "opencv-python-headless",
     "tqdm",
 ]
 
