@@ -456,7 +456,7 @@ class TIGREReconstructor:
                 # Correct starting lambda so decay is continuous across chunks.
                 chunk_kwargs['lmbda'] = self.lmbda * (self.lmbda_red ** i_done)
                 if vol_tigre is not None:
-                    chunk_kwargs['x0'] = vol_tigre
+                    chunk_kwargs['init'] = vol_tigre
 
                 vol_tigre = alg_func(sinogram, geo, tigre_angles, chunk, **chunk_kwargs)
                 i_done += chunk
