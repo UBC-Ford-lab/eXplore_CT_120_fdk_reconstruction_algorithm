@@ -273,7 +273,8 @@ class TIGREReconstructor:
         self.holdout_index = holdout_index
         self.eval_every = eval_every
         self.patience = patience
-        self.best_iter = None  # set during reconstruct() when crossval is on
+        self.best_iter = None       # set during reconstruct() when crossval is on
+        self.crossval_metrics = None  # dict of lists; set after reconstruct()
 
         self.reconstructed_volume = None
 
@@ -442,10 +443,12 @@ class TIGREReconstructor:
             vol_tigre = None
             best_vol = None
             best_ssim = -1.0
+            best_psnr = 0.0
             best_iter = 0
             patience_count = 0
             chunk_kwargs = {**kwargs, 'verbose': False}
             i_done = 0
+            cv_iters, cv_ssim, cv_psnr, cv_mse = [], [], [], []
 
             while i_done < self.iterations:
                 chunk = min(self.eval_every, self.iterations - i_done)
@@ -465,8 +468,14 @@ class TIGREReconstructor:
                         if mse > 0 else float('inf'))
                 ssim = float(_ssim_fn(holdout_proj, pred, data_range=data_range))
 
+                cv_iters.append(i_done)
+                cv_ssim.append(ssim)
+                cv_psnr.append(psnr)
+                cv_mse.append(mse)
+
                 if ssim > best_ssim:
                     best_ssim = ssim
+                    best_psnr = psnr
                     best_iter = i_done
                     best_vol = vol_tigre.copy()
                     patience_count = 0
@@ -485,15 +494,26 @@ class TIGREReconstructor:
                     break
 
             else:
-                # Loop completed without early stop — check if best was not last.
                 if best_iter < i_done:
                     print(f"\n  Note: peak SSIM={best_ssim:.6f} was at iter {best_iter}, "
                           f"not the final iteration.")
 
             vol_tigre = best_vol
             self.best_iter = best_iter
+            self.crossval_metrics = {
+                'iters': cv_iters,
+                'ssim': cv_ssim,
+                'psnr': cv_psnr,
+                'mse': cv_mse,
+                'best_iter': best_iter,
+                'best_ssim': best_ssim,
+                'best_psnr': best_psnr,
+                'stop_iter': i_done,
+                'holdout_index': idx,
+                'holdout_deg': holdout_deg,
+            }
             print(f"  Saving volume from iter {best_iter} "
-                  f"(SSIM={best_ssim:.6f}, PSNR={psnr:.4f} dB)\n")
+                  f"(SSIM={best_ssim:.6f}, PSNR={best_psnr:.4f} dB)\n")
 
         t_recon = time.time() - t_start
         del sinogram
@@ -553,3 +573,135 @@ class TIGREReconstructor:
 
         print("\nReconstruction complete.")
         return self.reconstructed_volume
+
+    def plot_crossval(self, save_prefix):
+        """
+        Save a publication-quality convergence figure to
+        {save_prefix}_convergence.pdf and .png.
+
+        Must be called after reconstruct() when crossval=True.
+        """
+        if self.crossval_metrics is None:
+            return
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.ticker as mticker
+        except ImportError:
+            print("  matplotlib not available — skipping convergence figure.")
+            return
+
+        m = self.crossval_metrics
+        iters     = np.asarray(m['iters'])
+        cv_ssim   = np.asarray(m['ssim'])
+        cv_psnr   = np.asarray(m['psnr'])
+        cv_mse    = np.asarray(m['mse'])
+        best_iter = m['best_iter']
+        stop_iter = m['stop_iter']
+
+        # ── Publication style ────────────────────────────────────────────────
+        rc = {
+            'font.family':        'sans-serif',
+            'font.size':          9,
+            'axes.labelsize':     9,
+            'axes.titlesize':     9,
+            'xtick.labelsize':    8,
+            'ytick.labelsize':    8,
+            'legend.fontsize':    8,
+            'legend.framealpha':  0.85,
+            'axes.linewidth':     0.75,
+            'xtick.major.width':  0.75,
+            'ytick.major.width':  0.75,
+            'xtick.minor.width':  0.5,
+            'ytick.minor.width':  0.5,
+            'xtick.direction':    'out',
+            'ytick.direction':    'out',
+            'lines.linewidth':    1.5,
+            'patch.linewidth':    0.75,
+            'pdf.fonttype':       42,   # embed TrueType, not Type 3
+            'ps.fonttype':        42,
+        }
+
+        blue  = '#2166ac'
+        red   = '#d6604d'
+        green = '#1a9641'
+        grey  = '#555555'
+
+        with plt.rc_context(rc):
+            fig, axes = plt.subplots(3, 1, figsize=(3.5, 6.0), sharex=True)
+
+            # Shade patience region (between best and stop) on all panels
+            if stop_iter > best_iter:
+                for ax in axes:
+                    ax.axvspan(best_iter, stop_iter, color='#ffcccc',
+                               alpha=0.45, zorder=0, linewidth=0)
+
+            # Vertical line at peak
+            for ax in axes:
+                ax.axvline(best_iter, color=grey, linestyle='--',
+                           linewidth=0.9, zorder=2)
+
+            # ── Panel 1: SSIM ────────────────────────────────────────────────
+            ax = axes[0]
+            ax.plot(iters, cv_ssim, color=blue, linewidth=1.5, zorder=3)
+            best_idx  = int(np.where(iters == best_iter)[0][0])
+            ax.scatter([best_iter], [cv_ssim[best_idx]], color=blue,
+                       s=60, zorder=4, marker='*', linewidths=0)
+            ax.set_ylabel('SSIM')
+            y_pad = (cv_ssim.max() - cv_ssim.min()) * 0.12 or 0.01
+            ax.set_ylim(cv_ssim.min() - y_pad, cv_ssim.max() + y_pad)
+            ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+            ax.legend(
+                handles=[
+                    plt.Line2D([0], [0], color=grey, linestyle='--',
+                               linewidth=0.9, label=f'Peak iter {best_iter}'),
+                    plt.Line2D([0], [0], color='#ffcccc', linewidth=6,
+                               solid_capstyle='butt',
+                               label=f'Patience window'),
+                ],
+                loc='lower right', handlelength=1.2,
+            )
+
+            # ── Panel 2: PSNR ────────────────────────────────────────────────
+            ax = axes[1]
+            ax.plot(iters, cv_psnr, color=red, linewidth=1.5, zorder=3)
+            ax.scatter([best_iter], [cv_psnr[best_idx]], color=red,
+                       s=60, zorder=4, marker='*', linewidths=0)
+            ax.set_ylabel('PSNR (dB)')
+            y_pad = (cv_psnr.max() - cv_psnr.min()) * 0.12 or 0.1
+            ax.set_ylim(cv_psnr.min() - y_pad, cv_psnr.max() + y_pad)
+            ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+
+            # ── Panel 3: Holdout MSE (log scale) ─────────────────────────────
+            ax = axes[2]
+            ax.semilogy(iters, cv_mse, color=green, linewidth=1.5, zorder=3)
+            ax.scatter([best_iter], [cv_mse[best_idx]], color=green,
+                       s=60, zorder=4, marker='*', linewidths=0)
+            ax.set_ylabel('Holdout MSE')
+            ax.set_xlabel('Iteration')
+            ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation())
+            ax.grid(True, which='minor', color='#e0e0e0',
+                    linewidth=0.4, zorder=0)
+
+            # ── Shared formatting ─────────────────────────────────────────────
+            for ax in axes:
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.grid(True, which='major', color='#dddddd',
+                        linewidth=0.5, zorder=0)
+                ax.set_axisbelow(True)
+
+            # Tighten x-axis to data range
+            axes[0].set_xlim(iters[0] - self.eval_every * 0.5,
+                             iters[-1] + self.eval_every * 0.5)
+
+            plt.tight_layout(pad=0.6, h_pad=0.4)
+
+            for ext in ('pdf', 'png'):
+                path = f"{save_prefix}_convergence.{ext}"
+                fig.savefig(path, dpi=300, bbox_inches='tight')
+                print(f"  Saved convergence figure: {path}")
+
+            plt.close(fig)

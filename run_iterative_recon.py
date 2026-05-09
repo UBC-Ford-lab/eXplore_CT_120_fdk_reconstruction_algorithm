@@ -506,6 +506,10 @@ def main():
     # Run reconstruction
     reconstructor.reconstruct()
 
+    # Save convergence figure (no-op if crossval was off)
+    if hasattr(reconstructor, 'plot_crossval'):
+        reconstructor.plot_crossval(output_path)
+
     # Post-process and save using shared utility
     postprocess_and_save(
         volume=reconstructor.reconstructed_volume,
