@@ -471,6 +471,16 @@ class TIGREReconstructor:
 
                 # Forward-project at holdout angle and compute metrics.
                 pred = tigre.Ax(vol_tigre, geo, holdout_angle, 'interpolated')[0]
+
+                # Diagnostic: print ranges on first checkpoint to verify alignment.
+                if i_done == self.eval_every:
+                    print(f"  [diag] holdout: min={holdout_proj.min():.4f} "
+                          f"max={holdout_proj.max():.4f} "
+                          f"mean={holdout_proj.mean():.4f}")
+                    print(f"  [diag] pred:    min={pred.min():.4f} "
+                          f"max={pred.max():.4f} "
+                          f"mean={pred.mean():.4f}")
+
                 mse = float(np.mean((pred - holdout_proj) ** 2))
                 psnr = (10.0 * np.log10(data_range ** 2 / mse)
                         if mse > 0 else float('inf'))
