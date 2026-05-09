@@ -168,6 +168,27 @@ Examples:
         help='Re-enable two-point auto-calibration (not recommended for mouse scans)'
     )
 
+    # Cross-validation holdout
+    parser.add_argument(
+        '--holdout-index',
+        type=int,
+        default=None,
+        metavar='N',
+        help='Projection index to hold out for cross-validation. That projection '
+             'is excluded from reconstruction; every --eval-every iterations the '
+             'current volume is forward-projected at that angle and PSNR/SSIM/MSE '
+             'are printed vs the actual holdout projection. TIGRE backend only. '
+             '(default: disabled)'
+    )
+    parser.add_argument(
+        '--eval-every',
+        type=int,
+        default=10,
+        metavar='K',
+        help='Evaluate holdout metrics every K iterations (default: 10). '
+             'Only used when --holdout-index is set.'
+    )
+
     # Backend selection
     parser.add_argument(
         '--backend',
@@ -426,6 +447,9 @@ def main():
 
     # Initialize reconstructor based on backend
     if args.backend == 'astra':
+        if args.holdout_index is not None:
+            print("WARNING: --holdout-index is only supported with --backend tigre. "
+                  "Ignoring holdout for ASTRA backend.")
         reconstructor = ASTRAReconstructor(
             projections=projections,
             angles=angles_np,
@@ -460,6 +484,8 @@ def main():
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             ring_median_width=args.ring_median_width,
+            holdout_index=args.holdout_index,
+            eval_every=args.eval_every,
         )
 
     # Run reconstruction

@@ -23,6 +23,11 @@ try:
 except ImportError:
     tigre = None
 
+try:
+    from skimage.metrics import structural_similarity as _ssim_fn
+except ImportError:
+    _ssim_fn = None
+
 from .ct_core.calibration import (MU_WATER_80KV,
                                    MU_WATER_80KV_NO_BHC,
                                    MU_WATER_80KV_WITH_BHC)
@@ -180,7 +185,8 @@ class TIGREReconstructor:
                  upper_clamp_value=1.05,
                  mu_water=None, output_hu=True,
                  bhc_coeffs=None,
-                 ring_correction=False, ring_median_width=51):
+                 ring_correction=False, ring_median_width=51,
+                 holdout_index=None, eval_every=10):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -208,6 +214,13 @@ class TIGREReconstructor:
             bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None
             ring_correction: Apply sinogram-space ring artifact correction
             ring_median_width: Median filter width for ring correction (odd int)
+            holdout_index: int or None. If set, this projection index is removed
+                from the sinogram before reconstruction and used as a held-out
+                validation view. After every eval_every iterations the current
+                volume is forward-projected at that angle and PSNR/SSIM/MSE are
+                printed vs the actual holdout projection. (default: None)
+            eval_every: int. Evaluate holdout metrics every this many iterations.
+                Ignored when holdout_index is None. (default: 10)
         """
         _check_tigre_available()
 
@@ -249,6 +262,10 @@ class TIGREReconstructor:
         self.bhc_coeffs = bhc_coeffs
         self.ring_correction = ring_correction
         self.ring_median_width = ring_median_width
+
+        # Cross-validation holdout
+        self.holdout_index = holdout_index
+        self.eval_every = eval_every
 
         self.reconstructed_volume = None
 
@@ -351,6 +368,18 @@ class TIGREReconstructor:
         # Flip columns to match TIGRE's detector convention.
         sinogram = np.ascontiguousarray(sinogram[:, :, ::-1], dtype=np.float32)
 
+        # Holdout cross-validation: extract one projection before reconstruction.
+        holdout_proj = None
+        if self.holdout_index is not None:
+            idx = self.holdout_index
+            holdout_proj = sinogram[idx].copy()       # (N_b, N_a) TIGRE convention
+            holdout_angle = tigre_angles[idx:idx + 1]
+            sinogram = np.delete(sinogram, idx, axis=0)
+            tigre_angles = np.delete(tigre_angles, idx, axis=0)
+            holdout_deg = float(np.rad2deg(self.angles[idx]))
+            print(f"\nHoldout: projection {idx} ({holdout_deg:.1f}° FDK) "
+                  f"excluded; eval every {self.eval_every} iterations.")
+
         alg_func = _TIGRE_ALG_FUNCS[self.algorithm]()
 
         kwargs = {
@@ -383,7 +412,50 @@ class TIGREReconstructor:
               f"lambda={self.lmbda}, lambda_red={self.lmbda_red})...")
 
         t_start = time.time()
-        vol_tigre = alg_func(sinogram, geo, tigre_angles, self.iterations, **kwargs)
+
+        if holdout_proj is None:
+            # No cross-validation: run all iterations at once.
+            vol_tigre = alg_func(sinogram, geo, tigre_angles, self.iterations, **kwargs)
+        else:
+            # Cross-validation: run in chunks, eval after each.
+            if _ssim_fn is None:
+                raise ImportError(
+                    "scikit-image is required for holdout evaluation. "
+                    "Install with: pip install scikit-image"
+                )
+
+            print(f"\n  {'Iter':>6}   {'PSNR (dB)':>10}   {'SSIM':>10}   {'Holdout MSE':>14}")
+            data_range = float(holdout_proj.max() - holdout_proj.min())
+            if data_range < 1e-9:
+                data_range = 1.0
+
+            vol_tigre = None
+            chunk_kwargs = {**kwargs, 'verbose': False}
+            i_done = 0
+
+            while i_done < self.iterations:
+                chunk = min(self.eval_every, self.iterations - i_done)
+
+                # Correct starting lambda for this chunk so decay is continuous
+                # even though we call alg_func repeatedly.
+                chunk_kwargs['lmbda'] = self.lmbda * (self.lmbda_red ** i_done)
+
+                if vol_tigre is not None:
+                    chunk_kwargs['x0'] = vol_tigre
+
+                vol_tigre = alg_func(sinogram, geo, tigre_angles, chunk, **chunk_kwargs)
+                i_done += chunk
+
+                # Forward-project at holdout angle and compute metrics.
+                pred = tigre.Ax(vol_tigre, geo, holdout_angle, 'interpolated')[0]
+                mse = float(np.mean((pred - holdout_proj) ** 2))
+                psnr = (10.0 * np.log10(data_range ** 2 / mse)
+                        if mse > 0 else float('inf'))
+                ssim = float(_ssim_fn(holdout_proj, pred, data_range=data_range))
+                print(f"  {i_done:>6}   {psnr:>10.4f}   {ssim:>10.6f}   {mse:>14.8e}")
+
+            print()
+
         t_recon = time.time() - t_start
         del sinogram
         print(f"  Reconstruction took {t_recon / 60:.1f} min "
