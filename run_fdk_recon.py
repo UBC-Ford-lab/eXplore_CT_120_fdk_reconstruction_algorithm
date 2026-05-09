@@ -181,6 +181,21 @@ Examples:
              'Controls the scale of features removed. Larger = more aggressive.'
     )
 
+    parser.add_argument(
+        '--skip-calibration',
+        action='store_true',
+        default=True,
+        help='Skip two-point auto-calibration; save physics-based HU directly '
+             '(default: on). Recommended — auto-calibration maps the central '
+             'ROI to 0 HU, which is unreliable when that ROI is not water.'
+    )
+    parser.add_argument(
+        '--no-skip-calibration',
+        dest='skip_calibration',
+        action='store_false',
+        help='Re-enable two-point auto-calibration (not recommended for mouse scans)'
+    )
+
     # Beam hardening correction
     parser.add_argument(
         '--bhc-coeffs',
@@ -368,6 +383,7 @@ def main():
         bilateral_sigma_spatial=args.bilateral_sigma_spatial,
         bilateral_sigma_range=args.bilateral_sigma_range,
         voxel_xy=args.voxel_xy,
+        skip_calibration=args.skip_calibration,
     )
 
     end = time.time()
