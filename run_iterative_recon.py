@@ -168,25 +168,38 @@ Examples:
         help='Re-enable two-point auto-calibration (not recommended for mouse scans)'
     )
 
-    # Cross-validation holdout
+    # Cross-validation holdout (TIGRE backend only)
+    parser.add_argument(
+        '--no-crossval',
+        action='store_true',
+        default=False,
+        help='Disable holdout cross-validation and run all iterations without '
+             'early stopping. By default cross-val is on (TIGRE backend).'
+    )
     parser.add_argument(
         '--holdout-index',
         type=int,
         default=None,
         metavar='N',
-        help='Projection index to hold out for cross-validation. That projection '
-             'is excluded from reconstruction; every --eval-every iterations the '
-             'current volume is forward-projected at that angle and PSNR/SSIM/MSE '
-             'are printed vs the actual holdout projection. TIGRE backend only. '
-             '(default: disabled)'
+        help='Projection index to hold out (default: middle projection, N_angles//2). '
+             'Ignored when --no-crossval is set or backend is astra.'
     )
     parser.add_argument(
         '--eval-every',
         type=int,
         default=10,
         metavar='K',
-        help='Evaluate holdout metrics every K iterations (default: 10). '
-             'Only used when --holdout-index is set.'
+        help='Evaluate holdout metrics every K iterations (default: 10).'
+    )
+    parser.add_argument(
+        '--patience',
+        type=int,
+        default=3,
+        metavar='P',
+        help='Early stopping patience: stop if SSIM does not improve for P '
+             'consecutive eval checkpoints (default: 3, i.e. 30 iters at '
+             'eval-every=10). Use a large value to disable early stopping '
+             'while keeping metric logging.'
     )
 
     # Backend selection
@@ -447,9 +460,9 @@ def main():
 
     # Initialize reconstructor based on backend
     if args.backend == 'astra':
-        if args.holdout_index is not None:
-            print("WARNING: --holdout-index is only supported with --backend tigre. "
-                  "Ignoring holdout for ASTRA backend.")
+        if not args.no_crossval:
+            print("WARNING: cross-validation is only supported with --backend tigre. "
+                  "Running ASTRA without holdout eval.")
         reconstructor = ASTRAReconstructor(
             projections=projections,
             angles=angles_np,
@@ -484,8 +497,10 @@ def main():
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             ring_median_width=args.ring_median_width,
+            crossval=not args.no_crossval,
             holdout_index=args.holdout_index,
             eval_every=args.eval_every,
+            patience=args.patience,
         )
 
     # Run reconstruction

@@ -186,7 +186,8 @@ class TIGREReconstructor:
                  mu_water=None, output_hu=True,
                  bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51,
-                 holdout_index=None, eval_every=10):
+                 crossval=True, holdout_index=None,
+                 eval_every=10, patience=3):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -214,13 +215,17 @@ class TIGREReconstructor:
             bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None
             ring_correction: Apply sinogram-space ring artifact correction
             ring_median_width: Median filter width for ring correction (odd int)
-            holdout_index: int or None. If set, this projection index is removed
-                from the sinogram before reconstruction and used as a held-out
-                validation view. After every eval_every iterations the current
-                volume is forward-projected at that angle and PSNR/SSIM/MSE are
-                printed vs the actual holdout projection. (default: None)
+            crossval: bool. If True (default), hold out one projection and
+                evaluate PSNR/SSIM/MSE every eval_every iterations. Reconstruction
+                stops early when SSIM stops improving (patience-based). The saved
+                volume is the one at peak SSIM, not the final iteration.
+            holdout_index: int or None. Index of the projection to hold out.
+                None (default) auto-selects the middle projection (N_angles // 2).
+                Ignored when crossval=False.
             eval_every: int. Evaluate holdout metrics every this many iterations.
-                Ignored when holdout_index is None. (default: 10)
+                (default: 10)
+            patience: int. Stop early if SSIM fails to improve for this many
+                consecutive eval checkpoints. (default: 3)
         """
         _check_tigre_available()
 
@@ -264,8 +269,11 @@ class TIGREReconstructor:
         self.ring_median_width = ring_median_width
 
         # Cross-validation holdout
+        self.crossval = crossval
         self.holdout_index = holdout_index
         self.eval_every = eval_every
+        self.patience = patience
+        self.best_iter = None  # set during reconstruct() when crossval is on
 
         self.reconstructed_volume = None
 
@@ -370,15 +378,22 @@ class TIGREReconstructor:
 
         # Holdout cross-validation: extract one projection before reconstruction.
         holdout_proj = None
-        if self.holdout_index is not None:
-            idx = self.holdout_index
+        if self.crossval:
+            if _ssim_fn is None:
+                raise ImportError(
+                    "scikit-image is required for cross-validation. "
+                    "Install with: pip install scikit-image"
+                )
+            N_train = sinogram.shape[0]
+            idx = self.holdout_index if self.holdout_index is not None else N_train // 2
             holdout_proj = sinogram[idx].copy()       # (N_b, N_a) TIGRE convention
             holdout_angle = tigre_angles[idx:idx + 1]
             sinogram = np.delete(sinogram, idx, axis=0)
             tigre_angles = np.delete(tigre_angles, idx, axis=0)
             holdout_deg = float(np.rad2deg(self.angles[idx]))
-            print(f"\nHoldout: projection {idx} ({holdout_deg:.1f}° FDK) "
-                  f"excluded; eval every {self.eval_every} iterations.")
+            print(f"\nCross-validation: holding out projection {idx} "
+                  f"({holdout_deg:.1f}° FDK); eval every {self.eval_every} iters, "
+                  f"patience={self.patience} checkpoints.")
 
         alg_func = _TIGRE_ALG_FUNCS[self.algorithm]()
 
@@ -417,29 +432,26 @@ class TIGREReconstructor:
             # No cross-validation: run all iterations at once.
             vol_tigre = alg_func(sinogram, geo, tigre_angles, self.iterations, **kwargs)
         else:
-            # Cross-validation: run in chunks, eval after each.
-            if _ssim_fn is None:
-                raise ImportError(
-                    "scikit-image is required for holdout evaluation. "
-                    "Install with: pip install scikit-image"
-                )
-
-            print(f"\n  {'Iter':>6}   {'PSNR (dB)':>10}   {'SSIM':>10}   {'Holdout MSE':>14}")
+            # Cross-validation: chunked loop with early stopping on SSIM.
+            print(f"\n  {'Iter':>6}   {'PSNR (dB)':>10}   {'SSIM':>10}   "
+                  f"{'Holdout MSE':>14}   {'':>4}")
             data_range = float(holdout_proj.max() - holdout_proj.min())
             if data_range < 1e-9:
                 data_range = 1.0
 
             vol_tigre = None
+            best_vol = None
+            best_ssim = -1.0
+            best_iter = 0
+            patience_count = 0
             chunk_kwargs = {**kwargs, 'verbose': False}
             i_done = 0
 
             while i_done < self.iterations:
                 chunk = min(self.eval_every, self.iterations - i_done)
 
-                # Correct starting lambda for this chunk so decay is continuous
-                # even though we call alg_func repeatedly.
+                # Correct starting lambda so decay is continuous across chunks.
                 chunk_kwargs['lmbda'] = self.lmbda * (self.lmbda_red ** i_done)
-
                 if vol_tigre is not None:
                     chunk_kwargs['x0'] = vol_tigre
 
@@ -452,9 +464,36 @@ class TIGREReconstructor:
                 psnr = (10.0 * np.log10(data_range ** 2 / mse)
                         if mse > 0 else float('inf'))
                 ssim = float(_ssim_fn(holdout_proj, pred, data_range=data_range))
-                print(f"  {i_done:>6}   {psnr:>10.4f}   {ssim:>10.6f}   {mse:>14.8e}")
 
-            print()
+                if ssim > best_ssim:
+                    best_ssim = ssim
+                    best_iter = i_done
+                    best_vol = vol_tigre.copy()
+                    patience_count = 0
+                    marker = '★'
+                else:
+                    patience_count += 1
+                    marker = f'-{patience_count}'
+
+                print(f"  {i_done:>6}   {psnr:>10.4f}   {ssim:>10.6f}   "
+                      f"{mse:>14.8e}   {marker}")
+
+                if patience_count >= self.patience:
+                    print(f"\n  Early stopping: SSIM peaked at iter {best_iter} "
+                          f"(SSIM={best_ssim:.6f}). "
+                          f"No improvement for {self.patience} checkpoints.")
+                    break
+
+            else:
+                # Loop completed without early stop — check if best was not last.
+                if best_iter < i_done:
+                    print(f"\n  Note: peak SSIM={best_ssim:.6f} was at iter {best_iter}, "
+                          f"not the final iteration.")
+
+            vol_tigre = best_vol
+            self.best_iter = best_iter
+            print(f"  Saving volume from iter {best_iter} "
+                  f"(SSIM={best_ssim:.6f}, PSNR={psnr:.4f} dB)\n")
 
         t_recon = time.time() - t_start
         del sinogram
