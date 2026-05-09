@@ -461,6 +461,10 @@ class TIGREReconstructor:
                 vol_tigre = alg_func(sinogram, geo, tigre_angles, chunk, **chunk_kwargs)
                 i_done += chunk
 
+                # TIGRE mutates geo.offOrigin to (N_angles, 3) during reconstruction.
+                # Reset to scalar before Ax so the shape check passes for 1 angle.
+                geo.offOrigin = np.array([0.0, 0.0, 0.0])
+
                 # Forward-project at holdout angle and compute metrics.
                 pred = tigre.Ax(vol_tigre, geo, holdout_angle, 'interpolated')[0]
                 mse = float(np.mean((pred - holdout_proj) ** 2))
