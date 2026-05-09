@@ -85,7 +85,22 @@ def soft_clamp_upper(x: np.ndarray, max_val: float = 1.0, sharpness: float = 50.
 # Reference: NIST XCOM database, effective energy for typical CT beam
 # Units: mm⁻¹ (0.184 cm⁻¹ × 0.1 cm/mm = 0.0184 mm⁻¹)
 # NOTE: Previous value was 0.00184 (10x error in unit conversion)
-MU_WATER_80KV = 0.0184  # mm⁻¹
+#
+# Scanner-specific effective μ_water for the GE eXplore CT 120 at 80 kVp:
+#   MU_WATER_80KV_NO_BHC  — empirically derived by aligning SIRT (no BHC,
+#       physics HU) tissue values with scanner FDK output (~160 HU target).
+#       Back-calculated: 0.0219 mm⁻¹ (polychromatic beam, ~55 keV effective).
+#   MU_WATER_80KV_WITH_BHC — estimated from no-BHC value by applying the
+#       BHC-induced μ reduction factor (4–7.3% from cross-validation data).
+#       Midpoint: 0.0219 × (1 - 0.056) ≈ 0.0207 mm⁻¹. Needs phantom validation.
+MU_WATER_80KV_NO_BHC   = 0.0219  # mm⁻¹  empirical, no-BHC pipeline
+MU_WATER_80KV_WITH_BHC = 0.0207  # mm⁻¹  estimated, BHC pipeline (needs phantom validation)
+
+# Alias for external code and diagnostic prints. Points to the no-BHC value
+# since that is the default pipeline. Backends auto-select the correct constant
+# based on whether BHC is active; this alias is the fallback for external code
+# that imports MU_WATER_80KV directly.
+MU_WATER_80KV = MU_WATER_80KV_NO_BHC
 
 # Linear attenuation coefficient of air (effectively zero)
 MU_AIR = 0.0  # mm⁻¹

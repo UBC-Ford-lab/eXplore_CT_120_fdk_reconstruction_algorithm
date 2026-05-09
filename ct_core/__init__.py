@@ -25,6 +25,8 @@ try:
         log_transform_transmission,
         convert_to_hounsfield_units,
         MU_WATER_80KV,
+        MU_WATER_80KV_NO_BHC,
+        MU_WATER_80KV_WITH_BHC,
         MU_AIR,
         fit_hu_calibration,
     )
@@ -67,6 +69,8 @@ __all__ = [
     'log_transform_transmission',
     'convert_to_hounsfield_units',
     'MU_WATER_80KV',
+    'MU_WATER_80KV_NO_BHC',
+    'MU_WATER_80KV_WITH_BHC',
     'MU_AIR',
     'fit_hu_calibration',
     # TIFF

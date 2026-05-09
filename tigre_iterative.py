@@ -23,7 +23,9 @@ try:
 except ImportError:
     tigre = None
 
-from .ct_core.calibration import MU_WATER_80KV
+from .ct_core.calibration import (MU_WATER_80KV,
+                                   MU_WATER_80KV_NO_BHC,
+                                   MU_WATER_80KV_WITH_BHC)
 from .ct_core.preprocessing import preprocess_sinogram
 
 SUPPORTED_TIGRE_ALGORITHMS = ('ossart', 'sart', 'sirt')
@@ -176,7 +178,7 @@ class TIGREReconstructor:
                  clamp_mode='none', soft_clip_transmission=True,
                  soft_clip_sharpness=50.0, upper_clamp=True,
                  upper_clamp_value=1.05,
-                 mu_water=MU_WATER_80KV, output_hu=True,
+                 mu_water=None, output_hu=True,
                  bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51):
         """
@@ -236,7 +238,11 @@ class TIGREReconstructor:
         self.upper_clamp_value = upper_clamp_value
 
         # HU conversion parameters
-        self.mu_water = mu_water
+        if mu_water is None:
+            self.mu_water = (MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None
+                             else MU_WATER_80KV_NO_BHC)
+        else:
+            self.mu_water = mu_water
         self.output_hu = output_hu
 
         # BHC and ring correction

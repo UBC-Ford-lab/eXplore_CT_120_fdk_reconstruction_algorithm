@@ -6,7 +6,9 @@ import matplotlib.pyplot as plt
 import os
 import sys
 
-from .ct_core.calibration import MU_WATER_80KV
+from .ct_core.calibration import (MU_WATER_80KV,
+                                   MU_WATER_80KV_NO_BHC,
+                                   MU_WATER_80KV_WITH_BHC)
 
 # Device: use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -218,7 +220,11 @@ class FDKReconstructor:
         self.folder_name = folder_name
 
         # HU calibration parameters
-        self.mu_water = mu_water
+        if mu_water is None:
+            self.mu_water = (MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None
+                             else MU_WATER_80KV_NO_BHC)
+        else:
+            self.mu_water = mu_water
         self.output_hu = output_hu
         self.bright_field = bright_field
         self.dark_field = dark_field
@@ -401,7 +407,7 @@ class FDKReconstructor:
         (FP(V1*mask) and FP(mask)) into one: FP((mu_bone_mono - V1)*mask),
         since mu_bone_mono*FP(mask) - FP(V1*mask) = FP((mu_bone_mono-V1)*mask).
         """
-        mu_water = MU_WATER_80KV
+        mu_water = self.mu_water
         mu_thresh = mu_water * (1 + self.bone_bhc_threshold / 1000.0)
         mu_bone_mono = mu_water * (1 + self.bone_bhc_hu / 1000.0)
 
@@ -1003,10 +1009,10 @@ class FDKReconstructor:
         print("Physics-based HU Calibration (true μ output)")
         print("=" * 60)
 
-        mu_water = MU_WATER_80KV  # 0.0184 mm⁻¹
+        mu_water = self.mu_water
         p1 = float(np.percentile(vol_np, 1))
         p85 = float(np.percentile(vol_np, 85))
-        print(f"  μ_water (literature, 80 kVp): {mu_water:.6f} mm⁻¹")
+        print(f"  μ_water (effective, {'BHC' if self.bhc_coeffs is not None else 'no-BHC'}): {mu_water:.6f} mm⁻¹")
         print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
 
         vol_np = (vol_np - mu_water) / mu_water * 1000.0

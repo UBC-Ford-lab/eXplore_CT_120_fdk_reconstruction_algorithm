@@ -23,7 +23,6 @@ import numpy as np
 
 from .astra_iterative import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
 from .tigre_iterative import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
-from .ct_core.calibration import MU_WATER_80KV
 from .ct_core.scan_setup import (
     auto_detect_scan_folder,
     load_scan_data,
@@ -124,10 +123,10 @@ Examples:
         '--bhc-coeffs',
         type=float,
         nargs='+',
-        default=[0.856, 0.21],
+        default=None,
         help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
-             'beam hardening correction. Default: 0.856 0.21 (80 kVp). '
-             'Use --no-bhc to disable.'
+             'beam hardening correction. Default: disabled (no BHC). '
+             'Example: --bhc-coeffs 0.856 0.21 (80 kVp water phantom calibration).'
     )
     parser.add_argument(
         '--no-bhc',
@@ -153,6 +152,20 @@ Examples:
         type=int,
         default=51,
         help='Median filter width for ring correction (odd int, default: 51)'
+    )
+    parser.add_argument(
+        '--skip-calibration',
+        action='store_true',
+        default=True,
+        help='Skip two-point auto-calibration; save physics-based HU directly '
+             '(default: on). Recommended — auto-calibration maps the central '
+             'ROI to 0 HU, which is unreliable when that ROI is not water.'
+    )
+    parser.add_argument(
+        '--no-skip-calibration',
+        dest='skip_calibration',
+        action='store_false',
+        help='Re-enable two-point auto-calibration (not recommended for mouse scans)'
     )
 
     # Backend selection
@@ -425,7 +438,6 @@ def main():
             super_sampling=args.super_sampling,
             bright_field=bright_field,
             dark_field=dark_field,
-            mu_water=MU_WATER_80KV,
             output_hu=True,
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
@@ -444,7 +456,6 @@ def main():
             gpu_index=args.gpu_index,
             bright_field=bright_field,
             dark_field=dark_field,
-            mu_water=MU_WATER_80KV,
             output_hu=True,
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
@@ -463,6 +474,7 @@ def main():
         bilateral_sigma_spatial=args.bilateral_sigma_spatial,
         bilateral_sigma_range=args.bilateral_sigma_range,
         voxel_xy=args.voxel_xy,
+        skip_calibration=args.skip_calibration,
     )
 
     end = time.time()

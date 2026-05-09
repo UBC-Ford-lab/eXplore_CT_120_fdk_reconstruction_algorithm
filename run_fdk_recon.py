@@ -21,7 +21,6 @@ import time
 import numpy as np
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
-from .ct_core.calibration import MU_WATER_80KV
 from .ct_core.scan_setup import (
     auto_detect_scan_folder,
     load_scan_data,
@@ -187,11 +186,11 @@ Examples:
         '--bhc-coeffs',
         nargs='+',
         type=float,
-        default=[0.856, 0.21],
+        default=None,
         help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
              'beam hardening correction: p_corrected = c1*p + c2*p^2 + ... '
-             'Default: 0.856 0.21 (calibrated from water phantom at 80 kVp). '
-             'Use --no-bhc to disable.'
+             'Example: 0.856 0.21 (calibrated from water phantom at 80 kVp). '
+             'Default: disabled (no BHC). Use --bhc-coeffs to enable.'
     )
     parser.add_argument(
         '--no-bhc',
@@ -337,7 +336,7 @@ def main():
         output_hu=True,
         bright_field=bright_field,
         dark_field=dark_field,
-        mu_water=MU_WATER_80KV,
+        mu_water=None,
         clamp_mode="none",
         soft_clip_transmission=True,
         soft_clip_sharpness=50.0,
