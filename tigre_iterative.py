@@ -20,6 +20,7 @@ try:
     import tigre
     from tigre.utilities.geometry import Geometry as TigreGeometry
     import tigre.algorithms as tigre_algs
+    from tigre.utilities.im_3d_denoise import im3ddenoise as _im3ddenoise
 except ImportError:
     tigre = None
 
@@ -187,7 +188,8 @@ class TIGREReconstructor:
                  bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51,
                  crossval=True, holdout_index=None,
-                 eval_every=10, patience=3):
+                 eval_every=10, patience=3,
+                 tv_lambda=0.0, tv_iters=50):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -226,6 +228,16 @@ class TIGREReconstructor:
                 (default: 10)
             patience: int. Stop early if SSIM fails to improve for this many
                 consecutive eval checkpoints. (default: 3)
+            tv_lambda: TV regularization strength applied to the volume after
+                each iteration chunk. 0.0 (default) disables TV entirely.
+                Strength is on the normalised [0,1] image scale (im3ddenoise
+                normalises internally), so values are scan-independent.
+                5–20 is the useful range for micro-CT; 10 is a good first
+                guess — strong enough to sharpen bone edges relative to plain
+                SIRT, conservative enough not to erase fine trabecular detail.
+            tv_iters: Chambolle-Pock TV denoising iterations applied at each
+                TV step (default 50). Higher values converge the TV sub-problem
+                more fully; 50 matches the TIGRE OSSART-TV default.
         """
         _check_tigre_available()
 
@@ -273,6 +285,8 @@ class TIGREReconstructor:
         self.holdout_index = holdout_index
         self.eval_every = eval_every
         self.patience = patience
+        self.tv_lambda = tv_lambda
+        self.tv_iters = tv_iters
         self.best_iter = None       # set during reconstruct() when crossval is on
         self.crossval_metrics = None  # dict of lists; set after reconstruct()
 
@@ -423,15 +437,33 @@ class TIGREReconstructor:
               f"{self.iterations} iterations estimated: "
               f"{est_total / 60:.1f} min")
 
+        tv_str = (f", TV(λ={self.tv_lambda}, iters={self.tv_iters})"
+                  if self.tv_lambda > 0 else "")
         print(f"\nRunning {self.algorithm.upper()} "
               f"({self.iterations} iterations, blocksize={self.blocksize}, "
-              f"lambda={self.lmbda}, lambda_red={self.lmbda_red})...")
+              f"lambda={self.lmbda}, lambda_red={self.lmbda_red}{tv_str})...")
 
         t_start = time.time()
 
         if holdout_proj is None:
-            # No cross-validation: run all iterations at once.
-            vol_tigre = alg_func(sinogram, geo, tigre_angles, self.iterations, **kwargs)
+            if self.tv_lambda <= 0:
+                # No TV, no crossval: run all iterations at once.
+                vol_tigre = alg_func(sinogram, geo, tigre_angles, self.iterations, **kwargs)
+            else:
+                # TV + no crossval: run in chunks of eval_every, apply TV after each.
+                vol_tigre = None
+                chunk_kwargs = {**kwargs, 'verbose': False}
+                i_done = 0
+                while i_done < self.iterations:
+                    chunk = min(self.eval_every, self.iterations - i_done)
+                    chunk_kwargs['lmbda'] = self.lmbda * (self.lmbda_red ** i_done)
+                    if vol_tigre is not None:
+                        chunk_kwargs['init'] = vol_tigre
+                    vol_tigre = alg_func(sinogram, geo, tigre_angles, chunk, **chunk_kwargs)
+                    i_done += chunk
+                    vol_tigre = _im3ddenoise(vol_tigre, self.tv_iters, self.tv_lambda)
+                    print(f"  TV @ iter {i_done}: "
+                          f"[{vol_tigre.min():.6f}, {vol_tigre.max():.6f}]")
         else:
             # Cross-validation: chunked loop with early stopping on SSIM.
             print(f"\n  {'Iter':>6}   {'PSNR (dB)':>10}   {'SSIM':>10}   "
@@ -460,6 +492,11 @@ class TIGREReconstructor:
 
                 vol_tigre = alg_func(sinogram, geo, tigre_angles, chunk, **chunk_kwargs)
                 i_done += chunk
+
+                # Apply TV regularization if enabled (before metrics, so SSIM
+                # evaluates the regularized volume and best_vol is TV-denoised).
+                if self.tv_lambda > 0:
+                    vol_tigre = _im3ddenoise(vol_tigre, self.tv_iters, self.tv_lambda)
 
                 # TIGRE's check_geo repmat-s offOrigin→(N,3), offDetector→(N,2),
                 # rotDetector→(N,3), and COR→(N,) during reconstruction.

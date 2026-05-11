@@ -289,6 +289,25 @@ Examples:
         help='Relaxation reduction factor per iteration (default: 0.97, TIGRE only). '
              'Lambda decays as lmbda * lmbda_red^iter, annealing toward zero.'
     )
+    parser.add_argument(
+        '--tv-lambda',
+        type=float,
+        default=0.0,
+        metavar='TV',
+        help='TV regularization strength applied after each iteration chunk '
+             '(default: 0, disabled). Acts on the normalised [0,1] image scale '
+             'so the value is scan-independent. 10 is a good first guess for '
+             'micro-CT: sharpens bone edges over plain SIRT without erasing fine '
+             'trabecular detail. Useful range: 5–20. TIGRE only.'
+    )
+    parser.add_argument(
+        '--tv-iters',
+        type=int,
+        default=50,
+        metavar='N',
+        help='Chambolle-Pock TV denoising iterations per application '
+             '(default: 50, TIGRE only). Matches the TIGRE OSSART-TV default.'
+    )
 
     # ROI-based reconstruction
     parser.add_argument(
@@ -501,6 +520,8 @@ def main():
             holdout_index=args.holdout_index,
             eval_every=args.eval_every,
             patience=args.patience,
+            tv_lambda=args.tv_lambda,
+            tv_iters=args.tv_iters,
         )
 
     # Run reconstruction
