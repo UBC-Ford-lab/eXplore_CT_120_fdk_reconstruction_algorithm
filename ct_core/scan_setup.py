@@ -63,7 +63,8 @@ def auto_detect_scan_folder(data_folder: str) -> str:
     return scan_folder
 
 
-def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle):
+def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
+                   sub_scan='-00-'):
     """
     Load projections, angles, and calibration fields from a scan folder.
 
@@ -121,7 +122,8 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle):
     print(f"\nLoading projections (pattern: {projection_pattern})...")
     proj_paths = sorted(Path(data_folder).glob(projection_pattern))
     # Apply phase filter only to acquisition files (not sequential proj-* files)
-    proj_paths = [p for p in proj_paths if p.name.startswith('proj-') or '-00-' in str(p)]
+    if sub_scan:
+        proj_paths = [p for p in proj_paths if p.name.startswith('proj-') or sub_scan in str(p)]
     n_files = len(proj_paths)
     if n_files == 0:
         print(f"Error: No projections matching '{projection_pattern}' in {data_folder}")
@@ -156,6 +158,7 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle):
         xml_file,
         paths_str=projection_pattern,
         projection_spacing=projection_spacing,
+        sub_scan=sub_scan or '-00-',
     )
     projections = dataset.projections  # shape (N_angles, N_b, N_a)
     angles = dataset.angles_rad        # shape (N_angles,)
