@@ -216,6 +216,10 @@ class FDKReconstructor:
         self.dz = geometry["dz"] # voxel size in mm
         self.central_pixel_a = geometry["central_pixel_a"]
         self.central_pixel_b = geometry["central_pixel_b"]
+        # Scale for applying the detector COR/central-slice offset in backprojection.
+        # 1.0 = apply the verified-correct offset (default). 0.0 = off (legacy);
+        # -1.0 = flipped sign (diagnostic). See note in backprojection().
+        self.cor_offset_scale = geometry.get("cor_offset_scale", 1.0)
         self.source_locations = source_locations
         self.folder_name = folder_name
 
@@ -881,12 +885,29 @@ class FDKReconstructor:
             # 2D coordinate grids (z-independent) — computed once
             X_2d, Y_2d = torch.meshgrid(self.x, self.y, indexing='ij')  # (Nx, Ny)
 
-            # Pre-compute detector offset constants
-            # NOTE: VFF projections are already COR-centered by the acquisition
-            # software, so the XML CentreOfRotation refers to the raw detector
-            # position, not the stored data. Use zero offset (COR at detector center).
-            a_offset = 0.0
-            b_offset = 0.0
+            # Detector centering (IMPORTANT — see COR-offset note below).
+            # The rotation axis projects to detector column central_pixel_a and the
+            # mid-plane ray to row central_pixel_b (scan.xml CentreOfRotation /
+            # CentralSlice). The stored VFF projections are NOT pre-centred, so we
+            # must shift the sampled detector coordinate by the displacement of the
+            # TRUE centre from the geometric centre (N-1)/2. Omitting this (the old
+            # a_offset=b_offset=0) reconstructs off-isocentre objects non-round and
+            # mis-registers edges (worst in the vertical/b direction, ~27 px here).
+            #
+            # SIGN VERIFIED EMPIRICALLY (June 2026, TRIUMF scanner) against the GEHC
+            # reference recon of Scan_1955: the correct offset is
+            # ((N-1)/2 - central_pixel)*pixel_size. (An earlier attempt used the
+            # OPPOSITE sign, which doubled the error and was reverted — do not flip.)
+            #
+            # cor_offset_scale: 1.0 = apply (default, correct); 0.0 = off (legacy,
+            # for back-compat / comparison); -1.0 = flipped sign (diagnostic only).
+            a_offset = self.cor_offset_scale * ((self.N_a - 1) / 2.0 - self.central_pixel_a) * self.da
+            b_offset = self.cor_offset_scale * ((self.N_b - 1) / 2.0 - self.central_pixel_b) * self.db
+            if self.cor_offset_scale != 0.0:
+                print(f"  Detector COR offset (scale={self.cor_offset_scale:+.1f}): "
+                      f"a={a_offset:+.4f} mm, b={b_offset:+.4f} mm")
+            else:
+                print("  Detector COR offset: OFF (legacy, COR at detector centre)")
             a_scale = 1.0 / (self.a_length / 2)
             b_scale = 1.0 / (self.b_length / 2)
 

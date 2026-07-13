@@ -107,6 +107,31 @@ Examples:
         help='Field of view in the z direction in mm (default: 120.0)'
     )
     parser.add_argument(
+        '--cor',
+        type=float,
+        default=None,
+        help='Override center-of-rotation detector pixel (central_pixel_a). '
+             'Default: CentreOfRotation from scan.xml. Use to recalibrate COR '
+             '(e.g. when an off-isocenter object reconstructs non-round).'
+    )
+    parser.add_argument(
+        '--central-slice',
+        type=float,
+        default=None,
+        help='Override central detector row (central_pixel_b). '
+             'Default: CentralSlice from scan.xml.'
+    )
+    parser.add_argument(
+        '--cor-offset-scale',
+        type=float,
+        default=1.0,
+        help='Apply the COR/central-slice detector offset in backprojection. '
+             '1.0 = apply verified-correct offset (default); 0.0 = off (legacy, '
+             'COR at detector centre); -1.0 = flipped sign (diagnostic). Corrects '
+             'non-round/mis-registered off-isocentre objects (projections are not '
+             'pre-centred).'
+    )
+    parser.add_argument(
         '--display',
         action='store_true',
         help='Save reconstruction slice PNGs after completion'
@@ -313,6 +338,17 @@ def main():
         args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
         roi_bounds=roi_bounds,
     )
+
+    # Optional center-of-rotation / central-slice overrides (COR recalibration)
+    if args.cor is not None:
+        print(f"  COR override: central_pixel_a "
+              f"{geometry['central_pixel_a']:.3f} -> {args.cor:.3f}")
+        geometry['central_pixel_a'] = args.cor
+    if args.central_slice is not None:
+        print(f"  Central-slice override: central_pixel_b "
+              f"{geometry['central_pixel_b']:.3f} -> {args.central_slice:.3f}")
+        geometry['central_pixel_b'] = args.central_slice
+    geometry['cor_offset_scale'] = args.cor_offset_scale
 
     # Resolve filter cutoff (may depend on geometry)
     if args.filter_cutoff.lower() == 'match':
