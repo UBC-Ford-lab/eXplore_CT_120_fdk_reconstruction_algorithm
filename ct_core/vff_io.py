@@ -3,6 +3,7 @@
 
 import numpy as np
 import os
+import tempfile
 from pathlib import Path
 import xmltodict
 import torch
@@ -179,9 +180,19 @@ class VFFDataset:
         data = data.squeeze(0)
         self.det_rows, self.det_cols = data.shape
 
-        # Create memmap for projections
+        # Create memmap for projections. Use a unique per-process temp file
+        # (SLURM_TMPDIR if set, else the system temp dir) rather than a fixed
+        # path inside the scan folder: mode='w+' truncates+recreates the file
+        # on open, so a fixed shared path caused concurrent reconstructions of
+        # the same scan to stomp on each other's memmap (Bus errors / "mmap
+        # length is greater than file size" when one process's re-open
+        # invalidated another's in-progress mapping).
         shape = (len(self.paths), self.det_rows, self.det_cols)
-        memmap_path = os.path.join(folder, 'detector_values.dat')
+        tmp_dir = os.environ.get('SLURM_TMPDIR') or tempfile.gettempdir()
+        memmap_fd, memmap_path = tempfile.mkstemp(
+            suffix='.dat', prefix='detector_values_', dir=tmp_dir)
+        os.close(memmap_fd)
+        self._memmap_path = memmap_path
         self.projections = np.memmap(memmap_path,
                                      dtype=data.dtype,
                                      mode='w+',
@@ -202,6 +213,12 @@ class VFFDataset:
 
             if save_headers:
                 self.headers.append(hdr)
+
+        # Projections are now fully loaded into the memmap; the backing file
+        # itself is scratch and can be removed immediately (the OS keeps the
+        # already-mmap'd data accessible via the existing file descriptor
+        # until this process exits or self.projections is released).
+        os.remove(self._memmap_path)
 
         # Convert memmap to native byte order so torch can load it
         if self.projections.dtype.byteorder not in ('=', '<'):  # not native little endian

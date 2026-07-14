@@ -228,13 +228,14 @@ class TIGREReconstructor:
                 (default: 10)
             patience: int. Stop early if SSIM fails to improve for this many
                 consecutive eval checkpoints. (default: 3)
-            tv_lambda: TV regularization strength applied to the volume after
-                each iteration chunk. 0.0 (default) disables TV entirely.
-                Strength is on the normalised [0,1] image scale (im3ddenoise
-                normalises internally), so values are scan-independent.
-                5–20 is the useful range for micro-CT; 10 is a good first
-                guess — strong enough to sharpen bone edges relative to plain
-                SIRT, conservative enough not to erase fine trabecular detail.
+            tv_lambda: TV denoising parameter passed to im3ddenoise after each
+                iteration chunk. 0.0 (default) disables TV entirely.
+                im3ddenoise normalises the volume to [0,1] internally, so this
+                value is scan-independent. TIGRE minimises (1/2)||u-f||² +
+                TV(u)/λ, so HIGHER λ = LESS smoothing (weaker TV), LOWER λ =
+                MORE smoothing (stronger TV). λ=0 disables TV; λ→∞ approaches
+                plain SIRT. Useful range for micro-CT: 10–50. λ=10 gives
+                visible noise suppression; λ<5 is destructively over-smooth.
             tv_iters: Chambolle-Pock TV denoising iterations applied at each
                 TV step (default 50). Higher values converge the TV sub-problem
                 more fully; 50 matches the TIGRE OSSART-TV default.
@@ -549,9 +550,13 @@ class TIGREReconstructor:
                     break
 
             else:
+                # Loop completed without early stopping — save the final iteration,
+                # not best_vol. The user ran all iterations intentionally.
                 if best_iter < i_done:
                     print(f"\n  Note: peak SSIM={best_ssim:.6f} was at iter {best_iter}, "
-                          f"not the final iteration.")
+                          f"not the final iteration. Saving final iteration ({i_done}).")
+                best_vol = vol_tigre  # keep final iteration as the saved result
+                best_iter = i_done
 
             vol_tigre = best_vol
             self.best_iter = best_iter
