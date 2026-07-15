@@ -95,8 +95,23 @@ def write_vff(filename, header, data, verbose=True):
     """
     Write a VFF file from a header dict and 2D/3D NumPy array.
 
+    The ASCII header is written in GE's `ncaa` dialect so the output loads
+    directly in external software (Amalytics / MicroView) — the magic word
+    `ncaa`, the GE keywords (rank/type/bands/format=slice), and voxel size /
+    HU-calibration fields are all present. The binary payload is unchanged:
+    big-endian, z-major, form-feed separated, exactly as GE expects.
+
+    Voxel data is assumed to already be in Hounsfield Units (air floor ≈ -1000).
+    We write water=0 / air=-1000 so Amalytics' HU formula
+    HU = 1000*(v-water)/(water-air) is the identity — the displayed value equals
+    the stored value whether or not the tool applies its calibration.
+
     :param filename: Path to output .vff file
-    :param header: Dict with metadata keys (e.g., 'bits'); size is inferred from `data`
+    :param header: Dict with metadata keys; recognized keys:
+        'bits' (8 or 16, default 16), 'elementsize' (isotropic voxel size in mm)
+        or 'spacing' ("dx dy dz" — first token used as elementsize),
+        'water'/'air' (HU calibration anchors, default 0 / -1000).
+        Size is always inferred from `data`.
     :param data: 3D NumPy array shaped (z, y, x) or 2D array (y, x)
     """
     # Convert input to NumPy array and ensure 3D shape
@@ -107,31 +122,28 @@ def write_vff(filename, header, data, verbose=True):
         raise ValueError(f"Data must be 2D or 3D array, got {arr.ndim}D")
     zdim, ydim, xdim = arr.shape
 
-    # Build header entirely from inferred dimensions and provided bits
+    # GE `ncaa` uses signed-short slices; pick dtype from bits
     bits = int(header.get('bits', 16))
     dtype = np.dtype('>u1') if bits == 8 else np.dtype('>i2') if bits == 16 else None
     if dtype is None:
         raise ValueError("Unsupported bits per voxel: must be 8 or 16")
 
-    # Assemble canonical header fields
-    hdr = header.copy()
-    hdr['size'] = [xdim, ydim, zdim]
-    hdr['bits'] = bits
-    hdr.setdefault('format', 'unsigned-byte' if bits == 8 else 'signed-short')
-    hdr.setdefault('endian', 'big')
+    # Voxel size (mm). GE's elementsize is a single scalar, so anisotropic
+    # volumes cannot be expressed faithfully — use the in-plane size and warn.
+    if 'elementsize' in header:
+        elementsize = float(header['elementsize'])
+    elif 'spacing' in header:
+        toks = str(header['spacing']).split()
+        elementsize = float(toks[0])
+        if verbose and len(toks) >= 3 and not all(abs(float(t) - elementsize) < 1e-9 for t in toks):
+            print(f"  WARNING: anisotropic spacing {toks} — GE elementsize is scalar; "
+                  f"writing {elementsize} for all axes.")
+    else:
+        elementsize = 1.0
 
-    # Build header text
-    lines = []
-    for key in ('size', 'bits', 'format', 'endian'):
-        val = hdr[key]
-        if key == 'size':
-            val = ' '.join(map(str, val))
-        lines.append(f"{key} = {val};")
-    for key, val in hdr.items():
-        if key in ('size', 'bits', 'format', 'endian'):
-            continue
-        lines.append(f"{key} = {val};")
-    header_text = "\n".join(lines) + "\n\f\n"
+    # HU calibration anchors — identity mapping by default (data already in HU)
+    water = float(header.get('water', 0.0))
+    air = float(header.get('air', -1000.0))
 
     # Ensure big-endian C-contiguous data
     if arr.dtype != dtype or arr.dtype.byteorder != '>' or not arr.flags['C_CONTIGUOUS']:
@@ -139,8 +151,33 @@ def write_vff(filename, header, data, verbose=True):
     else:
         arr_be = arr
 
+    # Data range (from the stored integer values) for the header min/max fields
+    dmin = float(arr_be.min()) if arr_be.size else 0.0
+    dmax = float(arr_be.max()) if arr_be.size else 0.0
+
+    # Build GE `ncaa` header (keys/format mirror working Green-*.vff files)
+    lines = [
+        "ncaa",
+        "rank=3;",
+        "type=raster;",
+        "modality=CT;",
+        f"size={xdim} {ydim} {zdim};",
+        "origin=0.0 0.0 0.0;",
+        "bands=1;",
+        f"bits={bits};",
+        "format=slice;",
+        "spacing=1.00 1.00 1.00;",
+        f"elementsize={elementsize:.6f};",
+        f"min={dmin:.6f};",
+        f"max={dmax:.6f};",
+        f"water={water:.6f};",
+        f"air={air:.6f};",
+    ]
+    header_text = "\n".join(lines) + "\n\f\n"
+
     if verbose:
-        print(f"Writing VFF to {filename}: shape={arr_be.shape}, dtype={arr_be.dtype}")
+        print(f"Writing VFF to {filename}: shape={arr_be.shape}, dtype={arr_be.dtype}, "
+              f"HU[min={dmin:.0f}, max={dmax:.0f}]")
 
     with open(filename, 'wb') as f:
         f.write(header_text.encode('latin-1'))

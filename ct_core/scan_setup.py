@@ -426,9 +426,12 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         print(f"  Bilateral filter applied in {t_bf_end - t_bf:.1f}s "
               f"({Nz_slices} slices)")
 
-    # Save uncalibrated VFF (physics-based HU only, no polynomial)
+    # Save uncalibrated VFF (physics-based HU only, no polynomial).
+    # elementsize is the GE `ncaa` scalar voxel size (mm); spacing is kept for
+    # the anisotropy warning in write_vff (dz != dx cannot be expressed).
     vff_meta = {
         'bits': 16,
+        'elementsize': geometry['dx'],
         'spacing': f"{geometry['dx']} {geometry['dx']} {geometry['dz']}",
     }
     uncal_path = output_path + '_uncalibrated.vff'
