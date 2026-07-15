@@ -72,6 +72,13 @@ Examples:
         help='Glob pattern for projection files (default: auto-detect proj-* or acq*)'
     )
     parser.add_argument(
+        '--phase',
+        default='00',
+        help='Acquisition phase to reconstruct for multi-phase (gated) scans, '
+             'e.g. 00 or 01. Selects projection files whose name contains '
+             '"-<phase>-" (default: 00). Ignored for sequential proj-* scans.'
+    )
+    parser.add_argument(
         '--voxel-xy',
         type=float,
         default=0.075,
@@ -405,6 +412,7 @@ def main():
     scan_data = load_scan_data(
         data_folder, scan_folder,
         args.projection_pattern, args.total_angle,
+        sub_scan=f'-{args.phase}-',
     )
     projections = scan_data['projections']
     angles = scan_data['angles']
