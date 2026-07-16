@@ -306,6 +306,37 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None
     return geometry
 
 
+def _hist_mode(values, bins=256, clip_pct=(0.5, 99.5)):
+    """Robust mode (histogram peak) of a 1-D population.
+
+    Histograms over the central `clip_pct` percentile range so a handful of
+    extreme voxels can't create a spurious peak, takes the tallest bin, and
+    refines to sub-bin precision with a parabolic fit to the peak and its two
+    neighbours. Returns None on empty input; falls back to the median if the
+    range is degenerate.
+    """
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return None
+    lo, hi = np.percentile(v, clip_pct)
+    if not (hi > lo):
+        return float(np.median(v))
+    hist, edges = np.histogram(v, bins=bins, range=(float(lo), float(hi)))
+    if hist.max() == 0:
+        return float(np.median(v))
+    k = int(np.argmax(hist))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    if 0 < k < len(hist) - 1:
+        y0, y1, y2 = float(hist[k - 1]), float(hist[k]), float(hist[k + 1])
+        denom = y0 - 2.0 * y1 + y2
+        if denom != 0.0:
+            delta = 0.5 * (y0 - y2) / denom
+            delta = max(-0.5, min(0.5, delta))
+            return float(centers[k] + delta * (centers[1] - centers[0]))
+    return float(centers[k])
+
+
 def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
                          voxel_xy=0.075, skip_calibration=False):
@@ -348,10 +379,15 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         # BHC, filter, or normalization settings.
         print("  Mode: two-point linear calibration (air/water from histogram)")
 
-        # --- Measure air value: median of voxels below -500 HU ---
+        # --- Measure air value: mode (histogram peak) of voxels below -500 HU ---
+        # The <-500 population is right-skewed (sharp air peak + partial-volume
+        # shoulder toward tissue); its mode, not its median, is the true air
+        # spike. Anchoring the mode to -1000 keeps the air peak cleanly on -1000
+        # instead of pushing it below (median > mode for this skew).
         air_voxels = vol_np[vol_np < -500.0]
-        if len(air_voxels) > 0:
-            hu_air = float(np.median(air_voxels))
+        air_mode = _hist_mode(air_voxels) if len(air_voxels) > 0 else None
+        if air_mode is not None:
+            hu_air = air_mode
         else:
             print("  WARNING: no air voxels found — using -1000")
             hu_air = -1000.0
@@ -370,10 +406,8 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
 
         if n_inside > 10:
             center_inside = center_line[:, :, inside_mask]
-            p25, p75 = np.percentile(center_inside, [25, 75])
-            water_voxels = center_inside[
-                (center_inside > p25) & (center_inside < p75)]
-            hu_water = float(np.median(water_voxels))
+            water_mode = _hist_mode(center_inside.ravel())
+            hu_water = water_mode if water_mode is not None else 0.0
             print(f"  Water/tissue ROI: {n_inside} z-slices inside object")
         else:
             print("  WARNING: could not segment inside/outside — using 0")
