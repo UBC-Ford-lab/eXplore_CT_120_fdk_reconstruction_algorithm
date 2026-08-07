@@ -145,9 +145,21 @@ def write_vff(filename, header, data, verbose=True):
     water = float(header.get('water', 0.0))
     air = float(header.get('air', -1000.0))
 
-    # Ensure big-endian C-contiguous data
+    # Ensure big-endian C-contiguous data.
+    # Float input (HU volumes are float32) must be ROUNDED and CLIPPED, not
+    # `astype`d: astype truncates toward zero (-999.7 HU -> -999, a systematic
+    # +0.5 HU bias on the air floor) and, worse, WRAPS on overflow, so a single
+    # +40000 HU voxel would silently store as -25536.
     if arr.dtype != dtype or arr.dtype.byteorder != '>' or not arr.flags['C_CONTIGUOUS']:
-        arr_be = arr.astype(dtype)
+        if np.issubdtype(arr.dtype, np.floating):
+            info = np.iinfo(dtype)
+            n_clip = int(np.count_nonzero((arr < info.min) | (arr > info.max)))
+            if n_clip and verbose:
+                print(f"  WARNING: {n_clip} voxel(s) outside the {bits}-bit range "
+                      f"[{info.min}, {info.max}] — clipped.")
+            arr_be = np.rint(np.clip(arr, info.min, info.max)).astype(dtype)
+        else:
+            arr_be = arr.astype(dtype)
     else:
         arr_be = arr
 
