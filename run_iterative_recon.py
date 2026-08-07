@@ -208,6 +208,37 @@ Examples:
              'eval-every=10). Use a large value to disable early stopping '
              'while keeping metric logging.'
     )
+    parser.add_argument(
+        '--checkpoint-dir',
+        default=None,
+        metavar='DIR',
+        help='If set (and crossval is on), save a cropped copy of the '
+             'reconstructed volume at every crossval eval checkpoint '
+             '(every --eval-every iterations), in the same on-disk '
+             'orientation/HU-calibration as the final saved volume. '
+             'Written as DIR/iter{N:04d}.npy; DIR/crossval_metrics.json is '
+             'also written once reconstruction finishes. Requires '
+             '--checkpoint-z-range. Default: disabled.'
+    )
+    parser.add_argument(
+        '--checkpoint-z-range',
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=('Z0', 'Z1'),
+        help='z-slice bounds [Z0, Z1) (on-disk VFF z-index convention) to '
+             'slice out of each checkpoint volume before saving. Required '
+             'if --checkpoint-dir is set.'
+    )
+    parser.add_argument(
+        '--checkpoint-xy-range',
+        type=int,
+        nargs=4,
+        default=None,
+        metavar=('Y0', 'Y1', 'X0', 'X1'),
+        help='In-plane crop bounds (on-disk VFF y/x convention) applied to '
+             'each checkpoint volume before saving. Default: full xy plane.'
+    )
 
     # Backend selection
     parser.add_argument(
@@ -223,7 +254,10 @@ Examples:
         default=None,
         help='Reconstruction algorithm. '
              'ASTRA: SIRT3D_CUDA, CGLS3D_CUDA, SART3D_CUDA, FDK_CUDA (default: SIRT3D_CUDA). '
-             'TIGRE: ossart, sart, sirt (default: ossart).'
+             'TIGRE: ossart, sart, sirt, mlem (default: ossart). '
+             'mlem is Maximum-Likelihood Expectation-Maximization under a Poisson '
+             'noise model (full-batch, no ordered subsets; ignores --lmbda/--lmbda-red; '
+             'incompatible with --pwls).'
     )
     parser.add_argument(
         '--iterations',
@@ -315,6 +349,20 @@ Examples:
         help='Chambolle-Pock TV denoising iterations per application '
              '(default: 50, TIGRE only). Matches the TIGRE OSSART-TV default.'
     )
+    parser.add_argument(
+        '--pwls',
+        action='store_true',
+        default=False,
+        help='Enable PWLS (penalized weighted least squares) data-fidelity '
+             'weighting (default: off, i.e. plain geometric weighting). '
+             'Down-weights rays with low estimated transmission (noisier '
+             'measurements) instead of trusting every ray equally, '
+             'approximating a maximum-likelihood weighting under a '
+             'quantum-noise model. Composes with --tv-lambda and crossval. '
+             'TIGRE only. Not supported with --algorithm mlem (MLEM already '
+             'models per-ray photon statistics natively and would silently '
+             'discard a PWLS weight array; this combination raises an error).'
+    )
 
     # ROI-based reconstruction
     parser.add_argument(
@@ -377,6 +425,18 @@ def main():
             print(f"Error: Algorithm '{args.algorithm}' not supported for TIGRE backend. "
                   f"Supported: {SUPPORTED_TIGRE_ALGORITHMS}")
             sys.exit(1)
+        if args.algorithm == 'mlem' and args.pwls:
+            print("Error: --pwls is not supported with --algorithm mlem. "
+                  "MLEM's constructor unconditionally overrides any custom W "
+                  "weight array with its own sensitivity map, so --pwls would "
+                  "be silently ignored rather than applied — and it's "
+                  "redundant anyway since MLEM already models per-ray photon "
+                  "statistics natively through its Poisson likelihood.")
+            sys.exit(1)
+
+    if args.checkpoint_dir is not None and args.checkpoint_z_range is None:
+        print("Error: --checkpoint-z-range is required when --checkpoint-dir is set.")
+        sys.exit(1)
 
     start = time.time()
 
@@ -395,8 +455,14 @@ def main():
         if args.max_constraint is not None:
             print(f"Max constraint: {args.max_constraint}")
     elif args.backend == 'tigre':
-        print(f"Blocksize: {args.blocksize}")
-        print(f"Lambda: {args.lmbda}, Lambda reduction: {args.lmbda_red}")
+        if args.algorithm == 'mlem':
+            print("MLEM: full-batch (no ordered subsets), no relaxation "
+                  "parameter — --blocksize/--lmbda/--lmbda-red are ignored")
+        else:
+            print(f"Blocksize: {args.blocksize}")
+            print(f"Lambda: {args.lmbda}, Lambda reduction: {args.lmbda_red}")
+        if args.pwls:
+            print(f"PWLS: enabled")
 
     # Resolve scan folder
     if args.scan_folder:
@@ -478,6 +544,8 @@ def main():
         suffix = f"_{args.algorithm.lower().replace('3d_cuda', '').replace('_cuda', '')}"
         if args.algorithm != 'FDK_CUDA':
             suffix += f"_{args.iterations}it"
+        if getattr(args, 'pwls', False):
+            suffix += "_pwls"
         output_path = data_folder.rstrip('/') + f'_recon{suffix}'
 
     print(f"\nOutput path: {output_path}")
@@ -530,6 +598,12 @@ def main():
             patience=args.patience,
             tv_lambda=args.tv_lambda,
             tv_iters=args.tv_iters,
+            pwls=args.pwls,
+            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_z_range=(tuple(args.checkpoint_z_range)
+                                 if args.checkpoint_z_range else None),
+            checkpoint_xy_range=(tuple(args.checkpoint_xy_range)
+                                  if args.checkpoint_xy_range else None),
         )
 
     # Run reconstruction

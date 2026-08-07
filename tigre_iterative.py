@@ -12,7 +12,10 @@ The geometry mapping translates the FDK backprojection coordinate convention
 Requires: tigre (optional dependency, built from source)
 """
 
+import copy
+import json
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -34,12 +37,13 @@ from .ct_core.calibration import (MU_WATER_80KV,
                                    MU_WATER_80KV_WITH_BHC)
 from .ct_core.preprocessing import preprocess_sinogram
 
-SUPPORTED_TIGRE_ALGORITHMS = ('ossart', 'sart', 'sirt')
+SUPPORTED_TIGRE_ALGORITHMS = ('ossart', 'sart', 'sirt', 'mlem')
 
 _TIGRE_ALG_FUNCS = {
     'ossart': lambda: tigre_algs.ossart,
     'sart': lambda: tigre_algs.sart,
     'sirt': lambda: tigre_algs.sirt,
+    'mlem': lambda: tigre_algs.mlem,
 }
 
 
@@ -165,13 +169,57 @@ def build_tigre_geometry(geometry, N_b, N_a):
     return geo
 
 
+def _pwls_weight(sinogram, geo, angles, gpuids=None):
+    """
+    Combined geometric x statistical per-ray weight array for PWLS-SIRT,
+    same shape as `sinogram` (N_angles, N_b, N_a). Pass as the `W` kwarg to
+    tigre_algs.sirt/sart/ossart, which otherwise computes a purely-geometric
+    W internally (IterativeReconAlg.set_w()) — this augments that geometric
+    conditioning with a data-driven confidence weight instead of replacing it.
+
+    Statistical factor: T_i = exp(-p_i) recovers the (possibly soft-clipped)
+    transmission that produced line integral p_i = -ln(T_i) in
+    preprocess_sinogram, directly from the sinogram actually being
+    reconstructed — no need to re-derive from bright/dark fields. Physically,
+    expected photon count on ray i is N_i = I_0 * T_i, and quantum-noise
+    variance on p_i is ~1/N_i, so the statistically-motivated weight is
+    w_i ~ N_i = I_0 * T_i. I_0 is a single global scale constant (flat-field
+    correction already removed per-pixel gain nonuniformity), and the PWLS
+    objective (Ax-p)^T diag(w) (Ax-p) is invariant to a uniform positive
+    rescaling of w, so I_0 cancels out under the mean-normalization below and
+    is never needed explicitly.
+
+    Geometric factor: replicated verbatim from TIGRE's
+    IterativeReconAlg.set_w() (tigre/algorithms/iterative_recon_alg.py) so
+    that PWLS mode uses the identical per-ray path-length normalization
+    plain SIRT/SART would use by default. Dropping it in favor of the
+    statistical factor alone would destabilize convergence, since raw
+    photon-count-scale weights span many orders of magnitude across a real
+    sinogram.
+    """
+    T = np.clip(np.exp(-sinogram.astype(np.float64)), 1e-6, 2.0)
+    w_stat = (T / T.mean()).astype(np.float32)
+
+    geox = copy.deepcopy(geo)
+    geox.sVoxel[1:] = geox.sVoxel[1:] * 1.1
+    geox.sVoxel[0] = max(geox.sDetector[0], geox.sVoxel[0])
+    geox.nVoxel = np.array([2, 2, 2])
+    geox.dVoxel = geox.sVoxel / geox.nVoxel
+    W_geom = tigre.Ax(np.ones(geox.nVoxel, dtype=np.float32), geox, angles,
+                       "interpolated", gpuids=gpuids)
+    W_geom[W_geom <= min(geo.dVoxel / 2)] = np.inf
+    W_geom = 1.0 / W_geom
+
+    return (W_geom * w_stat).astype(np.float32)
+
+
 class TIGREReconstructor:
     """
     Iterative cone-beam CT reconstruction using the TIGRE toolbox.
 
-    Supports OS-SART, SART, and SIRT algorithms. TIGRE handles GPU memory
-    splitting internally, enabling reconstruction of volumes that exceed
-    GPU VRAM.
+    Supports OS-SART, SART, SIRT, and MLEM algorithms. TIGRE handles GPU
+    memory splitting internally, enabling reconstruction of volumes that
+    exceed GPU VRAM.
 
     The output volume convention matches FDK: (Nx, Ny, Nz) with voxel coordinates.
     """
@@ -189,16 +237,30 @@ class TIGREReconstructor:
                  ring_correction=False, ring_median_width=51,
                  crossval=True, holdout_index=None,
                  eval_every=10, patience=3,
-                 tv_lambda=0.0, tv_iters=50):
+                 tv_lambda=0.0, tv_iters=50,
+                 pwls=False,
+                 checkpoint_dir=None, checkpoint_z_range=None,
+                 checkpoint_xy_range=None):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
             angles: Projection angles in radians (FDK convention), shape (N_angles,)
             geometry: dict with R_s, R_d, da, db, vol_shape, vol_origin, dx, dz
-            algorithm: TIGRE algorithm name ('ossart', 'sart', 'sirt')
+            algorithm: TIGRE algorithm name ('ossart', 'sart', 'sirt', 'mlem').
+                mlem is Maximum-Likelihood Expectation-Maximization: solves for
+                the ML image under a Poisson noise model via the multiplicative
+                update x_{k+1} = x_k * Atb(p / Ax_k) / Atb(1), instead of the
+                least-squares gradient step SIRT/SART/OSSART use. Always
+                full-batch (no ordered subsets — TIGRE's MLEM forces
+                blocksize=N_angles internally); ignores lmbda/lmbda_red
+                entirely (no relaxation parameter in the EM update); enforces
+                non-negativity implicitly through the multiplicative form
+                rather than via the nonneg flag. Not compatible with pwls
+                (see pwls below).
             iterations: Number of iterations (default 100)
             blocksize: Number of projections per OS-SART block (default 15).
                 Smaller = more subsets = faster convergence but noisier per-update.
+                Ignored for mlem (always full-batch).
             lmbda: Relaxation parameter (default 0.5). Controls update step size;
                 lower values give smoother convergence, less streak artifacts.
             lmbda_red: Relaxation reduction factor per iteration (default 0.97).
@@ -239,6 +301,46 @@ class TIGREReconstructor:
             tv_iters: Chambolle-Pock TV denoising iterations applied at each
                 TV step (default 50). Higher values converge the TV sub-problem
                 more fully; 50 matches the TIGRE OSSART-TV default.
+            pwls: bool. If True, replaces the algorithm's default purely-
+                geometric per-ray weight with a PWLS (penalized weighted
+                least squares) weight that additionally down-weights rays
+                with low estimated transmission (noisier measurements),
+                approximating a maximum-likelihood weighting under a
+                quantum-noise model. See _pwls_weight() for the derivation.
+                Composes with tv_lambda (TV step is unaffected — it acts in
+                the image domain, PWLS only reweights the data-fidelity
+                term) and with crossval/early stopping. Default False
+                (plain geometric weighting, i.e. standard SIRT/SART).
+                Incompatible with algorithm='mlem': MLEM.__init__ (TIGRE's
+                tigre/algorithms/statistical_algorithms.py) unconditionally
+                overrides any passed-in W with its own Atb(ones) sensitivity
+                map, so a PWLS W array would be silently discarded rather
+                than applied — raises ValueError instead of failing silently.
+                MLEM's Poisson likelihood already models per-ray photon
+                statistics natively, so PWLS reweighting is redundant for it
+                anyway.
+            checkpoint_dir: str or None. If set and crossval=True, save a
+                cropped copy of the reconstructed volume at every crossval
+                eval checkpoint (every eval_every iterations), in the same
+                on-disk orientation/HU-calibration as the final saved
+                volume (see _to_disk_volume). Written as
+                '{checkpoint_dir}/iter{i:04d}.npy' (float32). A
+                'crossval_metrics.json' (self.crossval_metrics) is also
+                written to this directory once reconstruction finishes, so
+                each checkpoint's SSIM/PSNR/MSE is available without
+                re-parsing logs. Intended for tracking how image-quality
+                metrics (MTF/NPS/d') evolve over iterations, independent of
+                the crossval SSIM used for early stopping. Default None
+                (disabled). Ignored when crossval=False (no per-checkpoint
+                volume exists to save).
+            checkpoint_z_range: (z0, z1) tuple or None. z-slice bounds (in
+                on-disk VFF z-index convention) to slice out of each
+                checkpoint volume before saving. Required if checkpoint_dir
+                is set.
+            checkpoint_xy_range: (y0, y1, x0, x1) tuple or None. In-plane
+                crop bounds (on-disk VFF y/x convention) applied to each
+                checkpoint volume before saving. None (default) keeps the
+                full xy plane.
         """
         _check_tigre_available()
 
@@ -246,6 +348,16 @@ class TIGREReconstructor:
             raise ValueError(
                 f"Unknown algorithm '{algorithm}'. "
                 f"Supported: {SUPPORTED_TIGRE_ALGORITHMS}"
+            )
+
+        if algorithm == 'mlem' and pwls:
+            raise ValueError(
+                "pwls=True is not compatible with algorithm='mlem': MLEM's "
+                "constructor unconditionally overrides any custom W weight "
+                "array with its own Atb(ones) sensitivity map, so the PWLS "
+                "weight would be silently ignored rather than applied. "
+                "MLEM already models per-ray photon statistics natively "
+                "through its Poisson likelihood, so PWLS is redundant here."
             )
 
         self.projections = projections
@@ -288,8 +400,18 @@ class TIGREReconstructor:
         self.patience = patience
         self.tv_lambda = tv_lambda
         self.tv_iters = tv_iters
+        self.pwls = pwls
         self.best_iter = None       # set during reconstruct() when crossval is on
         self.crossval_metrics = None  # dict of lists; set after reconstruct()
+
+        # Per-checkpoint volume export (see checkpoint_dir docstring above)
+        if checkpoint_dir is not None and checkpoint_z_range is None:
+            raise ValueError("checkpoint_z_range is required when checkpoint_dir is set.")
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_z_range = checkpoint_z_range
+        self.checkpoint_xy_range = checkpoint_xy_range
+        if self.checkpoint_dir is not None:
+            Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
         self.reconstructed_volume = None
 
@@ -331,6 +453,58 @@ class TIGREReconstructor:
                       f"{total / 2**30:.2f} GiB total, {free / 2**30:.2f} GiB free")
         except (FileNotFoundError, subprocess.TimeoutExpired):
             print("  (nvidia-smi not available — skipping GPU info)")
+
+    def _to_disk_volume(self, vol_tigre, Nx_orig, Ny_orig, Nz_orig):
+        """
+        Convert a raw TIGRE-convention volume (z, y, x) into the same
+        orientation, ROI crop, and HU calibration as the final saved .vff:
+          1. transpose to FDK convention (x, y, z) -- reconstruct() step 6
+          2. center-crop the (possibly CUDA-hang-padded) volume down to the
+             original ROI dimensions -- reconstruct() step 6b
+          3. optional HU conversion (physics-based, skip_calibration
+             convention: no two-point recalibration) -- reconstruct() step 7
+          4. transpose + y-flip to on-disk VFF convention (z, y, x), matching
+             ct_core/scan_setup.py's write step (vol.transpose(2,1,0)[:, ::-1, :])
+
+        Shared by the end-of-reconstruct() final-volume path and the
+        per-checkpoint export path so both are calibrated/oriented
+        identically -- see checkpoint_dir docstring in __init__.
+
+        Returns a float32 array in (z, y, x) on-disk convention, HU-clipped
+        to [-1024, 4095] if output_hu, uncropped in xy/z (caller slices).
+        """
+        vol = vol_tigre.transpose(2, 1, 0).astype(np.float32)  # (x, y, z)
+
+        Nx_pad, Ny_pad, Nz_pad = vol.shape
+        if Nx_pad != Nx_orig or Ny_pad != Ny_orig or Nz_pad != Nz_orig:
+            ox, oy, oz = self.geometry.get('vol_origin', (0, 0, 0))
+            dx = self.geometry['dx']
+            dz = self.geometry['dz']
+            x0 = round((Nx_pad - Nx_orig) / 2 + ox / dx)
+            y0 = round((Ny_pad - Ny_orig) / 2 + oy / dx)
+            z0 = round((Nz_pad - Nz_orig) / 2 + oz / dz)
+            vol = vol[x0:x0 + Nx_orig, y0:y0 + Ny_orig, z0:z0 + Nz_orig]
+
+        if self.output_hu:
+            vol = (vol - self.mu_water) / self.mu_water * 1000.0
+            vol = np.clip(vol, -1024, 4095).astype(np.float32)
+
+        return vol.transpose(2, 1, 0)[:, ::-1, :]  # (z, y, x), on-disk convention
+
+    def _save_checkpoint(self, vol_tigre, i_done, Nx_orig, Ny_orig, Nz_orig):
+        """Save a cropped on-disk-convention slab for one crossval checkpoint."""
+        vol_disk = self._to_disk_volume(vol_tigre, Nx_orig, Ny_orig, Nz_orig)
+        z0, z1 = self.checkpoint_z_range
+        if self.checkpoint_xy_range is not None:
+            y0, y1, x0, x1 = self.checkpoint_xy_range
+            slab = vol_disk[z0:z1, y0:y1, x0:x1]
+        else:
+            slab = vol_disk[z0:z1]
+        out_path = Path(self.checkpoint_dir) / f"iter{i_done:04d}.npy"
+        np.save(out_path, slab)
+        unit_str = f"[{slab.min():.0f}, {slab.max():.0f}] HU" if self.output_hu else \
+            f"[{slab.min():.4f}, {slab.max():.4f}] (raw)"
+        print(f"  [checkpoint] saved {out_path.name} {slab.shape} {unit_str}")
 
     def reconstruct(self):
         """
@@ -392,6 +566,11 @@ class TIGREReconstructor:
         # Flip columns to match TIGRE's detector convention.
         sinogram = np.ascontiguousarray(sinogram[:, :, ::-1], dtype=np.float32)
 
+        if self.checkpoint_dir is not None and not self.crossval:
+            print("\nWARNING: checkpoint_dir is set but crossval=False — there is "
+                  "no per-checkpoint loop to hook into, so no checkpoints will be "
+                  "saved.")
+
         # Holdout cross-validation: extract one projection before reconstruction.
         holdout_proj = None
         if self.crossval:
@@ -411,6 +590,27 @@ class TIGREReconstructor:
                   f"({holdout_deg:.1f}° FDK); eval every {self.eval_every} iters, "
                   f"patience={self.patience} checkpoints.")
 
+        if self.algorithm == 'mlem':
+            # MLEM's ratio update x_{k+1} = x_k * Atb(p/Ax_k) / Atb(1) implicitly
+            # assumes p >= 0 (it's the Poisson-emission-count EM update; TIGRE
+            # only guards exact-zero denominators, not negative numerators).
+            # preprocess_sinogram legitimately produces small negative line
+            # integrals near air/background (soft-clip allows transmission up
+            # to upper_clamp_value=1.05, i.e. p = -ln(T) slightly < 0) — harmless
+            # for the least-squares algorithms but fatal here: wherever a
+            # negative p lines up with a small Ax_k, the ratio blows up and,
+            # being multiplicative, compounds geometrically every iteration
+            # (observed: SSIM=0.69 at iter 10 -> float overflow by iter 20).
+            # Floor at 0 before MLEM ever sees the data; not applied to
+            # sirt/sart/ossart, which tolerate negative residuals fine.
+            n_neg = int(np.sum(sinogram < 0.0))
+            if n_neg > 0:
+                neg_min = float(sinogram.min())
+                print(f"\nMLEM: clipping {n_neg} negative sinogram values "
+                      f"(min={neg_min:.4f}) to 0.0 — MLEM's ratio update is "
+                      f"undefined for negative line integrals.")
+            np.clip(sinogram, 0.0, None, out=sinogram)
+
         alg_func = _TIGRE_ALG_FUNCS[self.algorithm]()
 
         kwargs = {
@@ -424,6 +624,15 @@ class TIGREReconstructor:
 
         if self.gpu_index != 0:
             kwargs['gpuids'] = tigre.utilities.gpu.GpuIds(self.gpu_index)
+
+        if self.pwls:
+            print("\nComputing PWLS weights (geometric x statistical)...")
+            W_pwls = _pwls_weight(sinogram, geo, tigre_angles,
+                                   gpuids=kwargs.get('gpuids'))
+            kwargs['W'] = W_pwls
+            print(f"  W range: [{W_pwls.min():.4e}, {W_pwls.max():.4e}], "
+                  f"mean={W_pwls.mean():.4e} (statistical factor alone "
+                  f"has mean 1.0 by construction)")
 
         # Run 1 calibration iteration for time estimate.
         # NOTE: Python threading timeouts don't work for TIGRE hang detection
@@ -440,9 +649,18 @@ class TIGREReconstructor:
 
         tv_str = (f", TV(λ={self.tv_lambda}, iters={self.tv_iters})"
                   if self.tv_lambda > 0 else "")
-        print(f"\nRunning {self.algorithm.upper()} "
-              f"({self.iterations} iterations, blocksize={self.blocksize}, "
-              f"lambda={self.lmbda}, lambda_red={self.lmbda_red}{tv_str})...")
+        pwls_str = ", PWLS" if self.pwls else ""
+        if self.algorithm == 'mlem':
+            # blocksize/lmbda/lmbda_red are accepted by TIGRE's MLEM kwargs
+            # but never referenced in its update rule (full-batch, no
+            # relaxation parameter) — omit them here to avoid implying they
+            # have any effect.
+            print(f"\nRunning MLEM "
+                  f"({self.iterations} iterations, full-batch{tv_str})...")
+        else:
+            print(f"\nRunning {self.algorithm.upper()} "
+                  f"({self.iterations} iterations, blocksize={self.blocksize}, "
+                  f"lambda={self.lmbda}, lambda_red={self.lmbda_red}{tv_str}{pwls_str})...")
 
         t_start = time.time()
 
@@ -543,6 +761,9 @@ class TIGREReconstructor:
                 print(f"  {i_done:>6}   {psnr:>10.4f}   {ssim:>10.6f}   "
                       f"{mse:>14.8e}   {marker}")
 
+                if self.checkpoint_dir is not None:
+                    self._save_checkpoint(vol_tigre, i_done, Nx_orig, Ny_orig, Nz_orig)
+
                 if patience_count >= self.patience:
                     print(f"\n  Early stopping: SSIM peaked at iter {best_iter} "
                           f"(SSIM={best_ssim:.6f}). "
@@ -574,6 +795,11 @@ class TIGREReconstructor:
             }
             print(f"  Saving volume from iter {best_iter} "
                   f"(SSIM={best_ssim:.6f}, PSNR={best_psnr:.4f} dB)\n")
+
+            if self.checkpoint_dir is not None:
+                metrics_path = Path(self.checkpoint_dir) / "crossval_metrics.json"
+                metrics_path.write_text(json.dumps(self.crossval_metrics, indent=2))
+                print(f"  Saved {metrics_path}")
 
         t_recon = time.time() - t_start
         del sinogram
@@ -661,6 +887,35 @@ class TIGREReconstructor:
         best_iter = m['best_iter']
         stop_iter = m['stop_iter']
 
+        # Guard against non-finite metrics (e.g. a divergent algorithm run,
+        # as MLEM can do on ill-conditioned data): matplotlib's set_ylim
+        # raises on NaN/Inf, and Inf samples in the plotted line blow up
+        # autoscale even on panels without an explicit ylim. Replace
+        # non-finite samples with NaN (matplotlib draws a gap there) and
+        # compute axis limits from the finite subset only, so a partial
+        # divergence still produces a readable figure instead of losing the
+        # whole run to an unhandled exception during metric plotting.
+        all_finite = np.isfinite(cv_ssim) & np.isfinite(cv_psnr) & np.isfinite(cv_mse)
+        if not all_finite.all():
+            first_bad_iter = int(iters[~all_finite][0])
+            print(f"  WARNING: {int((~all_finite).sum())} non-finite crossval "
+                  f"metric value(s) detected (first at iter {first_bad_iter}) "
+                  f"— the run likely diverged numerically. Plotting finite "
+                  f"values only; treat any 'best' iteration at/after this "
+                  f"point with suspicion (SSIM/PSNR are unreliable once the "
+                  f"reconstruction has overflowed).")
+        cv_ssim_plot = np.where(np.isfinite(cv_ssim), cv_ssim, np.nan)
+        cv_psnr_plot = np.where(np.isfinite(cv_psnr), cv_psnr, np.nan)
+        cv_mse_plot = np.where(np.isfinite(cv_mse) & (cv_mse > 0), cv_mse, np.nan)
+
+        def _safe_ylim(arr, pad_frac=0.12, pad_min=0.01):
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0:
+                return None
+            lo, hi = float(finite.min()), float(finite.max())
+            pad = (hi - lo) * pad_frac or pad_min
+            return lo - pad, hi + pad
+
         # ── Publication style ────────────────────────────────────────────────
         rc = {
             'font.family':        'sans-serif',
@@ -705,13 +960,15 @@ class TIGREReconstructor:
 
             # ── Panel 1: SSIM ────────────────────────────────────────────────
             ax = axes[0]
-            ax.plot(iters, cv_ssim, color=blue, linewidth=1.5, zorder=3)
+            ax.plot(iters, cv_ssim_plot, color=blue, linewidth=1.5, zorder=3)
             best_idx  = int(np.where(iters == best_iter)[0][0])
-            ax.scatter([best_iter], [cv_ssim[best_idx]], color=blue,
-                       s=60, zorder=4, marker='*', linewidths=0)
+            if np.isfinite(cv_ssim[best_idx]):
+                ax.scatter([best_iter], [cv_ssim[best_idx]], color=blue,
+                           s=60, zorder=4, marker='*', linewidths=0)
             ax.set_ylabel('SSIM')
-            y_pad = (cv_ssim.max() - cv_ssim.min()) * 0.12 or 0.01
-            ax.set_ylim(cv_ssim.min() - y_pad, cv_ssim.max() + y_pad)
+            ylim = _safe_ylim(cv_ssim)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
             ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
             ax.legend(
                 handles=[
@@ -726,19 +983,22 @@ class TIGREReconstructor:
 
             # ── Panel 2: PSNR ────────────────────────────────────────────────
             ax = axes[1]
-            ax.plot(iters, cv_psnr, color=red, linewidth=1.5, zorder=3)
-            ax.scatter([best_iter], [cv_psnr[best_idx]], color=red,
-                       s=60, zorder=4, marker='*', linewidths=0)
+            ax.plot(iters, cv_psnr_plot, color=red, linewidth=1.5, zorder=3)
+            if np.isfinite(cv_psnr[best_idx]):
+                ax.scatter([best_iter], [cv_psnr[best_idx]], color=red,
+                           s=60, zorder=4, marker='*', linewidths=0)
             ax.set_ylabel('PSNR (dB)')
-            y_pad = (cv_psnr.max() - cv_psnr.min()) * 0.12 or 0.1
-            ax.set_ylim(cv_psnr.min() - y_pad, cv_psnr.max() + y_pad)
+            ylim = _safe_ylim(cv_psnr, pad_frac=0.12, pad_min=0.1)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
             ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
 
             # ── Panel 3: Holdout MSE (log scale) ─────────────────────────────
             ax = axes[2]
-            ax.semilogy(iters, cv_mse, color=green, linewidth=1.5, zorder=3)
-            ax.scatter([best_iter], [cv_mse[best_idx]], color=green,
-                       s=60, zorder=4, marker='*', linewidths=0)
+            ax.semilogy(iters, cv_mse_plot, color=green, linewidth=1.5, zorder=3)
+            if np.isfinite(cv_mse_plot[best_idx]):
+                ax.scatter([best_iter], [cv_mse_plot[best_idx]], color=green,
+                           s=60, zorder=4, marker='*', linewidths=0)
             ax.set_ylabel('Holdout MSE')
             ax.set_xlabel('Iteration')
             ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation())
