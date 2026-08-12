@@ -325,3 +325,26 @@ class VFFDataset:
 
 if __name__ == '__main__':
     read_vff(filename = "/Users/falk/Downloads/Shelley phantom full scan 75um 16ms.vff", verbose=True)
+
+
+def detector_serial_from_scan(scan_folder) -> "str | None":
+    """Read ``serialNumber`` from any acquisition frame's VFF header.
+
+    Lives here (rather than in muNeRF's detector_warp) so the geometry
+    auto-calibration in ct_core/detector_psi.py can key its cache by detector
+    without importing anything from muNeRF — ct_core is the SHARED layer, and
+    the dependency must not point the other way.
+    """
+    from pathlib import Path as _P
+    scan_folder = _P(scan_folder)
+    for pattern in ("acq-*.vff", "proj-*.vff"):
+        frames = sorted(scan_folder.glob(pattern))
+        if frames:
+            try:
+                head = frames[0].open("rb").read(2048).replace(b"\x00", b"")
+                for line in head.decode("latin-1").splitlines():
+                    if line.startswith("serialNumber="):
+                        return line.split("=", 1)[1].rstrip(";").strip()
+            except OSError:
+                return None
+    return None

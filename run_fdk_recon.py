@@ -18,6 +18,7 @@ import os
 import sys
 import time
 
+from pathlib import Path
 import numpy as np
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
@@ -191,6 +192,21 @@ Examples:
         help='Disable Parker weighting (for comparison experiments).'
     )
     parser.add_argument(
+        '--geometry-autocal',
+        action='store_true',
+        default=True,
+        help="Measure detector in-plane rotation (psi) and the column centre "
+             "of rotation from this scan's conjugate rays before "
+             "reconstructing (reference-free, ~1 s). Default: on."
+    )
+    parser.add_argument(
+        '--no-geometry-autocal',
+        dest='geometry_autocal',
+        action='store_false',
+        help='Assume a perfectly square, centred detector — the '
+             'pre-2026-08-11 behaviour (bit-exact legacy path).'
+    )
+    parser.add_argument(
         '--ring-correction',
         action='store_true',
         default=True,
@@ -357,6 +373,40 @@ def main():
               f"{geometry['central_pixel_b']:.3f} -> {args.central_slice:.3f}")
         geometry['central_pixel_b'] = args.central_slice
     geometry['cor_offset_scale'] = args.cor_offset_scale
+
+    # ---- geometry auto-calibration (psi + column CoR) -----------------------
+    # FDK fuses flat-field + log + cone-weight + RAMP FILTER into one pass
+    # (_preprocess_and_filter), so unlike TIGRE there is no point inside it that
+    # holds unfiltered line integrals for the conjugate estimator. Rather than
+    # duplicate a full 7 GB preprocessing pass, read the SAME scan-keyed
+    # calibration muNeRF and the iterative pipeline write — it is the same
+    # detector and the same projections, so re-measuring would only re-derive
+    # the identical number.
+    # An explicit --cor / --central-slice always wins; --no-geometry-autocal
+    # restores the pre-2026-08-11 behaviour exactly (psi absent, CoR from XML).
+    if args.geometry_autocal and args.cor is None:
+        try:
+            import json as _json
+            from .ct_core.vff_io import detector_serial_from_scan
+            _serial = detector_serial_from_scan(args.scan_folder)
+            _tag = Path(args.scan_folder).name
+            _cal = (Path(__file__).resolve().parents[1] / "data" / "calibration"
+                    / f"detector_psi_{_serial}_{_tag}.json")
+            if _serial and _cal.exists():
+                _rec = _json.loads(_cal.read_text())
+                geometry['det_psi_rad'] = np.radians(float(_rec["psi_deg"]))
+                geometry['central_pixel_a'] = float(_rec["cpa0"])
+                print(f"\n  Geometry auto-calibration from {_cal.name}:")
+                print(f"    psi = {float(_rec['psi_deg']):+.4f} deg, "
+                      f"central_pixel_a = {float(_rec['cpa0']):.3f} "
+                      f"(measured {_rec.get('measured_on', '?')})")
+            else:
+                print(f"\n  Geometry auto-calibration: no cached measurement for "
+                      f"this scan ({_cal.name}) — using psi=0 and the XML CoR. "
+                      f"Run muNeRF or the iterative pipeline once on this scan, "
+                      f"or scripts/detector_psi_from_conjugates.py, to populate it.")
+        except Exception as _e:
+            print(f"\n  Geometry auto-calibration skipped ({type(_e).__name__}: {_e})")
 
     # Resolve filter cutoff (may depend on geometry)
     if args.filter_cutoff.lower() == 'match':

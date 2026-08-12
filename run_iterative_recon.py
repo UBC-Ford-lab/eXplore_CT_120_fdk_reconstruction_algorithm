@@ -143,6 +143,21 @@ Examples:
         help='Disable sinogram-domain beam hardening correction'
     )
     parser.add_argument(
+        '--geometry-autocal',
+        action='store_true',
+        default=True,
+        help='Measure detector in-plane rotation (psi) and the column centre '
+             'of rotation from this scan\'s conjugate rays before '
+             'reconstructing (reference-free, ~1 s). Default: on.'
+    )
+    parser.add_argument(
+        '--no-geometry-autocal',
+        dest='geometry_autocal',
+        action='store_false',
+        help='Assume a perfectly square, centred detector (psi=0, CoR at the '
+             'detector centre) — the pre-2026-08-11 behaviour.'
+    )
+    parser.add_argument(
         '--ring-correction',
         action='store_true',
         default=True,
@@ -592,6 +607,7 @@ def main():
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             ring_median_width=args.ring_median_width,
+            geometry_autocal=args.geometry_autocal,
             crossval=not args.no_crossval,
             holdout_index=args.holdout_index,
             eval_every=args.eval_every,

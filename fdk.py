@@ -220,6 +220,11 @@ class FDKReconstructor:
         # 1.0 = apply the verified-correct offset (default). 0.0 = off (legacy);
         # -1.0 = flipped sign (diagnostic). See note in backprojection().
         self.cor_offset_scale = geometry.get("cor_offset_scale", 1.0)
+        # Detector in-plane rotation (radians). 0.0 is a BIT-EXACT no-op: the
+        # backprojection keeps its original z-independent `a_2d` factorisation
+        # and never allocates the 3-D a-coordinate. Before 2026-08-11 FDK had no
+        # psi term at all, so 0.0 reproduces every historical reconstruction.
+        self.det_psi_rad = float(geometry.get("det_psi_rad", 0.0) or 0.0)
         self.source_locations = source_locations
         self.folder_name = folder_name
 
@@ -906,6 +911,10 @@ class FDKReconstructor:
             if self.cor_offset_scale != 0.0:
                 print(f"  Detector COR offset (scale={self.cor_offset_scale:+.1f}): "
                       f"a={a_offset:+.4f} mm, b={b_offset:+.4f} mm")
+            if self.det_psi_rad:
+                print(f"  Detector in-plane rotation: psi = "
+                      f"{np.rad2deg(self.det_psi_rad):+.4f} deg "
+                      f"(a-coordinate becomes z-dependent)")
             else:
                 print("  Detector COR offset: OFF (legacy, COR at detector centre)")
             a_scale = 1.0 / (self.a_length / 2)
@@ -938,8 +947,10 @@ class FDKReconstructor:
                 # Detector coordinate: project voxel onto flat detector at distance SDD
                 inv_U_2d = self.SDD / U_2d                        # (Nx, Ny)
 
-                # Normalized a-coordinate (z-independent)
-                a_2d = (inv_U_2d * (-X_2d * sb + Y_2d * cb) + a_offset) * a_scale  # (Nx, Ny)
+                # Detector coordinates in mm, before normalisation.
+                a_mm_2d = inv_U_2d * (-X_2d * sb + Y_2d * cb) + a_offset
+                # Normalized a-coordinate (z-independent WHEN psi == 0)
+                a_2d = a_mm_2d * a_scale  # (Nx, Ny)
 
                 # FDK weight: (R_s/U)² — inverse-square law from source
                 w_2d = (self.R_s / U_2d) ** 2  # (Nx, Ny)
@@ -952,12 +963,29 @@ class FDKReconstructor:
                     z_vals = self.z[z_start:z_end]  # (n_z,)
 
                     # b-coordinate via broadcasting: (Nx, Ny, 1) * (n_z,) → (Nx, Ny, n_z)
-                    b_3d = (inv_U_2d.unsqueeze(-1) * z_vals + b_offset) * b_scale
+                    b_mm_3d = inv_U_2d.unsqueeze(-1) * z_vals + b_offset
+                    b_3d = b_mm_3d * b_scale
+                    a_3d = None
+                    if self.det_psi_rad:
+                        # In-plane detector rotation. This COUPLES a to b, so the
+                        # a-coordinate stops being z-independent and has to
+                        # become 3-D — which is why psi != 0 costs memory and
+                        # time that psi == 0 does not. Rotating the sampling
+                        # point by -psi is equivalent to rotating the detector by
+                        # +psi.
+                        cpsi = float(np.cos(self.det_psi_rad))
+                        spsi = float(np.sin(self.det_psi_rad))
+                        a_r = a_mm_2d.unsqueeze(-1) * cpsi + b_mm_3d * spsi
+                        b_r = -a_mm_2d.unsqueeze(-1) * spsi + b_mm_3d * cpsi
+                        a_3d = a_r * a_scale
+                        b_3d = b_r * b_scale
 
                     # Write into pre-allocated grid buffer (no allocation)
                     flat_len = Ny * n_z
                     # a_2d: (Nx, Ny) → expand to (Nx, Ny, n_z) → reshape to (Nx, Ny*n_z)
-                    grid_buf[0, :, :flat_len, 0] = a_2d.unsqueeze(-1).expand(-1, -1, n_z).reshape(Nx, flat_len)
+                    grid_buf[0, :, :flat_len, 0] = (
+                        a_2d.unsqueeze(-1).expand(-1, -1, n_z) if a_3d is None
+                        else a_3d).reshape(Nx, flat_len)
                     grid_buf[0, :, :flat_len, 1] = b_3d.reshape(Nx, flat_len)
 
                     sampled = F.grid_sample(proj, grid_buf[:, :, :flat_len, :], mode='bilinear', align_corners=True)
