@@ -9,12 +9,80 @@ Cone-beam weighting and ramp filtering are FDK-specific and not applied here
 import numpy as np
 
 
-def _apply_bhc(chunk, bhc_coeffs):
-    """Apply BHC polynomial: p_corrected = c1*p + c2*p^2 + ..."""
+def apply_bhc(chunk, bhc_coeffs):
+    """Apply the BHC polynomial: p_corrected = c1*p + c2*p^2 + ...
+
+    Works on numpy arrays AND torch tensors (uses only ``*``/``+``/``**``),
+    so FDK's fused GPU path and the chunked numpy path share one definition.
+    Returns ``chunk`` unchanged when ``bhc_coeffs`` is None.
+    """
+    if bhc_coeffs is None:
+        return chunk
     result = bhc_coeffs[0] * chunk
     for k in range(1, len(bhc_coeffs)):
         result = result + bhc_coeffs[k] * chunk ** (k + 1)
     return result
+
+
+# Backwards-compatible private alias (pre-refactor name).
+_apply_bhc = apply_bhc
+
+
+def ring_artifact_correction(sinogram, median_width=51, verbose=True):
+    """Sinogram-space ring artifact correction, in place.
+
+    Removes fixed-pattern detector column offsets (the cause of concentric
+    ring artifacts): the angle-mean sinogram is median-filtered along
+    detector columns, and the residual fixed pattern is subtracted from
+    every projection.
+
+    Args:
+        sinogram: np.ndarray (N_angles, N_b, N_a) of line integrals,
+            modified IN PLACE.
+        median_width: median filter width along detector columns (odd int).
+
+    Returns:
+        The same ``sinogram`` array (for chaining).
+    """
+    from scipy.ndimage import median_filter
+    if verbose:
+        print("  Ring correction: computing column profile...")
+    mean_sino = sinogram.mean(axis=0)
+    smoothed = median_filter(mean_sino, size=(1, median_width))
+    ring_artifact = mean_sino - smoothed
+    sinogram -= ring_artifact[np.newaxis, :, :]
+    if verbose:
+        print(f"  Ring correction applied: max correction = "
+              f"{np.abs(ring_artifact).max():.6f}")
+    return sinogram
+
+
+def downsample_projections(arr, factor):
+    """Average-pool the last two (detector) axes by an integer factor.
+
+    Accepts a 3-D projection stack (N_angles, N_b, N_a) or a single 2-D
+    field (N_b, N_a) — bright/dark fields pool with the same code path.
+    Trims trailing rows/columns so both detector axes are divisible by the
+    factor. Returns float32.
+    """
+    factor = int(factor)
+    if factor <= 1:
+        return arr
+
+    if arr.ndim == 2:
+        N_b, N_a = arr.shape
+        N_b_new, N_a_new = (N_b // factor) * factor, (N_a // factor) * factor
+        trimmed = np.asarray(arr[:N_b_new, :N_a_new], dtype=np.float32)
+        return trimmed.reshape(
+            N_b_new // factor, factor, N_a_new // factor, factor
+        ).mean(axis=(1, 3))
+
+    N_angles, N_b, N_a = arr.shape
+    N_b_new, N_a_new = (N_b // factor) * factor, (N_a // factor) * factor
+    trimmed = np.array(arr[:, :N_b_new, :N_a_new], dtype=np.float32)
+    return trimmed.reshape(
+        N_angles, N_b_new // factor, factor, N_a_new // factor, factor
+    ).mean(axis=(2, 4))
 
 
 def preprocess_sinogram(projections, bright_field, dark_field,
@@ -128,21 +196,13 @@ def preprocess_sinogram(projections, bright_field, dark_field,
             np.maximum(chunk, 0.0, out=chunk)
 
         # Beam hardening correction
-        if bhc_coeffs is not None:
-            chunk = _apply_bhc(chunk, bhc_coeffs)
+        chunk = apply_bhc(chunk, bhc_coeffs)
 
         sinogram[start:end] = chunk
 
     # Ring correction (needs full sinogram — applied after chunked loop)
     if ring_correction:
-        from scipy.ndimage import median_filter
-        print(f"  Ring correction: computing column profile...")
-        mean_sino = sinogram.mean(axis=0)
-        smoothed = median_filter(mean_sino, size=(1, ring_median_width))
-        ring_artifact = mean_sino - smoothed
-        sinogram -= ring_artifact[np.newaxis, :, :]
-        ring_mag = np.abs(ring_artifact).max()
-        print(f"  Ring correction applied: max correction = {ring_mag:.6f}")
+        ring_artifact_correction(sinogram, median_width=ring_median_width)
 
     print(f"  Sinogram range: [{sinogram.min():.4f}, {sinogram.max():.4f}]")
     return sinogram

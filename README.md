@@ -1,6 +1,6 @@
 # eXplore CT 120 Reconstruction
 
-Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner. Supports FDK (analytic), ASTRA (SIRT, CGLS), and TIGRE (OS-SART) backends.
+Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner. Supports FDK (analytic), ASTRA (SIRT, CGLS), and TIGRE (OS-SART, SART, SIRT, MLEM) backends.
 
 ## Pipeline
 
@@ -13,6 +13,53 @@ Raw projections → flat-field + log → BHC → ring correction
 ```
 
 BHC (water, 80 kVp) and ring correction are on by default. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula) — self-calibrating regardless of filter or BHC settings.
+
+## Structure
+
+Every algorithm-independent stage lives in `ct_core` and is shared by all
+backends; a reconstruction algorithm is a drop-in replacement for any other:
+
+```
+run_fdk_recon.py / run_iterative_recon.py     thin drivers (backend flags only)
+  └─ ct_core/pipeline.py    shared CLI args, prepare_scan() → ScanContext,
+                            detector-psi calibration JSON, save_outputs()
+       ├─ ct_core/scan_setup.py      scan.xml, projections, geometry, VFF export
+       ├─ ct_core/preprocessing.py   flat-field+log, BHC, ring corr., downsample
+       ├─ ct_core/calibration.py     mu_water constants, mu→HU conversion
+       └─ ct_core/utils.py           GPU memory query
+fdk.py / astra_iterative.py / tigre_iterative.py   the algorithms
+```
+
+Backend contract: consume `ScanContext.projections` (raw counts,
+`(N_angles, N_b, N_a)`), `.angles` (radians, FDK convention), `.geometry`
+(dict from `build_geometry`), and return a float32 `(Nx, Ny, Nz)` volume in
+HU. Anything honouring that contract (e.g. a learning-based iterative solver)
+plugs into the same drivers.
+
+## Geometry self-calibration (standard, all backends)
+
+The detector in-plane rotation (psi) is calibrated automatically for every
+reconstruction: the drivers first read the scan-keyed
+`data/calibration/detector_psi_<serial>_<scan>.json`; on a cache miss they
+**measure psi from the scan's own projections** with the half-scan-consistency
+estimator (`ct_core/geometry_selfcal.py`, the validated method ported from
+muNeRF — FBP the two halves of the view range, score gradient-NCC agreement,
+two-stage grid search with fail-safe guards) and write the JSON so every
+later run, in any pipeline, gets a cache hit. Measurement needs a CUDA GPU
+(~1–5 min, once per scan); without one, TIGRE falls back to its inline
+conjugate estimator and FDK/ASTRA to psi=0, with printed notices.
+
+Only `psi_deg` is ever applied — fitted `cpa0` intercepts are known estimator
+bias and are reported as a diagnostic. `--no-geometry-autocal` disables the
+whole feature (pre-2026-08-11 behaviour).
+
+Standalone (pre-)calibration, e.g. on a cluster GPU node before submitting
+long jobs:
+
+```bash
+python -m reconstruction.run_geometry_calibration data/scans/Scan_1510
+python -m reconstruction.run_geometry_calibration data/scans/Scan_1510 --force  # re-measure
+```
 
 ## Usage
 

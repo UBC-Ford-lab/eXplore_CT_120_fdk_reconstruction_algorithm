@@ -17,10 +17,9 @@ try:
 except ImportError:
     astra = None
 
-from .ct_core.calibration import (MU_WATER_80KV,
-                                   MU_WATER_80KV_NO_BHC,
-                                   MU_WATER_80KV_WITH_BHC)
+from .ct_core.calibration import default_mu_water, mu_to_hu
 from .ct_core.preprocessing import preprocess_sinogram
+from .ct_core.utils import query_gpu_memory
 
 SUPPORTED_ALGORITHMS = ('SIRT3D_CUDA', 'CGLS3D_CUDA', 'SART3D_CUDA', 'FDK_CUDA')
 
@@ -64,6 +63,11 @@ def geometry_to_astra_vectors(angles, geometry):
     R_d = geometry['R_d']
     da = geometry['da']
     db = geometry['db']
+    # Measured detector in-plane rotation (about the detector normal). 0.0 is
+    # a bit-exact no-op; the convention matches muNeRF's ray construction and
+    # fdk.py (u' = c*u + s*v, v' = -s*u + c*v).
+    psi = float(geometry.get('det_psi_rad', 0.0) or 0.0)
+    c_psi, s_psi = np.cos(psi), np.sin(psi)
 
     cos_b = np.cos(angles)
     sin_b = np.sin(angles)
@@ -79,16 +83,15 @@ def geometry_to_astra_vectors(angles, geometry):
     dY = R_d * sin_b
     dZ = zeros
 
-    # Detector u-direction (horizontal, per pixel):
-    # From FDK formula: a-coordinate corresponds to (-sin(beta), cos(beta))
-    uX = -sin_b * da
-    uY = cos_b * da
-    uZ = zeros
+    # Detector unit axes before psi: u_hat = (-sin b, cos b, 0), v_hat = z_hat.
+    # psi rotates them in the detector plane; per-pixel vectors carry pitch.
+    uX = c_psi * (-sin_b) * da
+    uY = c_psi * cos_b * da
+    uZ = np.full_like(angles, s_psi * da)
 
-    # Detector v-direction (vertical, per pixel): (0, 0, db)
-    vX = zeros
-    vY = zeros
-    vZ = np.full_like(angles, db)
+    vX = -s_psi * (-sin_b) * db
+    vY = -s_psi * cos_b * db
+    vZ = np.full_like(angles, c_psi * db)
 
     vectors = np.column_stack([srcX, srcY, srcZ,
                                dX, dY, dZ,
@@ -190,11 +193,7 @@ class ASTRAReconstructor:
         self.upper_clamp_value = upper_clamp_value
 
         # HU conversion parameters
-        if mu_water is None:
-            self.mu_water = (MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None
-                             else MU_WATER_80KV_NO_BHC)
-        else:
-            self.mu_water = mu_water
+        self.mu_water = default_mu_water(mu_water, bhc_coeffs)
         self.output_hu = output_hu
 
         # BHC and ring correction
@@ -236,6 +235,10 @@ class ASTRAReconstructor:
             (proj_geom, vol_geom) — ASTRA geometry dicts
         """
         vectors = geometry_to_astra_vectors(self.angles, self.geometry)
+        psi = float(self.geometry.get('det_psi_rad', 0.0) or 0.0)
+        if psi:
+            print(f"  Detector in-plane rotation: psi = "
+                  f"{np.degrees(psi):+.4f} deg (rotated cone_vec axes)")
 
         # ASTRA cone_vec projection geometry
         # detector grid: N_b rows × N_a columns
@@ -291,28 +294,20 @@ class ASTRAReconstructor:
         print(f"  Total:     {total_estimate / 2**30:.2f} GiB")
 
         # Query GPU memory via nvidia-smi (avoids torch CUDA context overhead)
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name,memory.total,memory.free',
-                 '--format=csv,noheader,nounits', f'--id={self.gpu_index}'],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                parts = result.stdout.strip().split(', ')
-                name = parts[0]
-                total = int(parts[1]) * 2**20  # MiB to bytes
-                free = int(parts[2]) * 2**20
-                print(f"  GPU {self.gpu_index} ({name}): {total / 2**30:.2f} GiB total, {free / 2**30:.2f} GiB free")
-                if total_estimate > free * 0.85:
-                    raise MemoryError(
-                        f"Estimated GPU memory need ({total_estimate / 2**30:.2f} GiB) "
-                        f"exceeds available ({free / 2**30:.2f} GiB). "
-                        f"Try: reduce FOV (--fov-xy, --fov-z), increase voxel size "
-                        f"(--voxel-xy, --voxel-z), or use --downsample."
-                    )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        gpu = query_gpu_memory(self.gpu_index)
+        if gpu is None:
             print("  (nvidia-smi not available — skipping GPU memory check)")
+            return
+        print(f"  GPU {self.gpu_index} ({gpu['name']}): "
+              f"{gpu['total_bytes'] / 2**30:.2f} GiB total, "
+              f"{gpu['free_bytes'] / 2**30:.2f} GiB free")
+        if total_estimate > gpu['free_bytes'] * 0.85:
+            raise MemoryError(
+                f"Estimated GPU memory need ({total_estimate / 2**30:.2f} GiB) "
+                f"exceeds available ({gpu['free_bytes'] / 2**30:.2f} GiB). "
+                f"Try: reduce FOV (--fov-xy, --fov-z), increase voxel size "
+                f"(--voxel-xy, --voxel-z), or use --downsample."
+            )
 
     def reconstruct(self):
         """
@@ -420,27 +415,11 @@ class ASTRAReconstructor:
             if vol_id is not None:
                 astra.data3d.delete(vol_id)
 
-        # Step 8: Optional HU conversion
+        # Step 8: Optional HU conversion (shared ct_core definition)
         if self.output_hu:
             print("\nConverting to Hounsfield Units...")
-            mu_water = self.mu_water
-            print(f"  mu_water = {mu_water:.6f} mm^-1")
-
-            p1 = float(np.percentile(self.reconstructed_volume, 1))
-            p85 = float(np.percentile(self.reconstructed_volume, 85))
-            print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
-
-            self.reconstructed_volume = (
-                (self.reconstructed_volume - mu_water) / mu_water * 1000.0
-            )
-            self.reconstructed_volume = np.clip(
-                self.reconstructed_volume, -1024, 4095
-            ).astype(np.float32)
-
-            hu_p1 = float(np.percentile(self.reconstructed_volume, 1))
-            print(f"  Post-conversion P1 (expect ~-1000 for air): {hu_p1:.0f} HU")
-            print(f"  Range: [{self.reconstructed_volume.min():.0f}, "
-                  f"{self.reconstructed_volume.max():.0f}] HU")
+            self.reconstructed_volume = mu_to_hu(self.reconstructed_volume,
+                                                 self.mu_water)
 
         print("\nReconstruction complete.")
         return self.reconstructed_volume

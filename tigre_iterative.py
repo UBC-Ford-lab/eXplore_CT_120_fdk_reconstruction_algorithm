@@ -32,10 +32,9 @@ try:
 except ImportError:
     _ssim_fn = None
 
-from .ct_core.calibration import (MU_WATER_80KV,
-                                   MU_WATER_80KV_NO_BHC,
-                                   MU_WATER_80KV_WITH_BHC)
+from .ct_core.calibration import default_mu_water, mu_to_hu
 from .ct_core.preprocessing import preprocess_sinogram
+from .ct_core.utils import query_gpu_memory
 
 SUPPORTED_TIGRE_ALGORITHMS = ('ossart', 'sart', 'sirt', 'mlem')
 
@@ -423,11 +422,7 @@ class TIGREReconstructor:
         self.upper_clamp_value = upper_clamp_value
 
         # HU conversion parameters
-        if mu_water is None:
-            self.mu_water = (MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None
-                             else MU_WATER_80KV_NO_BHC)
-        else:
-            self.mu_water = mu_water
+        self.mu_water = default_mu_water(mu_water, bhc_coeffs)
         self.output_hu = output_hu
 
         # BHC and ring correction
@@ -479,22 +474,38 @@ class TIGREReconstructor:
               f"({self.N_angles}x{self.N_b}x{self.N_a} float32)")
         print(f"  Total:     {(vol_bytes + sino_bytes) / 2**30:.2f} GiB (min)")
 
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name,memory.total,memory.free',
-                 '--format=csv,noheader,nounits', f'--id={self.gpu_index}'],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                parts = result.stdout.strip().split(', ')
-                name = parts[0]
-                total = int(parts[1]) * 2**20
-                free = int(parts[2]) * 2**20
-                print(f"  GPU {self.gpu_index} ({name}): "
-                      f"{total / 2**30:.2f} GiB total, {free / 2**30:.2f} GiB free")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        gpu = query_gpu_memory(self.gpu_index)
+        if gpu is None:
             print("  (nvidia-smi not available — skipping GPU info)")
+        else:
+            print(f"  GPU {self.gpu_index} ({gpu['name']}): "
+                  f"{gpu['total_bytes'] / 2**30:.2f} GiB total, "
+                  f"{gpu['free_bytes'] / 2**30:.2f} GiB free")
+
+    def _crop_to_roi(self, vol_xyz, Nx_orig, Ny_orig, Nz_orig, verbose=False):
+        """Center-crop a padded (x, y, z) volume back to the requested ROI.
+
+        The reconstructed volume is centered at isocenter (offOrigin=0, the
+        CUDA-hang workaround), so an off-center ROI crops at
+        idx = (N_pad - N_roi)/2 + offset/voxel_size. Degenerates to a plain
+        center-crop for full-FOV (vol_origin=0). Single definition used by
+        both the final-volume path and the per-checkpoint export path.
+        """
+        Nx_pad, Ny_pad, Nz_pad = vol_xyz.shape
+        if (Nx_pad, Ny_pad, Nz_pad) == (Nx_orig, Ny_orig, Nz_orig):
+            return vol_xyz
+        ox, oy, oz = self.geometry.get('vol_origin', (0, 0, 0))
+        dx = self.geometry['dx']
+        dz = self.geometry['dz']
+        x0 = round((Nx_pad - Nx_orig) / 2 + ox / dx)
+        y0 = round((Ny_pad - Ny_orig) / 2 + oy / dx)
+        z0 = round((Nz_pad - Nz_orig) / 2 + oz / dz)
+        vol_xyz = vol_xyz[x0:x0 + Nx_orig, y0:y0 + Ny_orig, z0:z0 + Nz_orig]
+        if verbose:
+            print(f"  Cropped ({Nx_pad}, {Ny_pad}, {Nz_pad}) → "
+                  f"({Nx_orig}, {Ny_orig}, {Nz_orig}) "
+                  f"[start: ({x0}, {y0}, {z0})]")
+        return vol_xyz
 
     def _to_disk_volume(self, vol_tigre, Nx_orig, Ny_orig, Nz_orig):
         """
@@ -516,20 +527,10 @@ class TIGREReconstructor:
         to [-1024, 4095] if output_hu, uncropped in xy/z (caller slices).
         """
         vol = vol_tigre.transpose(2, 1, 0).astype(np.float32)  # (x, y, z)
-
-        Nx_pad, Ny_pad, Nz_pad = vol.shape
-        if Nx_pad != Nx_orig or Ny_pad != Ny_orig or Nz_pad != Nz_orig:
-            ox, oy, oz = self.geometry.get('vol_origin', (0, 0, 0))
-            dx = self.geometry['dx']
-            dz = self.geometry['dz']
-            x0 = round((Nx_pad - Nx_orig) / 2 + ox / dx)
-            y0 = round((Ny_pad - Ny_orig) / 2 + oy / dx)
-            z0 = round((Nz_pad - Nz_orig) / 2 + oz / dz)
-            vol = vol[x0:x0 + Nx_orig, y0:y0 + Ny_orig, z0:z0 + Nz_orig]
+        vol = self._crop_to_roi(vol, Nx_orig, Ny_orig, Nz_orig)
 
         if self.output_hu:
-            vol = (vol - self.mu_water) / self.mu_water * 1000.0
-            vol = np.clip(vol, -1024, 4095).astype(np.float32)
+            vol = mu_to_hu(vol, self.mu_water, verbose=False)
 
         return vol.transpose(2, 1, 0)[:, ::-1, :]  # (z, y, x), on-disk convention
 
@@ -924,49 +925,17 @@ class TIGREReconstructor:
         self.reconstructed_volume = vol_tigre.transpose(2, 1, 0).astype(np.float32)
         del vol_tigre
 
-        # Crop from centered volume to original ROI dimensions.
-        # The reconstructed volume is centered at isocenter (offOrigin=0).
-        # For ROI reconstruction, the ROI may be off-center, so crop indices
-        # account for the ROI offset: idx = (N_big - N_roi)/2 + offset/voxel_size
-        # For full-FOV (vol_origin=0), this degenerates to a simple center-crop.
-        Nx_pad, Ny_pad, Nz_pad = self.reconstructed_volume.shape
-        if Nx_pad != Nx_orig or Ny_pad != Ny_orig or Nz_pad != Nz_orig:
-            ox, oy, oz = self.geometry.get('vol_origin', (0, 0, 0))
-            dx = self.geometry['dx']
-            dz = self.geometry['dz']
-            x0 = round((Nx_pad - Nx_orig) / 2 + ox / dx)
-            y0 = round((Ny_pad - Ny_orig) / 2 + oy / dx)
-            z0 = round((Nz_pad - Nz_orig) / 2 + oz / dz)
-            self.reconstructed_volume = self.reconstructed_volume[
-                x0:x0 + Nx_orig, y0:y0 + Ny_orig, z0:z0 + Nz_orig
-            ]
-            print(f"  Cropped ({Nx_pad}, {Ny_pad}, {Nz_pad}) → "
-                  f"({Nx_orig}, {Ny_orig}, {Nz_orig}) "
-                  f"[start: ({x0}, {y0}, {z0})]")
+        # Crop from centered (possibly CUDA-hang-padded) volume to the ROI.
+        self.reconstructed_volume = self._crop_to_roi(
+            self.reconstructed_volume, Nx_orig, Ny_orig, Nz_orig, verbose=True)
 
         print(f"  Reordered to FDK convention: {self.reconstructed_volume.shape} (x, y, z)")
 
-        # Step 7: Optional HU conversion
+        # Step 7: Optional HU conversion (shared ct_core definition)
         if self.output_hu:
             print("\nConverting to Hounsfield Units...")
-            mu_water = self.mu_water
-            print(f"  mu_water = {mu_water:.6f} mm^-1")
-
-            p1 = float(np.percentile(self.reconstructed_volume, 1))
-            p85 = float(np.percentile(self.reconstructed_volume, 85))
-            print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
-
-            self.reconstructed_volume = (
-                (self.reconstructed_volume - mu_water) / mu_water * 1000.0
-            )
-            self.reconstructed_volume = np.clip(
-                self.reconstructed_volume, -1024, 4095
-            ).astype(np.float32)
-
-            hu_p1 = float(np.percentile(self.reconstructed_volume, 1))
-            print(f"  Post-conversion P1 (expect ~-1000 for air): {hu_p1:.0f} HU")
-            print(f"  Range: [{self.reconstructed_volume.min():.0f}, "
-                  f"{self.reconstructed_volume.max():.0f}] HU")
+            self.reconstructed_volume = mu_to_hu(self.reconstructed_volume,
+                                                 self.mu_water)
 
         print("\nReconstruction complete.")
         return self.reconstructed_volume

@@ -6,9 +6,8 @@ import matplotlib.pyplot as plt
 import os
 import sys
 
-from .ct_core.calibration import (MU_WATER_80KV,
-                                   MU_WATER_80KV_NO_BHC,
-                                   MU_WATER_80KV_WITH_BHC)
+from .ct_core.calibration import default_mu_water, mu_to_hu
+from .ct_core.preprocessing import apply_bhc, ring_artifact_correction
 
 # Device: use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -229,11 +228,7 @@ class FDKReconstructor:
         self.folder_name = folder_name
 
         # HU calibration parameters
-        if mu_water is None:
-            self.mu_water = (MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None
-                             else MU_WATER_80KV_NO_BHC)
-        else:
-            self.mu_water = mu_water
+        self.mu_water = default_mu_water(mu_water, bhc_coeffs)
         self.output_hu = output_hu
         self.bright_field = bright_field
         self.dark_field = dark_field
@@ -268,13 +263,8 @@ class FDKReconstructor:
         self.b_length = self.db * self.N_b
 
     def _apply_bhc(self, chunk):
-        """Apply BHC polynomial to line integrals: p_corrected = c1*p + c2*p^2 + ..."""
-        if self.bhc_coeffs is None:
-            return chunk
-        result = self.bhc_coeffs[0] * chunk
-        for k in range(1, len(self.bhc_coeffs)):
-            result = result + self.bhc_coeffs[k] * chunk.pow(k + 1)
-        return result
+        """Apply BHC polynomial to line integrals (shared ct_core definition)."""
+        return apply_bhc(chunk, self.bhc_coeffs)
 
     def _forward_project(self, volume, mask=None):
         """Voxel-driven GPU forward projection via nearest-neighbor splatting.
@@ -717,15 +707,8 @@ class FDKReconstructor:
 
             # --- Ring correction on full sinogram (if enabled) ---
             if self.ring_correction:
-                from scipy.ndimage import median_filter
-                print(f"  Ring correction: computing column profile...")
-                mean_sino = float_projections.mean(axis=0)
-                smoothed = median_filter(mean_sino, size=(1, self.ring_median_width))
-                ring_artifact = mean_sino - smoothed
-                float_projections -= ring_artifact[np.newaxis, :, :]
-                ring_mag = np.abs(ring_artifact).max()
-                print(f"  Ring correction applied: max correction = {ring_mag:.6f}")
-                del mean_sino, smoothed, ring_artifact
+                ring_artifact_correction(float_projections,
+                                         median_width=self.ring_median_width)
 
             # Store unfiltered sinogram for bone BHC (after ring correction, before filtering)
             if self.bone_bhc:
@@ -1058,21 +1041,10 @@ class FDKReconstructor:
         print("Physics-based HU Calibration (true μ output)")
         print("=" * 60)
 
-        mu_water = self.mu_water
-        p1 = float(np.percentile(vol_np, 1))
-        p85 = float(np.percentile(vol_np, 85))
-        print(f"  μ_water (effective, {'BHC' if self.bhc_coeffs is not None else 'no-BHC'}): {mu_water:.6f} mm⁻¹")
-        print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
-
-        vol_np = (vol_np - mu_water) / mu_water * 1000.0
-        vol_np = np.clip(vol_np, -1024, 4095)
-
-        hu_p1 = float(np.percentile(vol_np, 1))
-        print(f"  Post-conversion P1 (expect ~-1000 for air): {hu_p1:.0f} HU")
-        print(f"  Range: [{float(vol_np.min()):.0f}, {float(vol_np.max()):.0f}] HU")
+        print(f"  μ_water pipeline: "
+              f"{'BHC' if self.bhc_coeffs is not None else 'no-BHC'}")
+        self.reconstructed_volume = mu_to_hu(vol_np, self.mu_water)
         print("=" * 60)
-
-        self.reconstructed_volume = vol_np
 
     def display_volume(self):
 

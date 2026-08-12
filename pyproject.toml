@@ -41,4 +41,4 @@ Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_
 include = ["ct_core*"]
 
 [tool.setuptools]
-py-modules = ["fdk", "run_fdk_recon", "astra_iterative", "run_iterative_recon"]
+py-modules = ["fdk", "run_fdk_recon", "astra_iterative", "run_iterative_recon", "tigre_iterative", "run_geometry_calibration"]

@@ -3,10 +3,13 @@ Run iterative cone-beam CT reconstruction using ASTRA or TIGRE toolbox.
 
 Supports multiple backends:
   - astra: SIRT, CGLS, SART, FDK via ASTRA toolbox
-  - tigre: OS-SART, SART, SIRT via TIGRE (handles GPU memory splitting internally)
+  - tigre: OS-SART, SART, SIRT, MLEM via TIGRE (handles GPU memory splitting
+    internally)
 
-Uses the same data-loading and post-processing pipeline as the FDK script,
-but replaces the reconstruction step with iterative algorithms.
+All algorithm-independent stages (scan loading, geometry build, detector
+downsampling, detector-psi calibration, HU calibration + VFF export) live in
+ct_core.pipeline and are shared with the FDK driver — this script only owns
+backend/algorithm selection and the iterative-specific knobs.
 
 Usage:
     python -m reconstruction.run_iterative_recon data/scans/Scan_1681
@@ -15,7 +18,6 @@ Usage:
 """
 
 import argparse
-import os
 import sys
 import time
 
@@ -23,17 +25,16 @@ import numpy as np
 
 from .astra_iterative import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
 from .tigre_iterative import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
-from .ct_core.scan_setup import (
-    auto_detect_scan_folder,
-    load_scan_data,
-    build_geometry,
-    parse_crop_boundary,
-    postprocess_and_save,
+from .ct_core.pipeline import (
+    add_common_args,
+    prepare_scan,
+    resolve_or_measure_detector_psi,
+    save_outputs,
 )
 
 
 def parse_args():
-    """Parse command-line arguments."""
+    """Parse command-line arguments (shared args + iterative-specific ones)."""
     parser = argparse.ArgumentParser(
         description='Run iterative reconstruction on VFF projections using ASTRA or TIGRE',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -45,149 +46,64 @@ Examples:
   python -m reconstruction.run_iterative_recon data/scans/Scan_1681 --backend tigre --algorithm ossart --iterations 150 --lmbda 0.3
         """
     )
+    add_common_args(parser)
 
-    # Shared arguments (same as FDK)
+    # Backend selection
     parser.add_argument(
-        'data_folder',
-        help='Path to folder containing projections and scan.xml'
+        '--backend',
+        default='astra',
+        choices=('astra', 'tigre'),
+        help='Reconstruction backend (default: astra)'
     )
     parser.add_argument(
-        '--scan-folder',
-        help='Path to original scan folder with bright.vff/dark.vff (auto-detected if not specified)'
-    )
-    parser.add_argument(
-        '--output',
-        help='Output VFF filename (auto-generated from data_folder if not specified)'
-    )
-    parser.add_argument(
-        '--total-angle',
-        default='determined',
-        help='Total angular coverage in degrees. Default: "determined" (reads IncrementAngle '
-             'and ViewCount from scan.xml to compute total angle automatically). '
-             'Specify a numeric value to override (e.g., --total-angle 360.0).'
-    )
-    parser.add_argument(
-        '--projection-pattern',
+        '--algorithm',
         default=None,
-        help='Glob pattern for projection files (default: auto-detect proj-* or acq*)'
+        help='Reconstruction algorithm. '
+             'ASTRA: SIRT3D_CUDA, CGLS3D_CUDA, SART3D_CUDA, FDK_CUDA (default: SIRT3D_CUDA). '
+             'TIGRE: ossart, sart, sirt, mlem (default: ossart). '
+             'mlem is Maximum-Likelihood Expectation-Maximization under a Poisson '
+             'noise model (full-batch, no ordered subsets; ignores --lmbda/--lmbda-red; '
+             'incompatible with --pwls).'
     )
     parser.add_argument(
-        '--phase',
-        default='00',
-        help='Acquisition phase to reconstruct for multi-phase (gated) scans, '
-             'e.g. 00 or 01. Selects projection files whose name contains '
-             '"-<phase>-" (default: 00). Ignored for sequential proj-* scans.'
-    )
-    parser.add_argument(
-        '--voxel-xy',
-        type=float,
-        default=0.075,
-        help='Reconstruction voxel size in the xy plane in mm (default: 0.075)'
-    )
-    parser.add_argument(
-        '--voxel-z',
-        type=float,
-        default=0.075,
-        help='Reconstruction voxel size in the z plane in mm (default: 0.075)'
-    )
-    parser.add_argument(
-        '--fov-xy',
-        type=float,
-        default=45,
-        help='Field of view in the xy plane in mm (default: 45)'
-    )
-    parser.add_argument(
-        '--fov-z',
-        type=float,
-        default=120.0,
-        help='Field of view in the z direction in mm (default: 120.0)'
-    )
-    parser.add_argument(
-        '--display',
-        action='store_true',
-        help='Save reconstruction slice PNGs after completion'
-    )
-    parser.add_argument(
-        '--bilateral-filter',
-        action='store_true',
-        help='Apply bilateral filter to calibrated volume (edge-preserving denoising)'
-    )
-    parser.add_argument(
-        '--bilateral-sigma-spatial',
-        type=float,
-        default=1.5,
-        help='Bilateral filter spatial sigma in mm (default: 1.5)'
-    )
-    parser.add_argument(
-        '--bilateral-sigma-range',
-        type=float,
-        default=50.0,
-        help='Bilateral filter intensity sigma in HU (default: 50.0)'
-    )
-
-    # Beam hardening correction
-    parser.add_argument(
-        '--bhc-coeffs',
-        type=float,
-        nargs='+',
-        default=None,
-        help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
-             'beam hardening correction. Default: disabled (no BHC). '
-             'Example: --bhc-coeffs 0.856 0.21 (80 kVp water phantom calibration).'
-    )
-    parser.add_argument(
-        '--no-bhc',
-        dest='bhc_coeffs',
-        action='store_const',
-        const=None,
-        help='Disable sinogram-domain beam hardening correction'
-    )
-    parser.add_argument(
-        '--geometry-autocal',
-        action='store_true',
-        default=True,
-        help='Measure detector in-plane rotation (psi) and the column centre '
-             'of rotation from this scan\'s conjugate rays before '
-             'reconstructing (reference-free, ~1 s). Default: on.'
-    )
-    parser.add_argument(
-        '--no-geometry-autocal',
-        dest='geometry_autocal',
-        action='store_false',
-        help='Assume a perfectly square, centred detector (psi=0, CoR at the '
-             'detector centre) — the pre-2026-08-11 behaviour.'
-    )
-    parser.add_argument(
-        '--ring-correction',
-        action='store_true',
-        default=True,
-        help='Enable sinogram-space ring artifact correction (default: on)'
-    )
-    parser.add_argument(
-        '--no-ring-correction',
-        dest='ring_correction',
-        action='store_false',
-        help='Disable ring artifact correction'
-    )
-    parser.add_argument(
-        '--ring-median-width',
+        '--iterations',
         type=int,
-        default=51,
-        help='Median filter width for ring correction (odd int, default: 51)'
+        default=100,
+        help='Number of iterations for iterative algorithms (default: 100). '
+             'Ignored for FDK_CUDA.'
     )
     parser.add_argument(
-        '--skip-calibration',
-        action='store_true',
-        default=True,
-        help='Skip two-point auto-calibration; save physics-based HU directly '
-             '(default: on). Recommended — auto-calibration maps the central '
-             'ROI to 0 HU, which is unreliable when that ROI is not water.'
+        '--min-constraint',
+        type=float,
+        default=None,
+        help='Minimum voxel value constraint (e.g., 0.0 for non-negativity). '
+             'Only for iterative algorithms.'
     )
     parser.add_argument(
-        '--no-skip-calibration',
-        dest='skip_calibration',
-        action='store_false',
-        help='Re-enable two-point auto-calibration (not recommended for mouse scans)'
+        '--max-constraint',
+        type=float,
+        default=None,
+        help='Maximum voxel value constraint. Only for iterative algorithms.'
+    )
+    parser.add_argument(
+        '--gpu-index',
+        type=int,
+        default=0,
+        help='CUDA device index (default: 0)'
+    )
+    parser.add_argument(
+        '--super-sampling',
+        type=int,
+        default=1,
+        help='Detector/voxel super-sampling factor (default: 1). '
+             'Higher values improve accuracy at the cost of speed.'
+    )
+    parser.add_argument(
+        '--calibration-method',
+        default='two_point',
+        help='HU calibration method (default: "two_point"). '
+             'Measures air/water from the volume and applies the standard '
+             'CT HU formula. Self-calibrating, works with any config.'
     )
 
     # Cross-validation holdout (TIGRE backend only)
@@ -255,74 +171,6 @@ Examples:
              'each checkpoint volume before saving. Default: full xy plane.'
     )
 
-    # Backend selection
-    parser.add_argument(
-        '--backend',
-        default='astra',
-        choices=('astra', 'tigre'),
-        help='Reconstruction backend (default: astra)'
-    )
-
-    # Algorithm (choices depend on backend, validated in main())
-    parser.add_argument(
-        '--algorithm',
-        default=None,
-        help='Reconstruction algorithm. '
-             'ASTRA: SIRT3D_CUDA, CGLS3D_CUDA, SART3D_CUDA, FDK_CUDA (default: SIRT3D_CUDA). '
-             'TIGRE: ossart, sart, sirt, mlem (default: ossart). '
-             'mlem is Maximum-Likelihood Expectation-Maximization under a Poisson '
-             'noise model (full-batch, no ordered subsets; ignores --lmbda/--lmbda-red; '
-             'incompatible with --pwls).'
-    )
-    parser.add_argument(
-        '--iterations',
-        type=int,
-        default=100,
-        help='Number of iterations for iterative algorithms (default: 100). '
-             'Ignored for FDK_CUDA.'
-    )
-    parser.add_argument(
-        '--min-constraint',
-        type=float,
-        default=None,
-        help='Minimum voxel value constraint (e.g., 0.0 for non-negativity). '
-             'Only for iterative algorithms.'
-    )
-    parser.add_argument(
-        '--max-constraint',
-        type=float,
-        default=None,
-        help='Maximum voxel value constraint. Only for iterative algorithms.'
-    )
-    parser.add_argument(
-        '--gpu-index',
-        type=int,
-        default=0,
-        help='CUDA device index (default: 0)'
-    )
-    parser.add_argument(
-        '--super-sampling',
-        type=int,
-        default=1,
-        help='Detector/voxel super-sampling factor (default: 1). '
-             'Higher values improve accuracy at the cost of speed.'
-    )
-    parser.add_argument(
-        '--downsample',
-        type=int,
-        default=1,
-        help='Downsample projections by this factor before reconstruction (default: 1). '
-             'Reduces GPU memory usage. Factor 2 halves each detector dimension.'
-    )
-
-    parser.add_argument(
-        '--calibration-method',
-        default='two_point',
-        help='HU calibration method (default: "two_point"). '
-             'Measures air/water from the volume and applies the standard '
-             'CT HU formula. Self-calibrating, works with any config.'
-    )
-
     # TIGRE-specific arguments
     parser.add_argument(
         '--blocksize',
@@ -379,47 +227,7 @@ Examples:
              'discard a PWLS weight array; this combination raises an error).'
     )
 
-    # ROI-based reconstruction
-    parser.add_argument(
-        '--roi',
-        nargs='+',
-        default=None,
-        help='ROI-based reconstruction. Use "auto" to load from '
-             'SubVolumeCoordinates.xml in the scan folder, or specify 6 values: '
-             'x_min x_max y_min y_max z_min z_max (mm, isocenter-centered). '
-             'When active, --fov-xy and --fov-z are ignored.'
-    )
-
     return parser.parse_args()
-
-
-def downsample_projections(projections, factor):
-    """
-    Downsample projections by averaging adjacent pixels.
-
-    Args:
-        projections: np.ndarray of shape (N_angles, N_b, N_a)
-        factor: integer downsampling factor
-
-    Returns:
-        Downsampled projections
-    """
-    if factor <= 1:
-        return projections
-
-    N_angles, N_b, N_a = projections.shape
-
-    # Trim to be divisible by factor
-    N_b_new = (N_b // factor) * factor
-    N_a_new = (N_a // factor) * factor
-    trimmed = np.array(projections[:, :N_b_new, :N_a_new], dtype=np.float32)
-
-    # Reshape and average
-    downsampled = trimmed.reshape(
-        N_angles, N_b_new // factor, factor, N_a_new // factor, factor
-    ).mean(axis=(2, 4))
-
-    return downsampled
 
 
 def main():
@@ -455,12 +263,10 @@ def main():
 
     start = time.time()
 
-    data_folder = args.data_folder
-
     print("=" * 60)
     print(f"Iterative Reconstruction Pipeline ({args.backend.upper()}: {args.algorithm})")
     print("=" * 60)
-    print(f"Data folder: {data_folder}")
+    print(f"Data folder: {args.data_folder}")
     print(f"Backend: {args.backend}")
     if args.algorithm != 'FDK_CUDA':
         print(f"Iterations: {args.iterations}")
@@ -479,78 +285,8 @@ def main():
         if args.pwls:
             print(f"PWLS: enabled")
 
-    # Resolve scan folder
-    if args.scan_folder:
-        scan_folder = args.scan_folder
-    else:
-        try:
-            scan_folder = auto_detect_scan_folder(data_folder)
-        except ValueError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    # Load scan data using shared utility
-    scan_data = load_scan_data(
-        data_folder, scan_folder,
-        args.projection_pattern, args.total_angle,
-        sub_scan=f'-{args.phase}-',
-    )
-    projections = scan_data['projections']
-    angles = scan_data['angles']
-    bright_field = scan_data['bright_field']
-    dark_field = scan_data['dark_field']
-
-    # Parse ROI bounds if requested
-    roi_bounds = None
-    if args.roi is not None:
-        if args.roi == ['auto']:
-            roi_bounds = parse_crop_boundary(scan_folder, scan_data['xml_header'])
-            if roi_bounds is None:
-                print("Error: SubVolumeCoordinates.xml not found or invalid in scan folder.")
-                print("  Looked in: " + os.path.join(scan_folder, 'Volumes', 'SubVolumeCoordinates.xml'))
-                sys.exit(1)
-        elif len(args.roi) == 6:
-            vals = [float(v) for v in args.roi]
-            roi_bounds = {
-                'x_min': vals[0], 'x_max': vals[1],
-                'y_min': vals[2], 'y_max': vals[3],
-                'z_min': vals[4], 'z_max': vals[5],
-            }
-        else:
-            print("Error: --roi requires 'auto' or exactly 6 values "
-                  "(x_min x_max y_min y_max z_min z_max)")
-            sys.exit(1)
-
-    # Build geometry using shared utility
-    geometry = build_geometry(
-        scan_data['xml_header'],
-        args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
-        roi_bounds=roi_bounds,
-    )
-
-    # Downsample if requested
-    if args.downsample > 1:
-        print(f"\nDownsampling projections by factor {args.downsample}...")
-        original_shape = projections.shape
-        projections = downsample_projections(projections, args.downsample)
-        print(f"  {original_shape} -> {projections.shape}")
-
-        # Also downsample bright/dark fields
-        N_b_new = projections.shape[1]
-        N_a_new = projections.shape[2]
-        factor = args.downsample
-        N_b_trim = N_b_new * factor
-        N_a_trim = N_a_new * factor
-        bright_field = bright_field[:N_b_trim, :N_a_trim].reshape(
-            N_b_new, factor, N_a_new, factor
-        ).mean(axis=(1, 3))
-        dark_field = dark_field[:N_b_trim, :N_a_trim].reshape(
-            N_b_new, factor, N_a_new, factor
-        ).mean(axis=(1, 3))
-
-        # Update geometry: detector pixel size scales with downsample factor
-        geometry['da'] *= args.downsample
-        geometry['db'] *= args.downsample
+    # Shared front half: scan folder, projections, ROI, geometry, downsample.
+    ctx = prepare_scan(args)
 
     # Determine output path
     if args.output:
@@ -561,74 +297,64 @@ def main():
             suffix += f"_{args.iterations}it"
         if getattr(args, 'pwls', False):
             suffix += "_pwls"
-        output_path = data_folder.rstrip('/') + f'_recon{suffix}'
+        output_path = ctx.default_output_path(f'_recon{suffix}')
 
     print(f"\nOutput path: {output_path}")
 
-    # Convert angles to numpy
-    angles_np = angles.numpy() if hasattr(angles, 'numpy') else np.asarray(angles)
+    # ---- geometry auto-calibration (detector in-plane rotation psi) --------
+    # Cached scan-keyed JSON first (written by any pipeline — muNeRF, FDK, or
+    # this driver); on a miss, the half-scan-consistency estimator
+    # (ct_core.geometry_selfcal, ported from muNeRF) measures psi from THIS
+    # scan's projections and caches it. For TIGRE, absence additionally falls
+    # back to its inline conjugate estimator (biased low ~-0.49 vs recon-true
+    # ~-0.7 on Scan_1510, blind on symmetric objects, but reference-free).
+    ext_psi = None
+    if args.geometry_autocal:
+        record = resolve_or_measure_detector_psi(
+            ctx, fallback_note=("the inline conjugate estimator will run "
+                                "instead (TIGRE) / psi=0 (ASTRA)"))
+        if record is not None:
+            ext_psi = float(record['psi_deg'])
 
     # Initialize reconstructor based on backend
     if args.backend == 'astra':
         if not args.no_crossval:
             print("WARNING: cross-validation is only supported with --backend tigre. "
                   "Running ASTRA without holdout eval.")
+        if ext_psi is not None:
+            # applied inside geometry_to_astra_vectors (rotated u/v axes)
+            ctx.geometry['det_psi_rad'] = float(np.radians(ext_psi))
         reconstructor = ASTRAReconstructor(
-            projections=projections,
-            angles=angles_np,
-            geometry=geometry,
+            projections=ctx.projections,
+            angles=ctx.angles,
+            geometry=ctx.geometry,
             algorithm=args.algorithm,
             iterations=args.iterations,
             min_constraint=args.min_constraint,
             max_constraint=args.max_constraint,
             gpu_index=args.gpu_index,
             super_sampling=args.super_sampling,
-            bright_field=bright_field,
-            dark_field=dark_field,
+            bright_field=ctx.bright_field,
+            dark_field=ctx.dark_field,
             output_hu=True,
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             ring_median_width=args.ring_median_width,
         )
     elif args.backend == 'tigre':
-        # Prefer the shared scan-keyed calibration JSON (written by muNeRF's
-        # half-scan self-calibration, the validated estimator) over the inline
-        # conjugate fit, which is biased low (~-0.49 vs recon-true ~-0.7 on
-        # Scan_1510) and blind on symmetric objects. Same file run_fdk_recon
-        # reads. Absent -> the inline estimate remains the fallback.
-        _ext_psi = None
-        if args.geometry_autocal:
-            try:
-                import json as _json
-                from pathlib import Path as _Path
-                from .ct_core.vff_io import detector_serial_from_scan
-                _serial = detector_serial_from_scan(scan_folder)
-                _tag = _Path(scan_folder).name
-                _cal = (_Path(__file__).resolve().parents[1] / "data"
-                        / "calibration" / f"detector_psi_{_serial}_{_tag}.json")
-                if _serial and _cal.exists():
-                    _rec = _json.loads(_cal.read_text())
-                    _ext_psi = float(_rec["psi_deg"])
-                    print(f"\nGeometry calibration from {_cal.name}: "
-                          f"psi = {_ext_psi:+.4f} deg (method "
-                          f"{_rec.get('method', 'conjugate')}, measured "
-                          f"{_rec.get('measured_on', '?')})")
-            except Exception as _e:
-                print(f"\nGeometry calibration JSON unavailable "
-                      f"({type(_e).__name__}: {_e}) — inline estimate will run")
         reconstructor = TIGREReconstructor(
-            detector_psi_deg=_ext_psi,
-            projections=projections,
-            angles=angles_np,
-            geometry=geometry,
+            detector_psi_deg=ext_psi,
+            projections=ctx.projections,
+            angles=ctx.angles,
+            geometry=ctx.geometry,
             algorithm=args.algorithm,
             iterations=args.iterations,
             blocksize=args.blocksize,
             lmbda=args.lmbda,
             lmbda_red=args.lmbda_red,
             gpu_index=args.gpu_index,
-            bright_field=bright_field,
-            dark_field=dark_field,
+            bright_field=ctx.bright_field,
+            dark_field=ctx.dark_field,
             output_hu=True,
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
@@ -655,17 +381,8 @@ def main():
     if hasattr(reconstructor, 'plot_crossval'):
         reconstructor.plot_crossval(output_path)
 
-    # Post-process and save using shared utility
-    postprocess_and_save(
-        volume=reconstructor.reconstructed_volume,
-        geometry=geometry,
-        output_path=output_path,
-        bilateral_filter=args.bilateral_filter,
-        bilateral_sigma_spatial=args.bilateral_sigma_spatial,
-        bilateral_sigma_range=args.bilateral_sigma_range,
-        voxel_xy=args.voxel_xy,
-        skip_calibration=args.skip_calibration,
-    )
+    # Shared back half: HU calibration + bilateral filter + VFF export.
+    save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
 
     end = time.time()
     print(f"\nReconstruction finished in {(end - start)/60:.2f} minutes.")

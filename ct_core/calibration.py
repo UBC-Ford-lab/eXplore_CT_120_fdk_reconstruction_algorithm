@@ -112,6 +112,43 @@ MU_AIR = 0.0  # mm⁻¹
 BHC_COEFFICIENTS_80KV = [0.856, 0.21]
 
 
+def default_mu_water(mu_water=None, bhc_coeffs=None) -> float:
+    """Resolve the effective mu_water for HU conversion.
+
+    An explicit ``mu_water`` always wins; otherwise the pipeline-matched
+    constant is selected by whether sinogram-domain BHC is active (BHC
+    lowers the effective mu_water by removing beam-hardening inflation).
+    One definition for every backend — FDK, ASTRA, TIGRE, and future ones.
+    """
+    if mu_water is not None:
+        return float(mu_water)
+    return MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None else MU_WATER_80KV_NO_BHC
+
+
+def mu_to_hu(volume, mu_water, verbose=True):
+    """Physics-based HU conversion: HU = (mu - mu_water) / mu_water * 1000.
+
+    Shared by every reconstruction backend so the output HU convention is
+    identical by construction. Clips to the on-disk range [-1024, 4095] and
+    returns float32. ``volume`` is a numpy array of mu values (mm^-1).
+    """
+    volume = np.asarray(volume, dtype=np.float32)
+    if verbose:
+        print(f"  mu_water = {mu_water:.6f} mm^-1")
+        p1 = float(np.percentile(volume, 1))
+        p85 = float(np.percentile(volume, 85))
+        print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
+
+    volume = (volume - mu_water) / mu_water * 1000.0
+    volume = np.clip(volume, -1024, 4095).astype(np.float32)
+
+    if verbose:
+        hu_p1 = float(np.percentile(volume, 1))
+        print(f"  Post-conversion P1 (expect ~-1000 for air): {hu_p1:.0f} HU")
+        print(f"  Range: [{volume.min():.0f}, {volume.max():.0f}] HU")
+    return volume
+
+
 def parse_calibration_from_xml(xml_path: str) -> Dict[str, float]:
     """
     Extract AirValue, WaterValue, and BoneHU from scan XML.

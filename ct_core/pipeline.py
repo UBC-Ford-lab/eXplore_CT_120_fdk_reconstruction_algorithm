@@ -1,0 +1,539 @@
+"""Shared driver-level plumbing for the reconstruction entry points.
+
+Every reconstruction algorithm in this package — FDK (analytic), ASTRA/TIGRE
+(classical iterative), and whatever comes next (learning-based iterative) —
+consumes the same inputs and produces the same output:
+
+    scan folder ─→ prepare_scan() ─→ ScanContext ─→ <algorithm> ─→ volume
+                                                        │
+                            save_outputs() ←────────────┘
+
+The algorithm-independent stages live here, once:
+
+  * ``add_common_args``      — CLI arguments shared by every driver
+  * ``prepare_scan``         — scan-folder resolution, projection/flat-field
+                               loading, ROI parsing, geometry build, optional
+                               detector downsampling (with correct
+                               central-pixel index conversion)
+  * ``resolve_detector_psi`` — the scan-keyed detector-psi calibration JSON
+                               (written by muNeRF's half-scan self-calibration
+                               or scripts/detector_psi_from_conjugates.py)
+  * ``save_outputs``         — HU calibration + bilateral filter + VFF export
+
+A reconstruction backend only has to honour the volume contract to be a
+drop-in replacement: take ``ctx.projections`` (raw counts, (N_angles, N_b,
+N_a)), ``ctx.angles`` (radians, FDK convention), ``ctx.geometry`` (dict, see
+``scan_setup.build_geometry``), and return a float32 volume of shape
+``geometry['vol_shape']`` = (Nx, Ny, Nz) in HU.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+
+from .scan_setup import (
+    auto_detect_scan_folder,
+    load_scan_data,
+    build_geometry,
+    parse_crop_boundary,
+    postprocess_and_save,
+)
+from .preprocessing import downsample_projections
+from .vff_io import detector_serial_from_scan
+
+
+# --------------------------------------------------------------------------
+# CLI arguments shared by every reconstruction driver
+# --------------------------------------------------------------------------
+
+def add_common_args(parser):
+    """Register the algorithm-independent arguments on ``parser``.
+
+    Backend-specific flags (FDK filter settings, TIGRE relaxation, ...) stay
+    in the individual drivers.
+    """
+    parser.add_argument(
+        'data_folder',
+        help='Path to folder containing projections and scan.xml'
+    )
+    parser.add_argument(
+        '--scan-folder',
+        help='Path to original scan folder with bright.vff/dark.vff '
+             '(auto-detected if not specified)'
+    )
+    parser.add_argument(
+        '--output',
+        help='Output VFF filename (auto-generated from data_folder if not specified)'
+    )
+    parser.add_argument(
+        '--total-angle',
+        default='determined',
+        help='Total angular coverage in degrees. Default: "determined" (reads '
+             'IncrementAngle and ViewCount from scan.xml to compute total angle '
+             'automatically). Specify a numeric value to override '
+             '(e.g., --total-angle 360.0).'
+    )
+    parser.add_argument(
+        '--projection-pattern',
+        default=None,
+        help='Glob pattern for projection files (default: auto-detect proj-* or acq*)'
+    )
+    parser.add_argument(
+        '--phase',
+        default='00',
+        help='Acquisition phase to reconstruct for multi-phase (gated) scans, '
+             'e.g. 00 or 01. Selects projection files whose name contains '
+             '"-<phase>-" (default: 00). Ignored for sequential proj-* scans.'
+    )
+    parser.add_argument(
+        '--voxel-xy',
+        type=float,
+        default=0.075,
+        help='Reconstruction voxel size in the xy plane in mm (default: 0.075)'
+    )
+    parser.add_argument(
+        '--voxel-z',
+        type=float,
+        default=0.075,
+        help='Reconstruction voxel size in the z plane in mm (default: 0.075)'
+    )
+    parser.add_argument(
+        '--fov-xy',
+        type=float,
+        default=45,
+        help='Field of view in the xy plane in mm (default: 45, for most mouse '
+             'scans; use 94 for most phantom scanner studies)'
+    )
+    parser.add_argument(
+        '--fov-z',
+        type=float,
+        default=120.0,
+        help='Field of view in the z direction in mm (default: 120.0)'
+    )
+    parser.add_argument(
+        '--roi',
+        nargs='+',
+        default=None,
+        help='ROI-based reconstruction. Use "auto" to load from '
+             'SubVolumeCoordinates.xml in the scan folder, or specify 6 values: '
+             'x_min x_max y_min y_max z_min z_max (mm, isocenter-centered). '
+             'When active, --fov-xy and --fov-z are ignored.'
+    )
+    parser.add_argument(
+        '--downsample',
+        type=int,
+        default=1,
+        help='Downsample projections by this factor before reconstruction '
+             '(default: 1). Reduces GPU memory usage. Factor 2 halves each '
+             'detector dimension (detector pixel size and central-pixel '
+             'indices are converted consistently).'
+    )
+    parser.add_argument(
+        '--display',
+        action='store_true',
+        help='Save reconstruction slice PNGs after completion'
+    )
+    parser.add_argument(
+        '--bilateral-filter',
+        action='store_true',
+        help='Apply bilateral filter to calibrated volume '
+             '(edge-preserving denoising)'
+    )
+    parser.add_argument(
+        '--bilateral-sigma-spatial',
+        type=float,
+        default=1.5,
+        help='Bilateral filter spatial sigma in mm (default: 1.5). '
+             'Converted to voxels using --voxel-xy.'
+    )
+    parser.add_argument(
+        '--bilateral-sigma-range',
+        type=float,
+        default=50.0,
+        help='Bilateral filter intensity sigma in HU (default: 50.0). '
+             'Controls edge-preservation threshold.'
+    )
+    parser.add_argument(
+        '--bhc-coeffs',
+        nargs='+',
+        type=float,
+        default=None,
+        help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
+             'beam hardening correction: p_corrected = c1*p + c2*p^2 + ... '
+             'Example: 0.856 0.21 (calibrated from water phantom at 80 kVp). '
+             'Default: disabled (no BHC).'
+    )
+    parser.add_argument(
+        '--no-bhc',
+        dest='bhc_coeffs',
+        action='store_const',
+        const=None,
+        help='Disable sinogram-domain beam hardening correction'
+    )
+    parser.add_argument(
+        '--geometry-autocal',
+        action='store_true',
+        default=True,
+        help='Use the scan-keyed detector geometry calibration (in-plane '
+             'rotation psi) measured reference-free from the projections. '
+             'Default: on.'
+    )
+    parser.add_argument(
+        '--no-geometry-autocal',
+        dest='geometry_autocal',
+        action='store_false',
+        help='Assume a perfectly square, centred detector — the '
+             'pre-2026-08-11 behaviour.'
+    )
+    parser.add_argument(
+        '--ring-correction',
+        action='store_true',
+        default=True,
+        dest='ring_correction',
+        help='Enable sinogram-space ring artifact correction (default: on). '
+             'Removes fixed-pattern detector column offsets that cause '
+             'concentric ring artifacts in the reconstruction.'
+    )
+    parser.add_argument(
+        '--no-ring-correction',
+        action='store_false',
+        dest='ring_correction',
+        help='Disable ring artifact correction.'
+    )
+    parser.add_argument(
+        '--ring-median-width',
+        type=int,
+        default=51,
+        help='Median filter width for ring correction (default: 51, must be '
+             'odd). Controls the scale of features removed. '
+             'Larger = more aggressive.'
+    )
+    parser.add_argument(
+        '--skip-calibration',
+        action='store_true',
+        default=True,
+        help='Skip two-point auto-calibration; save physics-based HU directly '
+             '(default: on). Recommended — auto-calibration maps the central '
+             'ROI to 0 HU, which is unreliable when that ROI is not water.'
+    )
+    parser.add_argument(
+        '--no-skip-calibration',
+        dest='skip_calibration',
+        action='store_false',
+        help='Re-enable two-point auto-calibration '
+             '(not recommended for mouse scans)'
+    )
+    return parser
+
+
+# --------------------------------------------------------------------------
+# Scan preparation (loading + geometry), shared by every driver
+# --------------------------------------------------------------------------
+
+@dataclass
+class ScanContext:
+    """Everything an algorithm needs, in the shared conventions.
+
+    ``projections`` are RAW counts (flat-field correction happens inside the
+    backends so FDK can keep its fused GPU path); ``angles`` are radians in
+    the FDK convention; ``geometry`` is the dict from
+    ``scan_setup.build_geometry`` (already downsample-adjusted when
+    ``downsample`` > 1).
+    """
+    data_folder: str
+    scan_folder: str
+    projections: np.ndarray
+    angles: np.ndarray
+    bright_field: Optional[np.ndarray]
+    dark_field: Optional[np.ndarray]
+    xml_header: dict
+    geometry: dict
+    roi_bounds: Optional[dict] = None
+    total_angle: float = 0.0
+    downsample: int = 1
+    detector_psi: Optional[dict] = field(default=None)
+
+    def default_output_path(self, suffix: str = '_recon') -> str:
+        return self.data_folder.rstrip('/') + suffix
+
+
+def _parse_roi_bounds(args, scan_folder, xml_header):
+    """Resolve --roi into isocenter-centered bounds (or None)."""
+    if args.roi is None:
+        return None
+    if args.roi == ['auto']:
+        roi_bounds = parse_crop_boundary(scan_folder, xml_header)
+        if roi_bounds is None:
+            print("Error: SubVolumeCoordinates.xml not found or invalid in scan folder.")
+            print("  Looked in: "
+                  + os.path.join(scan_folder, 'Volumes', 'SubVolumeCoordinates.xml'))
+            sys.exit(1)
+        return roi_bounds
+    if len(args.roi) == 6:
+        vals = [float(v) for v in args.roi]
+        return {
+            'x_min': vals[0], 'x_max': vals[1],
+            'y_min': vals[2], 'y_max': vals[3],
+            'z_min': vals[4], 'z_max': vals[5],
+        }
+    print("Error: --roi requires 'auto' or exactly 6 values "
+          "(x_min x_max y_min y_max z_min z_max)")
+    sys.exit(1)
+
+
+def prepare_scan(args) -> ScanContext:
+    """Run the algorithm-independent front half of every reconstruction.
+
+    Resolves the scan folder, loads projections + flat fields, parses the
+    ROI, builds the geometry dict, and (optionally) downsamples the detector
+    — identically for every backend.
+    """
+    data_folder = args.data_folder
+
+    # Resolve scan folder
+    if args.scan_folder:
+        scan_folder = args.scan_folder
+    else:
+        try:
+            scan_folder = auto_detect_scan_folder(data_folder)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    scan_data = load_scan_data(
+        data_folder, scan_folder,
+        args.projection_pattern, args.total_angle,
+        sub_scan=f'-{args.phase}-',
+    )
+    projections = scan_data['projections']
+    angles = scan_data['angles']
+    bright_field = scan_data['bright_field']
+    dark_field = scan_data['dark_field']
+
+    roi_bounds = _parse_roi_bounds(args, scan_folder, scan_data['xml_header'])
+
+    geometry = build_geometry(
+        scan_data['xml_header'],
+        args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
+        roi_bounds=roi_bounds,
+    )
+
+    # Optional detector downsampling (average pooling), applied consistently:
+    # detector pixel pitch scales UP by the factor, and the central-pixel
+    # indices convert as raw -> pooled: c' = (c - (f-1)/2) / f (the pooled
+    # pixel centre sits at the mean of its f raw-pixel centres).
+    factor = int(getattr(args, 'downsample', 1) or 1)
+    if factor > 1:
+        print(f"\nDownsampling projections by factor {factor}...")
+        original_shape = projections.shape
+        projections = downsample_projections(projections, factor)
+        print(f"  {original_shape} -> {projections.shape}")
+        if bright_field is not None:
+            bright_field = downsample_projections(bright_field, factor)
+        if dark_field is not None:
+            dark_field = downsample_projections(dark_field, factor)
+        geometry['da'] *= factor
+        geometry['db'] *= factor
+        for key in ('central_pixel_a', 'central_pixel_b'):
+            geometry[key] = (geometry[key] - (factor - 1) / 2.0) / factor
+
+    return ScanContext(
+        data_folder=data_folder,
+        scan_folder=scan_folder,
+        projections=projections,
+        angles=(angles.numpy() if hasattr(angles, 'numpy')
+                else np.asarray(angles)),
+        bright_field=bright_field,
+        dark_field=dark_field,
+        xml_header=scan_data['xml_header'],
+        geometry=geometry,
+        roi_bounds=roi_bounds,
+        total_angle=scan_data['total_angle'],
+        downsample=factor,
+    )
+
+
+# --------------------------------------------------------------------------
+# Detector geometry calibration (the ONE reader of the shared psi JSON)
+# --------------------------------------------------------------------------
+
+def resolve_detector_psi(scan_folder, verbose=True,
+                         fallback_note="using psi=0 and the XML CoR"
+                         ) -> Optional[dict]:
+    """Read the scan-keyed detector-psi calibration JSON, if it exists.
+
+    This is the single cross-pipeline interface for the detector in-plane
+    rotation: muNeRF's half-scan self-calibration (the validated estimator)
+    and scripts/detector_psi_from_conjugates.py both write
+    ``data/calibration/detector_psi_<serial>_<scanTag>.json``; every
+    reconstruction backend reads it through this function.
+
+    Returns the parsed record (keys: psi_deg, cpa0, method, measured_on, ...)
+    or None when no calibration exists for this scan. Policy note: consumers
+    apply ``psi_deg`` ONLY — the fitted ``cpa0`` intercept is known estimator
+    bias, not geometry (applying it split muNeRF run zsu85kc6's z=+23 mm tube
+    into two overlapped half-discs; the FBP tube test of 2026-08-12 shows the
+    column CoR round at the detector's geometric centre).
+    """
+    try:
+        serial = detector_serial_from_scan(scan_folder)
+        tag = Path(scan_folder).name
+        cal_path = (Path(__file__).resolve().parents[2] / "data" / "calibration"
+                    / f"detector_psi_{serial}_{tag}.json")
+        if not serial or not cal_path.exists():
+            if verbose:
+                print(f"\n  Geometry auto-calibration: no cached measurement "
+                      f"for this scan ({cal_path.name}) — {fallback_note}. "
+                      f"Run muNeRF or "
+                      f"scripts/detector_psi_from_conjugates.py once on this "
+                      f"scan to populate it.")
+            return None
+        record = json.loads(cal_path.read_text())
+        record['_path'] = str(cal_path)
+        if verbose:
+            print(f"\n  Geometry auto-calibration from {cal_path.name}:")
+            print(f"    psi = {float(record['psi_deg']):+.4f} deg  (method "
+                  f"{record.get('method', 'conjugate')}; fitted cpa0 "
+                  f"{float(record.get('cpa0', float('nan'))):.3f} NOT applied "
+                  f"— CoR stays at the geometric centre; measured "
+                  f"{record.get('measured_on', '?')})")
+        return record
+    except Exception as e:
+        if verbose:
+            print(f"\n  Geometry auto-calibration skipped "
+                  f"({type(e).__name__}: {e})")
+        return None
+
+
+def measure_detector_psi(ctx: ScanContext, verbose=True) -> Optional[dict]:
+    """Measure the detector in-plane rotation from THIS scan's projections.
+
+    Runs the half-scan-consistency estimator (ct_core.geometry_selfcal — the
+    validated method ported from muNeRF) on a pooled, flat-fielded copy of
+    the projections, writes the shared calibration JSON so every later run
+    (FDK, iterative, muNeRF) gets a cache hit, and returns the record.
+
+    Needs a CUDA device (~1-5 min of FBP scoring; CPU would take hours) and
+    bright/dark fields. Returns None — with the reason printed — whenever
+    measurement is not possible or the estimator rejects the data, so the
+    caller can fall back exactly as if no calibration existed.
+    """
+    if not torch.cuda.is_available():
+        if verbose:
+            print("  Geometry self-calibration skipped: no CUDA device "
+                  "(the half-scan estimator needs a GPU).")
+        return None
+    if ctx.bright_field is None or ctx.dark_field is None:
+        if verbose:
+            print("  Geometry self-calibration skipped: no bright/dark "
+                  "fields to form line integrals from.")
+        return None
+
+    from .geometry_selfcal import (
+        estimate_psi_halfncc,
+        prepare_estimation_sinogram,
+        calibration_json_path,
+        write_calibration_json,
+    )
+
+    try:
+        serial = detector_serial_from_scan(ctx.scan_folder)
+        # pool to ~raw-ds-3 for the estimator, on top of any --downsample
+        factor = max(1, int(round(3 / max(1, ctx.downsample))))
+        total_ds = ctx.downsample * factor
+        if verbose:
+            print(f"\n  Geometry self-calibration: measuring detector psi "
+                  f"from the projections (half-scan consistency, "
+                  f"pool {total_ds}x)...")
+        sino = prepare_estimation_sinogram(
+            ctx.projections, ctx.bright_field, ctx.dark_field, factor=factor)
+
+        g = dict(ctx.geometry)
+        g['da'] = float(g['da']) * factor
+        g['db'] = float(g['db']) * factor
+        for key in ('central_pixel_a', 'central_pixel_b'):
+            g[key] = (float(g[key]) - (factor - 1) / 2.0) / factor
+
+        angles_t = torch.as_tensor(np.asarray(ctx.angles, dtype=np.float64))
+        result = estimate_psi_halfncc(sino, angles_t, g,
+                                      downsample=total_ds, verbose=verbose)
+
+        record = None
+        if serial:
+            path = calibration_json_path(
+                Path(__file__).resolve().parents[2],
+                serial, Path(ctx.scan_folder).name)
+            write_calibration_json(path, result, downsample=total_ds,
+                                   detector_serial=serial)
+            if verbose:
+                print(f"  Saved calibration to {path.name} — future runs on "
+                      f"this scan (any pipeline) will reuse it.")
+        elif verbose:
+            print("  (no detector serial in the projection headers — "
+                  "measurement used but not cached)")
+        record = dict(result)
+        ctx.detector_psi = record
+        if verbose:
+            print(f"  psi = {float(record['psi_deg']):+.4f} deg (halfncc, "
+                  f"prominence {float(record.get('prominence', 0.0)):.2f}) — "
+                  f"fitted cpa0 NOT applied (estimator bias; CoR stays at "
+                  f"the geometric centre)")
+        return record
+    except Exception as e:
+        if verbose:
+            print(f"  Geometry self-calibration FAILED "
+                  f"({type(e).__name__}: {e}) — continuing without it.")
+        return None
+
+
+def resolve_or_measure_detector_psi(ctx: ScanContext, verbose=True,
+                                    fallback_note="using psi=0 and the XML CoR"
+                                    ) -> Optional[dict]:
+    """The standard geometry-calibration entry point for every driver.
+
+    Cached JSON first (written by any pipeline — muNeRF or this package);
+    on a miss, measure from this scan's own projections and cache. Returns
+    None only when both paths are unavailable, in which case the stated
+    fallback applies.
+    """
+    record = resolve_detector_psi(ctx.scan_folder, verbose=False)
+    if record is not None:
+        if verbose:
+            print(f"\n  Geometry calibration (cached "
+                  f"{Path(record['_path']).name}): psi = "
+                  f"{float(record['psi_deg']):+.4f} deg (method "
+                  f"{record.get('method', 'conjugate')}, measured "
+                  f"{record.get('measured_on', '?')}; fitted cpa0 NOT "
+                  f"applied)")
+        ctx.detector_psi = record
+        return record
+    record = measure_detector_psi(ctx, verbose=verbose)
+    if record is None and verbose:
+        print(f"  Geometry calibration unavailable — {fallback_note}.")
+    return record
+
+
+# --------------------------------------------------------------------------
+# Output stage, shared by every driver
+# --------------------------------------------------------------------------
+
+def save_outputs(volume, ctx: ScanContext, args, output_path: str) -> str:
+    """HU calibration + optional bilateral filter + VFF export."""
+    return postprocess_and_save(
+        volume=volume,
+        geometry=ctx.geometry,
+        output_path=output_path,
+        bilateral_filter=args.bilateral_filter,
+        bilateral_sigma_spatial=args.bilateral_sigma_spatial,
+        bilateral_sigma_range=args.bilateral_sigma_range,
+        voxel_xy=args.voxel_xy,
+        skip_calibration=args.skip_calibration,
+    )
