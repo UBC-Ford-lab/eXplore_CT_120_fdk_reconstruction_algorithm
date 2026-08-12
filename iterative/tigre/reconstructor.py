@@ -32,9 +32,9 @@ try:
 except ImportError:
     _ssim_fn = None
 
-from .ct_core.calibration import default_mu_water, mu_to_hu
-from .ct_core.preprocessing import preprocess_sinogram
-from .ct_core.utils import query_gpu_memory
+from ...ct_core.calibration import default_mu_water, mu_to_hu
+from ...ct_core.preprocessing import preprocess_sinogram
+from ...ct_core.utils import query_gpu_memory
 
 SUPPORTED_TIGRE_ALGORITHMS = ('ossart', 'sart', 'sirt', 'mlem')
 
@@ -605,7 +605,7 @@ class TIGREReconstructor:
         elif self.geometry_autocal:
             try:
                 import torch as _torch
-                from .ct_core.detector_psi import estimate_psi_joint
+                from ...ct_core.detector_psi import estimate_psi_joint
                 # self.angles (FDK convention) matches the sinogram AS IT IS
                 # HERE — the TIGRE angle conversion and the column flip both
                 # happen later, at Step 5.
@@ -617,7 +617,7 @@ class TIGREReconstructor:
                 print("\nGeometry auto-calibration (conjugate rays, no reference "
                       "volume)...")
                 _r = estimate_psi_joint(_sin, _ang, _g, downsample=1, verbose=False)
-                from .ct_core.detector_psi import MAX_PSI_DEG, MIN_JOINT_DEPTH
+                from ...ct_core.detector_psi import MAX_PSI_DEG, MIN_JOINT_DEPTH
                 if (abs(_r["psi_deg"]) <= MAX_PSI_DEG
                         and _r.get("joint_depth", 0.0) >= MIN_JOINT_DEPTH
                         and abs(_r["cpa0"] - _g["central_pixel_a"])

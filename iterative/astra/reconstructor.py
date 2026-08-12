@@ -17,9 +17,9 @@ try:
 except ImportError:
     astra = None
 
-from .ct_core.calibration import default_mu_water, mu_to_hu
-from .ct_core.preprocessing import preprocess_sinogram
-from .ct_core.utils import query_gpu_memory
+from ...ct_core.calibration import default_mu_water, mu_to_hu
+from ...ct_core.preprocessing import preprocess_sinogram
+from ...ct_core.utils import query_gpu_memory
 
 SUPPORTED_ALGORITHMS = ('SIRT3D_CUDA', 'CGLS3D_CUDA', 'SART3D_CUDA', 'FDK_CUDA')
 

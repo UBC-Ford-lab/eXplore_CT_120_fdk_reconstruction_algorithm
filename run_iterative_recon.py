@@ -23,9 +23,10 @@ import time
 
 import numpy as np
 
-from .astra_iterative import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
-from .tigre_iterative import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
+from .iterative.astra import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
+from .iterative.tigre import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
 from .ct_core.pipeline import (
+    ReconLogger,
     add_common_args,
     prepare_scan,
     resolve_or_measure_detector_psi,
@@ -374,6 +375,17 @@ def main():
                                   if args.checkpoint_xy_range else None),
         )
 
+    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    logger = ReconLogger(args, ctx, f'{args.backend}_{args.algorithm}',
+                         output_path, params={
+                             'iterations': args.iterations,
+                             'blocksize': args.blocksize,
+                             'lmbda': args.lmbda,
+                             'lmbda_red': args.lmbda_red,
+                             'tv_lambda': args.tv_lambda,
+                             'pwls': bool(args.pwls),
+                         })
+
     # Run reconstruction
     reconstructor.reconstruct()
 
@@ -383,6 +395,12 @@ def main():
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
+
+    if getattr(reconstructor, 'crossval_metrics', None):
+        logger.log_convergence(reconstructor.crossval_metrics)
+    logger.log_sinogram_preview(ctx.projections)
+    logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
+    logger.finish()
 
     end = time.time()
     print(f"\nReconstruction finished in {(end - start)/60:.2f} minutes.")

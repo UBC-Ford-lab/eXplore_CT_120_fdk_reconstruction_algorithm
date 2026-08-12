@@ -28,6 +28,7 @@ import torch
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
 from .ct_core.pipeline import (
+    ReconLogger,
     add_common_args,
     prepare_scan,
     resolve_or_measure_detector_psi,
@@ -232,10 +233,22 @@ def main():
         bone_bhc_hu=args.bone_bhc_hu,
     )
 
+    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    logger = ReconLogger(args, ctx, 'fdk', output_path, params={
+        'filter_cutoff': filter_cutoff,
+        'filter_type': args.filter_type,
+        'parker_weighting': bool(args.parker_weighting),
+        'bone_bhc': bool(args.bone_bhc),
+    })
+
     reconstructor.reconstruct(display_volume=args.display)
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
+
+    logger.log_sinogram_preview(ctx.projections)
+    logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
+    logger.finish()
 
     end = time.time()
     print(f"\nReconstruction finished in {(end - start)/60:.2f} minutes.")

@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 import os
 import sys
 
-from .ct_core.calibration import default_mu_water, mu_to_hu
-from .ct_core.preprocessing import apply_bhc, ring_artifact_correction
+from ..ct_core.calibration import default_mu_water, mu_to_hu
+from ..ct_core.preprocessing import apply_bhc, ring_artifact_correction
 
 # Device: use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

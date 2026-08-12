@@ -33,12 +33,13 @@ dependencies = [
 
 [project.optional-dependencies]
 iterative = ["astra-toolbox"]
+wandb = ["wandb"]
 
 [project.urls]
 Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_algorithm"
 
 [tool.setuptools.packages.find]
-include = ["ct_core*"]
+include = ["ct_core*", "fdk*", "iterative*", "learning_based_iterative*"]
 
 [tool.setuptools]
-py-modules = ["fdk", "run_fdk_recon", "astra_iterative", "run_iterative_recon", "tigre_iterative", "run_geometry_calibration"]
+py-modules = ["run_fdk_recon", "run_iterative_recon", "run_learned_recon", "run_geometry_calibration"]

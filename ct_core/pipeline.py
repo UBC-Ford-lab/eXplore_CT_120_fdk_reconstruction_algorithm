@@ -48,6 +48,7 @@ from .scan_setup import (
 )
 from .preprocessing import downsample_projections
 from .vff_io import detector_serial_from_scan
+from .wandb_logging import ReconLogger, add_wandb_args  # noqa: F401 (ReconLogger re-exported for drivers)
 
 
 # --------------------------------------------------------------------------
@@ -231,6 +232,9 @@ def add_common_args(parser):
         help='Re-enable two-point auto-calibration '
              '(not recommended for mouse scans)'
     )
+
+    # Experiment logging (local PNG plots + optional Weights & Biases)
+    add_wandb_args(parser)
     return parser
 
 
