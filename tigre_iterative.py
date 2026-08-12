@@ -605,7 +605,8 @@ class TIGREReconstructor:
                 from .ct_core.detector_psi import MAX_PSI_DEG, MIN_JOINT_DEPTH
                 if (abs(_r["psi_deg"]) <= MAX_PSI_DEG
                         and _r.get("joint_depth", 0.0) >= MIN_JOINT_DEPTH
-                        and abs(_r["cpa0"] - _g["central_pixel_a"]) <= 8.0 * 3):
+                        and abs(_r["cpa0"] - _g["central_pixel_a"])
+                            * float(self.geometry["da"]) <= 0.70):
                     _psi_deg, _cpa_raw = _r["psi_deg"], _r["cpa0"]
                     print(f"  psi = {_psi_deg:+.4f} deg, cpa0 = {_cpa_raw:.3f} "
                           f"(geometric centre {_g['central_pixel_a']:.1f}), "

@@ -131,8 +131,10 @@ def _refine(f, x0, h, n=7):
 
 
 def estimate_psi_joint(sinogram, angles, geometry, *, warp=None, downsample=1,
-                      bands=25, row_frac=0.90, coarse_half=8.0,
-                      coarse_step=0.25, thresh=0.15, device=None, verbose=True):
+                      bands=25, row_frac=0.90, search_half_mm=0.70,
+                      search_step_mm=0.020, fine_half_mm=0.52,
+                      fine_step_mm=0.008, thresh=0.15, device=None,
+                      verbose=True):
     """Fit (cpa0, psi) JOINTLY to every row band at once.
 
     WHY THIS IS MORE ROBUST THAN THE PER-BAND FIT. The two-stage estimator
@@ -190,6 +192,14 @@ def estimate_psi_joint(sinogram, angles, geometry, *, warp=None, downsample=1,
         centres = [o[1] for o in out]
     centres = np.asarray(centres, dtype=float)
 
+    # SEARCH EXTENTS ARE PHYSICAL (mm at the detector), converted to columns
+    # with `da` — which load_scene has already scaled by the downsample. Column
+    # counts are NOT ds-invariant: +/-8 columns spans 0.68 mm at ds=3 but only
+    # 0.23 mm at ds=1, so a fixed column window would silently search a third of
+    # the range on full-resolution data. Physical units make the behaviour
+    # identical at ds = 1, 2, 3, ...
+    coarse_half = float(search_half_mm) / da
+    coarse_step = max(float(search_step_mm) / da, 1e-3)
     grid = np.arange(-coarse_half, coarse_half + 1e-9, coarse_step)
     table = np.full((len(bandsS), len(grid)), np.nan)
     for gi, off in enumerate(grid):
@@ -218,13 +228,16 @@ def estimate_psi_joint(sinogram, angles, geometry, *, warp=None, downsample=1,
         return float(np.sum((1 - w) * table[np.arange(len(centres)), i0]
                             + w * table[np.arange(len(centres)), i0 + 1]))
 
-    c_grid = cpa_c + np.arange(-6.0, 6.01, 0.1)
+    _fh, _fs = float(fine_half_mm) / da, max(float(fine_step_mm) / da, 1e-3)
+    c_grid = cpa_c + np.arange(-_fh, _fh + 1e-9, _fs)
+    # slope is columns-per-ROW: columns and rows both scale with ds, so this
+    # grid is already ds-invariant and must NOT be converted.
     s_grid = np.arange(-0.030, 0.0301, 0.0005)
     Z = np.array([[total(c, s) for s in s_grid] for c in c_grid])
     Zf = Z[np.isfinite(Z)]                       # inf = outside the cost table
     ic, is_ = np.unravel_index(np.nanargmin(Z), Z.shape)
     c0, s0 = c_grid[ic], s_grid[is_]
-    for hc, hs in ((0.05, 0.0002), (0.02, 0.00008)):
+    for hc, hs in ((_fs / 2.0, 0.0002), (_fs / 5.0, 0.00008)):
         cs = c0 + hc * np.arange(-2, 3)
         ss = s0 + hs * np.arange(-2, 3)
         Zl = np.array([[total(c, s) for s in ss] for c in cs])
@@ -440,11 +453,32 @@ def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
 
     if cache is not None and cache.exists():
         rec = json.loads(cache.read_text())
+        # cpa0 is an index into the DOWNSAMPLED detector, so a cache written at
+        # a different `downsample` is not merely stale — it is in different
+        # units. At ds=3 cpa0=583.5 sits mid-detector; applied to the ds=1
+        # 3500-column grid it would be ~1166 columns off. Re-measure instead of
+        # converting: at a finer ds the fit is also better conditioned.
+        _cached_ds = rec.get("downsample")
+        if _cached_ds is not None and int(_cached_ds) != int(downsample):
+            if verbose:
+                print(f"  Detector psi: cache {cache.name} was measured at "
+                      f"downsample={_cached_ds}, this run is {downsample} — "
+                      f"cpa0 is in detector-index units, so re-measuring")
+            rec = None
+        elif _cached_ds is None:
+            if verbose:
+                print(f"  Detector psi: cache {cache.name} predates the "
+                      f"downsample tag — re-measuring to be safe")
+            rec = None
+    else:
+        rec = None
+    if rec is not None:
         if verbose:
             print(f"  Detector psi: {rec['psi_deg']:+.4f} deg from cache "
                   f"{cache.name} (measured {rec.get('measured_on', '?')})")
         _record(geometry, rec, source="cache")
         return float(rec["psi_deg"])
+
 
     if sinogram is None or angles is None:
         if verbose:
@@ -490,6 +524,10 @@ def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
     if cache is not None:
         import datetime
         rec = dict(res)
+        rec["downsample"] = int(downsample)
+        # raw-detector index too, so the number is interpretable independently
+        # of the downsample it happened to be measured at
+        rec["cpa0_raw"] = float(res["cpa0"]) * int(downsample) + (int(downsample) - 1) / 2.0
         rec["detector_serial"] = serial
         rec["measured_on"] = datetime.date.today().isoformat()
         cache.parent.mkdir(parents=True, exist_ok=True)
