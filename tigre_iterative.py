@@ -260,7 +260,7 @@ class TIGREReconstructor:
                  blocksize=15, lmbda=0.5, lmbda_red=0.97,
                  nonneg=True, gpu_index=0,
                  bright_field=None, dark_field=None,
-                 geometry_autocal=True,
+                 geometry_autocal=True, detector_psi_deg=None,
                  clamp_mode='none', soft_clip_transmission=True,
                  soft_clip_sharpness=50.0, upper_clamp=True,
                  upper_clamp_value=1.05,
@@ -409,6 +409,13 @@ class TIGREReconstructor:
         # Reference-free psi + column-CoR calibration before reconstruction.
         # False == the pre-2026-08-11 behaviour (square, centred detector).
         self.geometry_autocal = bool(geometry_autocal)
+        # Externally supplied psi (e.g. from the shared half-scan calibration
+        # JSON that muNeRF writes — the better estimator). When set, the
+        # inline conjugate fit is skipped entirely; the CoR stays at the
+        # geometric centre either way (fitted intercepts are estimator bias,
+        # see run zsu85kc6 / 2026-08-12).
+        self.detector_psi_deg = (None if detector_psi_deg is None
+                                 else float(detector_psi_deg))
         self.clamp_mode = clamp_mode
         self.soft_clip_transmission = soft_clip_transmission
         self.soft_clip_sharpness = soft_clip_sharpness
@@ -587,7 +594,14 @@ class TIGREReconstructor:
         # were hard-zero here before 2026-08-11. Set geometry_autocal=False to
         # reproduce that exactly.
         _psi_deg, _cpa_raw = None, None
-        if self.geometry_autocal:
+        if self.detector_psi_deg is not None:
+            # External calibration (half-scan consistency JSON) wins over the
+            # inline conjugate fit — it is the validated, unbiased estimator.
+            _psi_deg = self.detector_psi_deg
+            _cpa_raw = (self.N_a - 1) / 2.0
+            print(f"\nGeometry: psi = {_psi_deg:+.4f} deg from external "
+                  f"calibration (CoR at the geometric centre)")
+        elif self.geometry_autocal:
             try:
                 import torch as _torch
                 from .ct_core.detector_psi import estimate_psi_joint
@@ -607,10 +621,20 @@ class TIGREReconstructor:
                         and _r.get("joint_depth", 0.0) >= MIN_JOINT_DEPTH
                         and abs(_r["cpa0"] - _g["central_pixel_a"])
                             * float(self.geometry["da"]) <= 0.70):
-                    _psi_deg, _cpa_raw = _r["psi_deg"], _r["cpa0"]
-                    print(f"  psi = {_psi_deg:+.4f} deg, cpa0 = {_cpa_raw:.3f} "
-                          f"(geometric centre {_g['central_pixel_a']:.1f}), "
-                          f"joint depth {_r.get('joint_depth', float('nan')):.2f}")
+                    # psi only. The fitted cpa0 intercept is estimator BIAS,
+                    # not geometry: applying it (+2.12 raw cols on Scan_1510)
+                    # split muNeRF run zsu85kc6's z=+23 mm tube into two
+                    # overlapped half-discs, and the FBP tube test
+                    # (2026-08-12) shows the geometric centre round at the
+                    # midplane and both z extremes. The intercept is still
+                    # fitted — the joint fit needs it as a nuisance
+                    # parameter — but it is not APPLIED.
+                    _psi_deg, _cpa_raw = _r["psi_deg"], _g["central_pixel_a"]
+                    print(f"  psi = {_psi_deg:+.4f} deg  (fitted cpa0 "
+                          f"{_r['cpa0']:.3f} NOT applied — known estimator "
+                          f"bias; CoR stays at the geometric centre "
+                          f"{_g['central_pixel_a']:.1f}), joint depth "
+                          f"{_r.get('joint_depth', float('nan')):.2f}")
                 else:
                     print(f"  REJECTED (psi {_r['psi_deg']:+.3f}, depth "
                           f"{_r.get('joint_depth', 0.0):.2f}) — using psi=0, "

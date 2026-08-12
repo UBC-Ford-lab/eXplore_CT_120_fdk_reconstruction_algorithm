@@ -591,7 +591,33 @@ def main():
             ring_median_width=args.ring_median_width,
         )
     elif args.backend == 'tigre':
+        # Prefer the shared scan-keyed calibration JSON (written by muNeRF's
+        # half-scan self-calibration, the validated estimator) over the inline
+        # conjugate fit, which is biased low (~-0.49 vs recon-true ~-0.7 on
+        # Scan_1510) and blind on symmetric objects. Same file run_fdk_recon
+        # reads. Absent -> the inline estimate remains the fallback.
+        _ext_psi = None
+        if args.geometry_autocal:
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+                from .ct_core.vff_io import detector_serial_from_scan
+                _serial = detector_serial_from_scan(scan_folder)
+                _tag = _Path(scan_folder).name
+                _cal = (_Path(__file__).resolve().parents[1] / "data"
+                        / "calibration" / f"detector_psi_{_serial}_{_tag}.json")
+                if _serial and _cal.exists():
+                    _rec = _json.loads(_cal.read_text())
+                    _ext_psi = float(_rec["psi_deg"])
+                    print(f"\nGeometry calibration from {_cal.name}: "
+                          f"psi = {_ext_psi:+.4f} deg (method "
+                          f"{_rec.get('method', 'conjugate')}, measured "
+                          f"{_rec.get('measured_on', '?')})")
+            except Exception as _e:
+                print(f"\nGeometry calibration JSON unavailable "
+                      f"({type(_e).__name__}: {_e}) — inline estimate will run")
         reconstructor = TIGREReconstructor(
+            detector_psi_deg=_ext_psi,
             projections=projections,
             angles=angles_np,
             geometry=geometry,

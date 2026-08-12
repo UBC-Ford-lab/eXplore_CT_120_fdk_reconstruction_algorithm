@@ -395,11 +395,17 @@ def main():
             if _serial and _cal.exists():
                 _rec = _json.loads(_cal.read_text())
                 geometry['det_psi_rad'] = np.radians(float(_rec["psi_deg"]))
-                geometry['central_pixel_a'] = float(_rec["cpa0"])
+                # psi ONLY. The fitted cpa0 intercept is estimator bias, not
+                # geometry: applying it split muNeRF run zsu85kc6's z=+23 mm
+                # tube into two overlapped half-discs, and the FBP tube test
+                # (2026-08-12) shows the column CoR round at the detector's
+                # geometric centre. central_pixel_a is left as built.
                 print(f"\n  Geometry auto-calibration from {_cal.name}:")
-                print(f"    psi = {float(_rec['psi_deg']):+.4f} deg, "
-                      f"central_pixel_a = {float(_rec['cpa0']):.3f} "
-                      f"(measured {_rec.get('measured_on', '?')})")
+                print(f"    psi = {float(_rec['psi_deg']):+.4f} deg  (method "
+                      f"{_rec.get('method', 'conjugate')}; fitted cpa0 "
+                      f"{float(_rec['cpa0']):.3f} NOT applied — CoR stays at "
+                      f"the geometric centre; measured "
+                      f"{_rec.get('measured_on', '?')})")
             else:
                 print(f"\n  Geometry auto-calibration: no cached measurement for "
                       f"this scan ({_cal.name}) — using psi=0 and the XML CoR. "
