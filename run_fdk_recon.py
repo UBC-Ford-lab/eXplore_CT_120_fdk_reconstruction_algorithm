@@ -77,8 +77,9 @@ Examples:
         type=float,
         default=None,
         help='Override center-of-rotation detector pixel (central_pixel_a). '
-             'Default: CentreOfRotation from scan.xml. Use to recalibrate COR '
-             '(e.g. when an off-isocenter object reconstructs non-round).'
+             'Default: detector geometric centre (see --cor-mode; the '
+             'scan.xml CentreOfRotation over-corrects once detector psi is '
+             'applied). Use for manual COR experiments.'
     )
     parser.add_argument(
         '--central-slice',
@@ -91,11 +92,12 @@ Examples:
         '--cor-offset-scale',
         type=float,
         default=1.0,
-        help='Apply the COR/central-slice detector offset in backprojection. '
-             '1.0 = apply verified-correct offset (default); 0.0 = off (legacy, '
-             'COR at detector centre); -1.0 = flipped sign (diagnostic). Corrects '
-             'non-round/mis-registered off-isocentre objects (projections are not '
-             'pre-centred).'
+        help='Scale on the COR/central-slice detector offset in '
+             'backprojection (default 1.0). With the default --cor-mode '
+             'center the offset is zero and this flag is inert; it only '
+             'matters with --cor-mode xml or an explicit --cor, where '
+             '1.0 applies the offset, 0.0 disables it, -1.0 flips the sign '
+             '(diagnostic).'
     )
     parser.add_argument(
         '--metal-artifact-reduction',

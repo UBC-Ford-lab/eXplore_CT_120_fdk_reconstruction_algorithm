@@ -181,6 +181,18 @@ def add_common_args(parser):
         help='Disable sinogram-domain beam hardening correction'
     )
     parser.add_argument(
+        '--cor-mode',
+        default='center',
+        choices=('center', 'xml'),
+        help='Detector centre-of-rotation policy (default: center). '
+             '"center" places the rotation axis at the detector geometric '
+             'centre — the validated configuration: with the detector-psi '
+             'calibration applied, adding the scan.xml CentreOfRotation '
+             'offset on top over-corrects (decisive split-tube experiment, '
+             '2026-08-13). "xml" restores the legacy scan.xml '
+             'CentreOfRotation/CentralSlice values.'
+    )
+    parser.add_argument(
         '--geometry-autocal',
         action='store_true',
         default=True,
@@ -307,6 +319,38 @@ def _parse_roi_bounds(args, scan_folder, xml_header):
     sys.exit(1)
 
 
+def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
+                     cor_mode: str = 'center', verbose: bool = True) -> dict:
+    """Detector centre-of-rotation policy, applied to every backend's
+    geometry.
+
+    DEFAULT ('center'): the rotation axis sits at the detector geometric
+    centre. The scan.xml CentreOfRotation/CentralSlice offset and the
+    detector-psi calibration are nearly degenerate at any single
+    off-midplane height, and applying BOTH over-corrects: the decisive
+    split-tube experiment (Scan_1510, 2026-08-13) showed psi alone matches
+    the vendor reconstruction at the midplane AND at z=+22 mm, while
+    psi + XML COR re-splits the off-midplane tube. The XML values stay
+    available under ``central_pixel_*_xml`` (and via cor_mode='xml').
+    """
+    geometry['central_pixel_a_xml'] = geometry['central_pixel_a']
+    geometry['central_pixel_b_xml'] = geometry['central_pixel_b']
+    if cor_mode == 'center':
+        geometry['central_pixel_a'] = (n_a - 1) / 2.0
+        geometry['central_pixel_b'] = (n_b - 1) / 2.0
+        if verbose:
+            print(f"\n  Centre of rotation: detector geometric centre "
+                  f"(a={geometry['central_pixel_a']:.1f}, "
+                  f"b={geometry['central_pixel_b']:.1f}); scan.xml values "
+                  f"(a={geometry['central_pixel_a_xml']:.1f}, "
+                  f"b={geometry['central_pixel_b_xml']:.1f}) NOT applied — "
+                  f"psi calibration covers the alignment (--cor-mode xml "
+                  f"restores the legacy behaviour).")
+    elif verbose:
+        print("\n  Centre of rotation: scan.xml values (--cor-mode xml).")
+    return geometry
+
+
 def prepare_scan(args) -> ScanContext:
     """Run the algorithm-independent front half of every reconstruction.
 
@@ -344,6 +388,9 @@ def prepare_scan(args) -> ScanContext:
         roi_bounds=roi_bounds,
     )
 
+    apply_cor_policy(geometry, projections.shape[1], projections.shape[2],
+                     cor_mode=getattr(args, 'cor_mode', 'center'))
+
     # Optional detector downsampling (average pooling), applied consistently:
     # detector pixel pitch scales UP by the factor, and the central-pixel
     # indices convert as raw -> pooled: c' = (c - (f-1)/2) / f (the pooled
@@ -360,7 +407,8 @@ def prepare_scan(args) -> ScanContext:
             dark_field = downsample_projections(dark_field, factor)
         geometry['da'] *= factor
         geometry['db'] *= factor
-        for key in ('central_pixel_a', 'central_pixel_b'):
+        for key in ('central_pixel_a', 'central_pixel_b',
+                    'central_pixel_a_xml', 'central_pixel_b_xml'):
             geometry[key] = (geometry[key] - (factor - 1) / 2.0) / factor
 
     return ScanContext(

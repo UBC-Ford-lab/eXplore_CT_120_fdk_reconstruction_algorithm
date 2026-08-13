@@ -94,6 +94,16 @@ Only `psi_deg` is ever applied — fitted `cpa0` intercepts are known estimator
 bias and are reported as a diagnostic. `--no-geometry-autocal` disables the
 whole feature (pre-2026-08-11 behaviour).
 
+**Centre of rotation: detector geometric centre (default).** The scan.xml
+`CentreOfRotation`/`CentralSlice` offset and the detector-psi rotation are
+nearly degenerate corrections — at any single off-midplane height they shift
+rays the same way — and applying BOTH over-corrects: a decisive experiment
+(Scan_1510 off-midplane tube, 2026-08-13; midplane + z=+22 mm crops vs the
+vendor reconstruction) showed psi alone matches the vendor while
+psi + XML COR re-splits the tube. All backends therefore place the rotation
+axis at the detector geometric centre; `--cor-mode xml` restores the legacy
+scan.xml values (kept in the geometry dict under `central_pixel_*_xml`).
+
 Standalone (pre-)calibration, e.g. on a cluster GPU node before submitting
 long jobs:
 
