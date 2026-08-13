@@ -102,17 +102,58 @@ python -m reconstruction.run_geometry_calibration data/scans/Scan_1510
 python -m reconstruction.run_geometry_calibration data/scans/Scan_1510 --force  # re-measure
 ```
 
+## Machine preflight (all backends)
+
+Every driver checks the machine BEFORE any large allocation: is a CUDA GPU
+present (ASTRA/TIGRE are CUDA-only and abort cleanly; FDK and the voxel
+trainer fall back to CPU with a loud warning), does the estimated peak VRAM
+fit in free GPU memory, and does the estimated host RAM fit in MemAvailable —
+using documented per-backend formulas (e.g. ASTRA needs its whole
+2x(volume+sinogram) workspace at once; TIGRE splits VRAM internally but keeps
+~4x the volume in host RAM). Verdicts: OK / TIGHT / INSUFFICIENT / NO-GPU.
+
+```bash
+# Dry run: "would this job fit here?" — prints the report and exits
+python -m reconstruction.run_iterative_recon data/scans/Scan_1510 \
+    --backend astra --preflight-only
+
+# Force past an INSUFFICIENT verdict (expect OOM)
+... --skip-preflight
+```
+
 ## Plots & experiment logging (all backends)
 
 Every reconstruction writes a set of PNGs next to the output volume
 (`<output>_plots/`): orthogonal central slices on physical mm axes, an HU
-histogram, a sinogram preview, and — for backends with a holdout
-(TIGRE crossval, the learned backend) — a convergence curve. `--no-plots`
-disables this.
+histogram, a sinogram preview, the projection diagnostics below, and — for
+backends with an eval loop (TIGRE, the learned backend) — a convergence
+curve. `--no-plots` disables this.
 
-The same figures (plus native live charts: training loss / LR / holdout
-metrics per step for the learned backend, per-eval SSIM/PSNR/MSE for TIGRE
-crossval) can be logged to **Weights & Biases**, strictly opt-in:
+**Projection diagnostics (all backends).** Every run evaluates its
+reconstruction against the measured *evaluation projection* (the central
+angle): `diag/ssim`, `diag/psnr`, `diag/mse`, a local-SSIM heatmap, and a
+projection power-spectrum figure. Iterative backends (TIGRE, voxel) emit
+them over the iterations from their own forward projections; single-shot
+backends (FDK, ASTRA) get them once, by forward-projecting the final volume
+through the canonical ray tracer. Alongside, the **noise ceiling** — the
+best SSIM/PSNR any reconstruction can honestly reach, and the σ²-equivalent
+MSE floor — is measured from a second independent measurement of the same
+line integrals: the other acquisition phase when the scan has one (e.g.
+acq-01 frames), else the neighbouring projection (conservative), and is
+printed, logged per-step for chart overlay, and drawn into the heatmap's
+ceiling panel and the power spectrum's noise floor. All projection
+diagnostics are restricted to the detector rows whose rays stay inside the
+reconstruction z-slab — outer rows integrate through matter the volume does
+not contain and would score FOV truncation, not the reconstruction.
+By default the evaluation projection **stays in** the reconstruction
+(diagnostic); pass `--withhold-eval` to remove it from the input and turn
+the diag metrics into true held-out validation. With `--wandb`, the
+finished volume is additionally logged as a scrollable axial-slice
+sequence (`recon_slices`).
+
+The same figures (plus native live charts: training loss / LR per step for
+the learned backend, per-eval diag metrics for TIGRE and voxel) can be
+logged to **Weights & Biases**, strictly opt-in:
 
 ```bash
 export WANDB_PROJECT=my-ct-project        # or pass --wandb-project

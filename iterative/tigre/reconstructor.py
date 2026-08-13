@@ -267,11 +267,13 @@ class TIGREReconstructor:
                  bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51,
                  crossval=True, holdout_index=None,
+                 withhold_eval=False,
                  eval_every=10, patience=3,
                  tv_lambda=0.0, tv_iters=50,
                  pwls=False,
                  checkpoint_dir=None, checkpoint_z_range=None,
-                 checkpoint_xy_range=None):
+                 checkpoint_xy_range=None,
+                 log_fn=None, diag_fn=None):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -310,13 +312,18 @@ class TIGREReconstructor:
             bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None
             ring_correction: Apply sinogram-space ring artifact correction
             ring_median_width: Median filter width for ring correction (odd int)
-            crossval: bool. If True (default), hold out one projection and
-                evaluate PSNR/SSIM/MSE every eval_every iterations. Reconstruction
-                stops early when SSIM stops improving (patience-based). The saved
-                volume is the one at peak SSIM, not the final iteration.
-            holdout_index: int or None. Index of the projection to hold out.
+            crossval: bool. If True (default), evaluate PSNR/SSIM/MSE against
+                the evaluation projection every eval_every iterations.
+                Reconstruction stops early when SSIM stops improving
+                (patience-based). The saved volume is the one at peak SSIM,
+                not the final iteration.
+            holdout_index: int or None. Index of the evaluation projection.
                 None (default) auto-selects the middle projection (N_angles // 2).
                 Ignored when crossval=False.
+            withhold_eval: bool. If True, the evaluation projection is REMOVED
+                from the reconstruction input (true held-out validation, the
+                pre-2026-08-13 behaviour). Default False: the projection is
+                reconstructed from and evaluated against (diagnostic).
             eval_every: int. Evaluate holdout metrics every this many iterations.
                 (default: 10)
             patience: int. Stop early if SSIM fails to improve for this many
@@ -430,8 +437,19 @@ class TIGREReconstructor:
         self.ring_correction = ring_correction
         self.ring_median_width = ring_median_width
 
-        # Cross-validation holdout
+        # Evaluation projection (crossval machinery)
         self.crossval = crossval
+        self.withhold_eval = withhold_eval
+        # Optional live-metric sink: Callable[[dict, int], None], called at
+        # every eval checkpoint. Keeps the backend wandb-free; the driver
+        # passes ReconLogger.log so W&B charts update DURING the run.
+        self.log_fn = log_fn
+        # Optional projection-diagnostics sink: Callable[(pred, target,
+        # step)], called with the FDK-convention prediction/measurement at
+        # every eval checkpoint. The driver passes a wrapper around
+        # ReconLogger.log_projection_diag (diag/* scalars + SSIM-heatmap and
+        # power-spectrum figures). Also wandb-free here.
+        self.diag_fn = diag_fn
         self.holdout_index = holdout_index
         self.eval_every = eval_every
         self.patience = patience
@@ -683,7 +701,8 @@ class TIGREReconstructor:
                   "no per-checkpoint loop to hook into, so no checkpoints will be "
                   "saved.")
 
-        # Holdout cross-validation: extract one projection before reconstruction.
+        # Evaluation projection: extracted before reconstruction; withheld
+        # from the input only when withhold_eval (true held-out validation).
         holdout_proj = None
         if self.crossval:
             if _ssim_fn is None:
@@ -695,12 +714,20 @@ class TIGREReconstructor:
             idx = self.holdout_index if self.holdout_index is not None else N_train // 2
             holdout_proj = sinogram[idx].copy()       # (N_b, N_a) TIGRE convention
             holdout_angle = tigre_angles[idx:idx + 1]
-            sinogram = np.delete(sinogram, idx, axis=0)
-            tigre_angles = np.delete(tigre_angles, idx, axis=0)
             holdout_deg = float(np.rad2deg(self.angles[idx]))
-            print(f"\nCross-validation: holding out projection {idx} "
-                  f"({holdout_deg:.1f}° FDK); eval every {self.eval_every} iters, "
-                  f"patience={self.patience} checkpoints.")
+            if self.withhold_eval:
+                sinogram = np.delete(sinogram, idx, axis=0)
+                tigre_angles = np.delete(tigre_angles, idx, axis=0)
+                print(f"\nCross-validation: WITHHOLDING projection {idx} "
+                      f"({holdout_deg:.1f}° FDK) from the reconstruction; "
+                      f"eval every {self.eval_every} iters, "
+                      f"patience={self.patience} checkpoints.")
+            else:
+                print(f"\nDiagnostics: evaluating against projection {idx} "
+                      f"({holdout_deg:.1f}° FDK), which STAYS in the "
+                      f"reconstruction (pass withhold_eval for true "
+                      f"validation); eval every {self.eval_every} iters, "
+                      f"patience={self.patience} checkpoints.")
 
         if self.algorithm == 'mlem':
             # MLEM's ratio update x_{k+1} = x_k * Atb(p/Ax_k) / Atb(1) implicitly
@@ -858,6 +885,22 @@ class TIGREReconstructor:
                 cv_ssim.append(ssim)
                 cv_psnr.append(psnr)
                 cv_mse.append(mse)
+                if self.diag_fn is not None:
+                    # Columns back to the FDK detector convention, rows cut
+                    # to the band covered by the reconstruction z-slab (the
+                    # same band the noise ceiling and the other backends'
+                    # diagnostics use — outer rows score FOV truncation, not
+                    # the reconstruction).
+                    from ...ct_core.projection_diag import covered_detector_rows
+                    b0, b1 = covered_detector_rows(self.geometry)
+                    b0, b1 = max(0, b0), min(pred.shape[0], b1)
+                    if b1 - b0 < 16:
+                        b0, b1 = 0, pred.shape[0]
+                    self.diag_fn(pred[b0:b1, ::-1],
+                                 holdout_proj[b0:b1, ::-1], i_done)
+                elif self.log_fn is not None:
+                    self.log_fn({"diag/ssim": ssim, "diag/psnr": psnr,
+                                 "diag/mse": mse}, i_done)
 
                 if ssim > best_ssim:
                     best_ssim = ssim

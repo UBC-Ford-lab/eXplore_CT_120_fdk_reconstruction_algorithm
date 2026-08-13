@@ -41,6 +41,12 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
+from .projection_diag import (
+    evaluate_projection,
+    power_spectrum_figure,
+    ssim_heatmap_figure,
+)
+
 
 # ---------------------------------------------------------------- CLI args --
 
@@ -76,10 +82,13 @@ def add_wandb_args(parser) -> None:
 HU_WINDOW = (-1000.0, 2000.0)
 
 
-def volume_triptych_figure(volume, geometry: dict,
-                           hu_window=HU_WINDOW) -> Figure:
-    """Central axial / coronal / sagittal slices of an (Nx, Ny, Nz) volume,
-    on physical mm axes centred at the reconstruction origin."""
+def midplane_views(volume, geometry: dict):
+    """The three central orthogonal slices of an (Nx, Ny, Nz) volume.
+
+    Returns [(name, slice_2d, xlabel, ylabel, extent_mm), ...] for
+    axial / coronal / sagittal — the single source both the triptych figure
+    and the per-view W&B images draw from.
+    """
     Nx, Ny, Nz = volume.shape
     dx = float(geometry.get("dx", 1.0))
     dz = float(geometry.get("dz", dx))
@@ -87,38 +96,72 @@ def volume_triptych_figure(volume, geometry: dict,
     ex = (ox - Nx * dx / 2, ox + Nx * dx / 2)
     ey = (oy - Ny * dx / 2, oy + Ny * dx / 2)
     ez = (oz - Nz * dz / 2, oz + Nz * dz / 2)
-    fig = Figure(figsize=(13, 4.5), dpi=110)
-    views = [
-        (volume[:, :, Nz // 2].T, "axial (z centre)", "x [mm]", "y [mm]", ex + ey),
-        (volume[:, Ny // 2, :].T, "coronal (y centre)", "x [mm]", "z [mm]", ex + ez),
-        (volume[Nx // 2, :, :].T, "sagittal (x centre)", "y [mm]", "z [mm]", ey + ez),
+    return [
+        ("axial", volume[:, :, Nz // 2].T, "x [mm]", "y [mm]", ex + ey),
+        ("coronal", volume[:, Ny // 2, :].T, "x [mm]", "z [mm]", ex + ez),
+        ("sagittal", volume[Nx // 2, :, :].T, "y [mm]", "z [mm]", ey + ez),
     ]
-    for k, (sl, title, xl, yl, extent) in enumerate(views):
-        ax = fig.add_subplot(1, 3, k + 1)
-        im = ax.imshow(sl, cmap="gray", origin="lower", extent=extent,
-                       vmin=hu_window[0], vmax=hu_window[1])
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel(xl, fontsize=8)
-        ax.set_ylabel(yl, fontsize=8)
-        ax.tick_params(labelsize=7)
-        fig.colorbar(im, ax=ax, fraction=0.046, label="HU" if k == 2 else None)
+
+
+def single_view_figure(name, sl, xl, yl, extent, hu_window=HU_WINDOW) -> Figure:
+    """One midplane view as its own figure (per-view W&B panels).
+
+    No colorbar — the window is fixed ([-1000, 2000] HU) and stated in the
+    title, so the bar only cost image area.
+    """
+    fig = Figure(figsize=(6, 5.5), dpi=110)
+    ax = fig.add_subplot(111)
+    ax.imshow(sl, cmap="gray", origin="lower", extent=extent,
+              vmin=hu_window[0], vmax=hu_window[1])
+    ax.set_title(f"{name} (midplane, {hu_window[0]:.0f}..{hu_window[1]:.0f} HU)",
+                 fontsize=10)
+    ax.set_xlabel(xl, fontsize=8)
+    ax.set_ylabel(yl, fontsize=8)
+    ax.tick_params(labelsize=7)
     fig.tight_layout()
     return fig
 
 
 def hu_histogram_figure(volume) -> Figure:
-    """Log-count HU histogram with tissue landmarks."""
-    fig = Figure(figsize=(6.5, 4), dpi=110)
-    ax = fig.add_subplot(111)
-    ax.hist(np.asarray(volume).ravel(), bins=256, range=(-1100, 3100),
-            log=True, color="steelblue")
+    """Linear-count HU histogram with tissue landmarks.
+
+    Two panels, both linear-y — one linear axis cannot span the air spike
+    (~1e8), the tissue peak (~1e6) and the bone tail (~1e3) at once:
+
+      * left: full range, y scaled to the NON-AIR maximum (tallest bin above
+        -900 HU, x1.3 headroom); the air spike runs off the top with its true
+        height annotated.
+      * right: bone-tail zoom (>= +300 HU) on its own y-scale.
+    """
+    counts, edges = np.histogram(np.asarray(volume).ravel(), bins=256,
+                                 range=(-1100, 3100))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    fig = Figure(figsize=(10.5, 4), dpi=110)
+
+    ax = fig.add_subplot(1, 2, 1)
+    ax.stairs(counts, edges, fill=True, color="steelblue")
+    non_air = counts[centers > -900.0]
+    if non_air.size and non_air.max() > 0:
+        y_top = 1.3 * float(non_air.max())
+        if counts.max() > y_top:
+            ax.set_ylim(0, y_top)
     for hu, label in ((-1000, "air"), (0, "water"), (1500, "bone")):
         ax.axvline(hu, color="crimson", lw=0.8, ls="--")
-        ax.text(hu, ax.get_ylim()[1] * 0.5, f" {label}", fontsize=7,
+        ax.text(hu, ax.get_ylim()[1] * 0.95, f" {label}", fontsize=7,
                 color="crimson", rotation=90, va="top")
     ax.set_xlabel("HU")
-    ax.set_ylabel("voxel count (log)")
+    ax.set_ylabel("voxel count")
     ax.set_title("HU distribution")
+
+    axb = fig.add_subplot(1, 2, 2)
+    i0 = int(np.argmax(centers >= 300.0))
+    axb.stairs(counts[i0:], edges[i0:], fill=True, color="steelblue")
+    axb.axvline(1500, color="crimson", lw=0.8, ls="--")
+    axb.text(1500, axb.get_ylim()[1] * 0.95, " bone", fontsize=7,
+             color="crimson", rotation=90, va="top")
+    axb.set_xlabel("HU")
+    axb.set_title("bone tail (zoom, >= 300 HU)")
+
     fig.tight_layout()
     return fig
 
@@ -219,6 +262,12 @@ class ReconLogger:
         self.plot_dir = self.plot_dir.parent / (self.plot_dir.name + "_plots")
         self.run = None
         self._t0 = time.time()
+        # Projection-diagnostics state (see log_projection_diag).
+        self.noise_ceiling = None
+        self._da = float(ctx.geometry.get("da", 1.0)) if ctx is not None else 1.0
+        self._n_a = (int(ctx.projections.shape[2])
+                     if getattr(ctx, "projections", None) is not None else 0)
+        self._max_step = 0
 
         if not getattr(args, "wandb", False):
             return
@@ -260,6 +309,8 @@ class ReconLogger:
 
     def log(self, metrics: dict, step: int | None = None) -> None:
         """Native per-step scalars (live charts). No-op without W&B."""
+        if step is not None:
+            self._max_step = max(self._max_step, int(step))
         if self.run is None:
             return
         try:
@@ -267,8 +318,12 @@ class ReconLogger:
         except Exception as e:
             print(f"W&B log failed ({type(e).__name__}: {e})")
 
-    def _emit(self, name: str, fig: Figure) -> None:
-        """Save a figure locally and (if enabled) upload it."""
+    def _emit(self, name: str, fig: Figure, step: int | None = None) -> None:
+        """Save a figure locally and (if enabled) upload it.
+
+        With ``step`` the W&B image joins a per-step sequence (slider in the
+        UI); the local PNG is overwritten so it always holds the latest.
+        """
         path = None
         if self.plots_enabled:
             self.plot_dir.mkdir(parents=True, exist_ok=True)
@@ -278,8 +333,11 @@ class ReconLogger:
         if self.run is not None:
             try:
                 import wandb
-                self.run.log({f"plots/{name}":
-                              wandb.Image(str(path) if path else fig)})
+                image = wandb.Image(str(path) if path else fig)
+                if step is not None:
+                    self.log({f"plots/{name}": image}, step=step)
+                else:
+                    self.run.log({f"plots/{name}": image})
             except Exception as e:
                 print(f"W&B image log failed ({type(e).__name__}: {e})")
 
@@ -329,10 +387,13 @@ class ReconLogger:
                           if j < len(series[n][1])}, step=int(it))
 
     def log_volume_summary(self, volume_hu, ctx) -> None:
-        """Slice triptych + HU histogram + summary scalars for any backend."""
+        """Three individual midplane views + HU histogram + summary scalars
+        for any backend."""
         vol = np.asarray(volume_hu)
         if self.plots_enabled or self.run is not None:
-            self._emit("slices", volume_triptych_figure(vol, ctx.geometry))
+            for name, sl, xl, yl, extent in midplane_views(vol, ctx.geometry):
+                self._emit(f"view_{name}",
+                           single_view_figure(name, sl, xl, yl, extent))
             self._emit("hu_histogram", hu_histogram_figure(vol))
         if self.run is not None:
             p = np.percentile(vol, (1, 50, 99, 99.9))
@@ -342,6 +403,143 @@ class ReconLogger:
                 "volume/shape": list(vol.shape),
                 "elapsed_min": (time.time() - self._t0) / 60.0,
             })
+
+    # -- projection diagnostics (diag/*) --------------------------------
+
+    def set_noise_ceiling(self, ceiling: dict | None) -> None:
+        """Attach the measured noise ceiling (projection_diag.
+        measure_noise_ceiling). Its ssim/psnr/mse constants are logged
+        alongside every diag step so they overlay as reference lines, and its
+        frame pair feeds the ceiling panels of the diagnostic figures."""
+        self.noise_ceiling = ceiling
+        if self.run is not None and ceiling is not None:
+            try:
+                self.run.summary.update({
+                    "diag/noise_ceil_ssim": ceiling["ssim"],
+                    "diag/noise_ceil_psnr": ceiling["psnr"],
+                    "diag/noise_ceil_mse": ceiling["mse"],
+                    "diag/noise_ceil_source": ceiling["source"],
+                })
+            except Exception as e:
+                print(f"W&B noise-ceiling log failed ({type(e).__name__}: {e})")
+
+    def log_projection_diag(self, pred, target, step: int | None = None,
+                            figures: bool = True, scalars: bool = True,
+                            verbose: bool = True) -> dict:
+        """The per-projection diagnostic bundle every backend shares:
+        diag/ssim, diag/psnr, diag/mse scalars (+ the noise-ceiling
+        constants), and — when ``figures`` — the local-SSIM heatmap and the
+        power-spectrum figure (both without any FDK baseline).
+
+        Backends call this through the driver-provided ``diag_fn`` with
+        their evaluation-projection prediction; drivers call it once more
+        (or for the first time, for single-shot backends like FDK/ASTRA)
+        with the final volume's forward projection. Returns the metrics.
+        """
+        pred = np.asarray(pred, dtype=np.float32)
+        target = np.asarray(target, dtype=np.float32)
+        m = evaluate_projection(pred, target)
+        if verbose:
+            tag = f"@{step}" if step is not None else "(final)"
+            ceil = (f"  [ceiling ssim={self.noise_ceiling['ssim']:.4f}]"
+                    if self.noise_ceiling else "")
+            print(f"  diag{tag}  ssim={m['ssim']:.4f}  "
+                  f"psnr={m['psnr']:6.2f} dB  mse={m['mse']:.6e}{ceil}")
+        values = {"diag/ssim": m["ssim"], "diag/psnr": m["psnr"],
+                  "diag/mse": m["mse"]}
+        if self.noise_ceiling is not None:
+            values.update({
+                "diag/noise_ceil_ssim": self.noise_ceiling["ssim"],
+                "diag/noise_ceil_psnr": self.noise_ceiling["psnr"],
+                "diag/noise_ceil_mse": self.noise_ceiling["mse"],
+            })
+        if scalars:
+            if step is not None:
+                self.log(values, step=step)
+            elif self.run is not None:
+                try:
+                    self.run.summary.update(values)
+                except Exception as e:
+                    print(f"W&B diag summary failed ({type(e).__name__}: {e})")
+
+        if figures and (self.plots_enabled or self.run is not None):
+            try:
+                pair = (self.noise_ceiling or {}).get("pair")
+                suffix = f" (iter {step})" if step is not None else " (final)"
+                self._emit("diag_ssim_heatmap",
+                           ssim_heatmap_figure(pred, target, noise_pair=pair,
+                                               title=suffix), step=step)
+                # Detector pixel pitch of THIS prediction: the geometry's
+                # pitch times whatever stride the caller rendered at.
+                factor = (max(1, int(round(self._n_a / pred.shape[1])))
+                          if self._n_a else 1)
+                self._emit("diag_power_spectrum",
+                           power_spectrum_figure(pred, target,
+                                                 det_px_mm=self._da * factor,
+                                                 noise_pair=pair,
+                                                 title=suffix),
+                           step=step)
+            except Exception as e:  # diagnostics must never kill a recon
+                print(f"  diag figures failed ({type(e).__name__}: {e})")
+        return m
+
+    def log_recon_slices(self, volume_hu, hu_window=HU_WINDOW,
+                         max_slices: int = 240) -> None:
+        """The finished volume as a scrollable axial-slice sequence (W&B
+        only — hundreds of local PNGs would just be clutter). Slices log at
+        steps beyond the last training step so they never collide."""
+        if self.run is None:
+            return
+        try:
+            import wandb
+            vol = np.asarray(volume_hu)
+            Nz = vol.shape[2]
+            stride = max(1, int(np.ceil(Nz / max_slices)))
+            lo, hi = hu_window
+            # W&B's internal step also advances on every un-stepped log call
+            # (each figure upload), so start beyond BOTH counters — otherwise
+            # the first slices land on already-passed steps and are dropped.
+            wb_step = int(getattr(self.run, "step", 0) or 0)
+            base = max(self._max_step, wb_step) + 1
+            n_logged = 0
+            for k in range(0, Nz, stride):
+                sl = np.clip((vol[:, :, k].T - lo) / (hi - lo), 0.0, 1.0)
+                img = (sl * 255.0).astype(np.uint8)[::-1]  # origin-lower
+                self.run.log(
+                    {"recon_slices": wandb.Image(
+                        img, caption=f"z-slice {k}/{Nz}")},
+                    step=base + k)
+                n_logged += 1
+            print(f"  W&B: logged {n_logged} axial slices (recon_slices"
+                  f"{f', stride {stride}' if stride > 1 else ''})")
+        except Exception as e:
+            print(f"W&B recon_slices failed ({type(e).__name__}: {e})")
+
+    def log_preflight(self, report) -> None:
+        """Record the machine-fit report on the run (config + summary)."""
+        if self.run is None:
+            return
+        try:
+            self.run.config.update({
+                "preflight/verdict": report.verdict,
+                "preflight/gpu": report.gpu_name or "none",
+                "preflight/vram_needed_gib": report.vram_needed / 2**30,
+                "preflight/vram_free_gib": (report.vram_free or 0) / 2**30,
+                "preflight/ram_needed_gib": report.ram_needed / 2**30,
+            }, allow_val_change=True)
+            self.run.summary["preflight/verdict"] = report.verdict
+        except Exception as e:
+            print(f"W&B preflight log failed ({type(e).__name__}: {e})")
+
+    def abort(self, reason: str) -> None:
+        """Mark the W&B run FAILED and close it (fatal preflight, etc.)."""
+        if self.run is not None:
+            try:
+                self.run.summary["abort_reason"] = reason
+                self.run.finish(exit_code=1)
+            except Exception as e:
+                print(f"W&B abort failed ({type(e).__name__}: {e})")
+            self.run = None
 
     def finish(self) -> None:
         if self.run is not None:

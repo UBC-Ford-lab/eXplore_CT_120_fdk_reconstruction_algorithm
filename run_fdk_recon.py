@@ -27,12 +27,19 @@ import numpy as np
 import torch
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
+from .ct_core.calibration import default_mu_water
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
     prepare_scan,
     resolve_or_measure_detector_psi,
+    run_preflight,
     save_outputs,
+)
+from .ct_core.projection_diag import (
+    measure_noise_ceiling,
+    preprocess_frames,
+    render_projection_from_volume,
 )
 
 
@@ -159,6 +166,24 @@ def main():
     ctx = prepare_scan(args)
     geometry = ctx.geometry
 
+    output_path = args.output if args.output else ctx.default_output_path('_recon')
+    print(f"\nOutput path: {output_path}")
+
+    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    # Created BEFORE preflight so an auto-aborted job is recorded (FAILED
+    # run with the verdict) rather than leaving no trace.
+    logger = ReconLogger(args, ctx, 'fdk', output_path, params={
+        'filter_cutoff': args.filter_cutoff,
+        'filter_type': args.filter_type,
+        'parker_weighting': bool(args.parker_weighting),
+        'bone_bhc': bool(args.bone_bhc),
+        'withhold_eval': bool(args.withhold_eval),
+    })
+
+    # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
+    run_preflight('fdk', ctx, gpu_index=0, logger=logger,
+                  skip=args.skip_preflight, only=args.preflight_only)
+
     # Optional center-of-rotation / central-slice overrides (COR recalibration)
     if args.cor is not None:
         print(f"  COR override: central_pixel_a "
@@ -185,9 +210,11 @@ def main():
 
     # Resolve filter cutoff (may depend on geometry)
     if args.filter_cutoff.lower() == 'match':
-        filter_cutoff = geometry['da'] / geometry['dx']
+        # da/dx capped at Nyquist: with --downsample the (pooled) detector
+        # pixel can exceed the recon voxel, and a cutoff > 1 is meaningless.
+        filter_cutoff = min(1.0, geometry['da'] / geometry['dx'])
         print(f"\n  Filter cutoff 'match': da/dx = {geometry['da']:.4f}/"
-              f"{geometry['dx']:.4f} = {filter_cutoff:.4f}")
+              f"{geometry['dx']:.4f} -> {filter_cutoff:.4f}")
     else:
         filter_cutoff = float(args.filter_cutoff)
     if not 0.0 < filter_cutoff <= 1.0:
@@ -195,18 +222,31 @@ def main():
         sys.exit(1)
     print(f"  Filter type: {args.filter_type}")
 
-    output_path = args.output if args.output else ctx.default_output_path('_recon')
-    print(f"\nOutput path: {output_path}")
-
     if args.bhc_coeffs is not None:
         print(f"\n  BHC coefficients: {args.bhc_coeffs}")
     else:
         print(f"\n  BHC: disabled (--no-bhc)")
 
+    # ---- projection diagnostics: eval angle + noise ceiling ----------------
+    # FDK is single-shot, so the diag/* metrics and figures are computed once
+    # on the final volume; the ceiling (other acquisition phase if available,
+    # else the neighbouring projection) is measured up front so it lands in
+    # the logs even if the reconstruction later fails.
+    eval_idx = int(ctx.projections.shape[0]) // 2
+    logger.set_noise_ceiling(measure_noise_ceiling(
+        ctx, eval_idx, phase=args.phase, bhc_coeffs=args.bhc_coeffs))
+
+    fdk_proj, fdk_angles = ctx.projections, ctx.angles
+    if args.withhold_eval:
+        print(f"  Withholding evaluation projection {eval_idx} from the "
+              f"reconstruction input (--withhold-eval).")
+        fdk_proj = np.delete(ctx.projections, eval_idx, axis=0)
+        fdk_angles = np.delete(ctx.angles, eval_idx, axis=0)
+
     # Initialize reconstructor with verified settings
     reconstructor = FDKReconstructor(
-        projections=ctx.projections,
-        angles=torch.as_tensor(ctx.angles),
+        projections=fdk_proj,
+        angles=torch.as_tensor(fdk_angles),
         geometry=geometry,
         source_locations=None,
         folder_name=output_path,
@@ -233,21 +273,29 @@ def main():
         bone_bhc_hu=args.bone_bhc_hu,
     )
 
-    # Experiment logging: local PNGs next to the output, W&B when --wandb.
-    logger = ReconLogger(args, ctx, 'fdk', output_path, params={
-        'filter_cutoff': filter_cutoff,
-        'filter_type': args.filter_type,
-        'parker_weighting': bool(args.parker_weighting),
-        'bone_bhc': bool(args.bone_bhc),
-    })
-
     reconstructor.reconstruct(display_volume=args.display)
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
 
+    # Projection diagnostics on the final volume: forward-project at the
+    # evaluation angle through the canonical ray tracer -> diag/ssim, psnr,
+    # mse + SSIM-heatmap and power-spectrum figures. Best-effort.
+    try:
+        measured = preprocess_frames(
+            ctx.projections[eval_idx:eval_idx + 1], ctx,
+            bhc_coeffs=args.bhc_coeffs)[0]
+        pred, target = render_projection_from_volume(
+            reconstructor.reconstructed_volume, ctx, eval_idx, measured,
+            mu_water=default_mu_water(None, args.bhc_coeffs))
+        logger.log_projection_diag(pred, target)
+    except Exception as e:
+        print(f"  Final projection diagnostics failed "
+              f"({type(e).__name__}: {e})")
+
     logger.log_sinogram_preview(ctx.projections)
     logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
+    logger.log_recon_slices(reconstructor.reconstructed_volume)
     logger.finish()
 
     end = time.time()

@@ -49,6 +49,7 @@ from .scan_setup import (
 from .preprocessing import downsample_projections
 from .vff_io import detector_serial_from_scan
 from .wandb_logging import ReconLogger, add_wandb_args  # noqa: F401 (ReconLogger re-exported for drivers)
+from .preflight import add_preflight_args, run_preflight  # noqa: F401 (run_preflight re-exported for drivers)
 
 
 # --------------------------------------------------------------------------
@@ -233,8 +234,21 @@ def add_common_args(parser):
              '(not recommended for mouse scans)'
     )
 
+    parser.add_argument(
+        '--withhold-eval',
+        action='store_true',
+        default=False,
+        help='Withhold the evaluation projection (the central angle, the '
+             'same one every diagnostic uses) from the reconstruction, '
+             'turning the diag/* metrics into true held-out validation. '
+             'Default: off — the projection is reconstructed from AND '
+             'evaluated against (diagnostic, not validation).'
+    )
+
     # Experiment logging (local PNG plots + optional Weights & Biases)
     add_wandb_args(parser)
+    # Machine preflight (GPU/VRAM/RAM fit check before any big allocation)
+    add_preflight_args(parser)
     return parser
 
 

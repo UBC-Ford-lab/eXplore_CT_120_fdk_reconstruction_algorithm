@@ -33,8 +33,10 @@ from .ct_core.pipeline import (
     add_common_args,
     prepare_scan,
     resolve_or_measure_detector_psi,
+    run_preflight,
     save_outputs,
 )
+from .ct_core.projection_diag import measure_noise_ceiling
 
 SUPPORTED_LEARNED_ALGORITHMS = ("voxel",)
 
@@ -128,6 +130,33 @@ def main():
             f'_recon_{args.algorithm}_{args.iterations}it')
     print(f"\nOutput path: {output_path}")
 
+    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    # Created BEFORE preflight (an auto-aborted job is recorded as a FAILED
+    # run with the verdict); the trainer then logs LIVE (loss/lr/holdout-MSE
+    # per step) through the log_fn callback.
+    logger = ReconLogger(args, ctx, args.algorithm, output_path, params={
+        'iterations': args.iterations,
+        'rays_per_batch': args.rays_per_batch,
+        'lr': args.lr,
+        'lr_warmup_iters': args.lr_warmup_iters,
+        'samples_per_ray': args.samples_per_ray,
+        'init_density': args.init_density,
+        'seed': args.seed,
+        'detector_warp': args.detector_warp,
+        'crossval': not args.no_crossval,
+        'withhold_eval': bool(args.withhold_eval),
+    })
+
+    # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
+    # The voxel grid's VRAM need is dominated by 4x parameters (Adam), plus
+    # the per-batch ray buffers — mirror the trainer's auto-spp rule here.
+    _spp = args.samples_per_ray or int(np.ceil(
+        min(int(ctx.geometry['vol_shape'][0]), int(ctx.geometry['vol_shape'][1]))
+        / 0.55))
+    run_preflight('voxel', ctx, gpu_index=args.gpu_index, logger=logger,
+                  rays_per_batch=args.rays_per_batch, samples_per_ray=_spp,
+                  skip=args.skip_preflight, only=args.preflight_only)
+
     # ---- geometry auto-calibration (detector in-plane rotation psi) --------
     # Cached scan-keyed JSON first; on a miss the half-scan-consistency
     # estimator measures psi from this scan's projections. rays_from_indices
@@ -152,20 +181,14 @@ def main():
             ctx.geometry['detector_warp'] = warp
             ctx.geometry['sinogram_downsample'] = ds
 
-    # Experiment logging: local PNGs next to the output, W&B when --wandb.
-    # The voxel trainer logs LIVE (loss/lr/holdout-MSE per step) through the
-    # log_fn callback, so W&B shows training charts while the run is going.
-    logger = ReconLogger(args, ctx, args.algorithm, output_path, params={
-        'iterations': args.iterations,
-        'rays_per_batch': args.rays_per_batch,
-        'lr': args.lr,
-        'lr_warmup_iters': args.lr_warmup_iters,
-        'samples_per_ray': args.samples_per_ray,
-        'init_density': args.init_density,
-        'seed': args.seed,
-        'detector_warp': args.detector_warp,
-        'crossval': not args.no_crossval,
-    })
+    # ---- projection diagnostics: noise ceiling at the eval angle -----------
+    # Other acquisition phase when the scan has one, else the neighbouring
+    # projection. The trainer streams diag/ssim|psnr|mse against this ceiling
+    # at every eval checkpoint via diag_fn.
+    eval_idx = (args.holdout_index if args.holdout_index is not None
+                else int(ctx.projections.shape[0]) // 2)
+    logger.set_noise_ceiling(measure_noise_ceiling(
+        ctx, eval_idx, phase=args.phase, bhc_coeffs=args.bhc_coeffs))
 
     reconstructor = VoxelReconstructor(
         projections=ctx.projections,
@@ -187,9 +210,13 @@ def main():
         ring_median_width=args.ring_median_width,
         crossval=not args.no_crossval,
         holdout_index=args.holdout_index,
+        withhold_eval=args.withhold_eval,
         eval_every=args.eval_every,
         patience=args.patience,
         log_fn=logger.log,
+        # diag/* scalars every eval + SSIM-heatmap / power-spectrum figures
+        # on a coarser cadence (figure_every_evals), all through the logger.
+        diag_fn=logger.log_projection_diag,
     )
 
     reconstructor.reconstruct()
@@ -197,10 +224,11 @@ def main():
     # Shared back half: HU calibration + bilateral filter + VFF export.
     save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
 
-    # replay_steps=False: the trainer already streamed these live via log_fn.
+    # replay_steps=False: the trainer already streamed these live via diag_fn.
     logger.log_convergence(reconstructor.crossval_history, replay_steps=False)
     logger.log_sinogram_preview(ctx.projections)
     logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
+    logger.log_recon_slices(reconstructor.reconstructed_volume)
     logger.finish()
 
     end = time.time()

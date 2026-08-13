@@ -25,12 +25,19 @@ import numpy as np
 
 from .iterative.astra import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
 from .iterative.tigre import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
+from .ct_core.calibration import default_mu_water
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
     prepare_scan,
     resolve_or_measure_detector_psi,
+    run_preflight,
     save_outputs,
+)
+from .ct_core.projection_diag import (
+    measure_noise_ceiling,
+    preprocess_frames,
+    render_projection_from_volume,
 )
 
 
@@ -302,6 +309,27 @@ def main():
 
     print(f"\nOutput path: {output_path}")
 
+    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    # Created BEFORE preflight (an auto-aborted job is recorded as a FAILED
+    # run with the verdict) and before the reconstructor (TIGRE streams its
+    # crossval metrics live through log_fn while iterating).
+    logger = ReconLogger(args, ctx, f'{args.backend}_{args.algorithm}',
+                         output_path, params={
+                             'iterations': args.iterations,
+                             'blocksize': args.blocksize,
+                             'lmbda': args.lmbda,
+                             'lmbda_red': args.lmbda_red,
+                             'tv_lambda': args.tv_lambda,
+                             'pwls': bool(args.pwls),
+                             'withhold_eval': bool(args.withhold_eval),
+                         })
+
+    # Machine fit check (GPU presence / VRAM / RAM) before any big allocation
+    # — and before psi auto-measurement, which itself needs GPU minutes on a
+    # cache miss. ASTRA/TIGRE are CUDA-only: no GPU is a hard abort here.
+    run_preflight(args.backend, ctx, gpu_index=args.gpu_index, logger=logger,
+                  skip=args.skip_preflight, only=args.preflight_only)
+
     # ---- geometry auto-calibration (detector in-plane rotation psi) --------
     # Cached scan-keyed JSON first (written by any pipeline — muNeRF, FDK, or
     # this driver); on a miss, the half-scan-consistency estimator
@@ -317,17 +345,35 @@ def main():
         if record is not None:
             ext_psi = float(record['psi_deg'])
 
+    # ---- projection diagnostics: eval angle + noise ceiling ----------------
+    # The evaluation projection is the central angle (the same one every
+    # holdout scheme here has always used). The noise ceiling — the best
+    # SSIM/PSNR any reconstruction can honestly reach against the noisy
+    # measurement — comes from the other acquisition phase when the scan has
+    # one, else the neighbouring projection.
+    eval_idx = (args.holdout_index if args.holdout_index is not None
+                else int(ctx.projections.shape[0]) // 2)
+    logger.set_noise_ceiling(measure_noise_ceiling(
+        ctx, eval_idx, phase=args.phase, bhc_coeffs=args.bhc_coeffs))
+
     # Initialize reconstructor based on backend
     if args.backend == 'astra':
         if not args.no_crossval:
-            print("WARNING: cross-validation is only supported with --backend tigre. "
-                  "Running ASTRA without holdout eval.")
+            print("NOTE: ASTRA runs all iterations inside one opaque toolbox "
+                  "call — projection diagnostics are computed once, on the "
+                  "final volume.")
         if ext_psi is not None:
             # applied inside geometry_to_astra_vectors (rotated u/v axes)
             ctx.geometry['det_psi_rad'] = float(np.radians(ext_psi))
+        astra_proj, astra_angles = ctx.projections, ctx.angles
+        if args.withhold_eval:
+            print(f"  Withholding evaluation projection {eval_idx} from the "
+                  f"reconstruction input (--withhold-eval).")
+            astra_proj = np.delete(ctx.projections, eval_idx, axis=0)
+            astra_angles = np.delete(ctx.angles, eval_idx, axis=0)
         reconstructor = ASTRAReconstructor(
-            projections=ctx.projections,
-            angles=ctx.angles,
+            projections=astra_proj,
+            angles=astra_angles,
             geometry=ctx.geometry,
             algorithm=args.algorithm,
             iterations=args.iterations,
@@ -363,6 +409,7 @@ def main():
             geometry_autocal=args.geometry_autocal,
             crossval=not args.no_crossval,
             holdout_index=args.holdout_index,
+            withhold_eval=args.withhold_eval,
             eval_every=args.eval_every,
             patience=args.patience,
             tv_lambda=args.tv_lambda,
@@ -373,18 +420,11 @@ def main():
                                  if args.checkpoint_z_range else None),
             checkpoint_xy_range=(tuple(args.checkpoint_xy_range)
                                   if args.checkpoint_xy_range else None),
+            log_fn=logger.log,
+            # diag/* scalars + SSIM-heatmap / power-spectrum figures at every
+            # eval checkpoint, straight from TIGRE's own forward projection.
+            diag_fn=logger.log_projection_diag,
         )
-
-    # Experiment logging: local PNGs next to the output, W&B when --wandb.
-    logger = ReconLogger(args, ctx, f'{args.backend}_{args.algorithm}',
-                         output_path, params={
-                             'iterations': args.iterations,
-                             'blocksize': args.blocksize,
-                             'lmbda': args.lmbda,
-                             'lmbda_red': args.lmbda_red,
-                             'tv_lambda': args.tv_lambda,
-                             'pwls': bool(args.pwls),
-                         })
 
     # Run reconstruction
     reconstructor.reconstruct()
@@ -397,9 +437,29 @@ def main():
     save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
 
     if getattr(reconstructor, 'crossval_metrics', None):
-        logger.log_convergence(reconstructor.crossval_metrics)
+        # replay_steps=False: TIGRE already streamed these live via diag_fn;
+        # this call only produces the local/uploaded convergence figure.
+        logger.log_convergence(reconstructor.crossval_metrics,
+                               replay_steps=False)
+    else:
+        # No per-iteration eval loop (ASTRA, or TIGRE with --no-crossval):
+        # compute the projection diagnostics once, by forward-projecting the
+        # FINAL volume at the evaluation angle through the canonical ray
+        # tracer. Best-effort — a diagnostics failure never voids the recon.
+        try:
+            measured = preprocess_frames(
+                ctx.projections[eval_idx:eval_idx + 1], ctx,
+                bhc_coeffs=args.bhc_coeffs)[0]
+            pred, target = render_projection_from_volume(
+                reconstructor.reconstructed_volume, ctx, eval_idx, measured,
+                mu_water=default_mu_water(None, args.bhc_coeffs))
+            logger.log_projection_diag(pred, target)
+        except Exception as e:
+            print(f"  Final projection diagnostics failed "
+                  f"({type(e).__name__}: {e})")
     logger.log_sinogram_preview(ctx.projections)
     logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
+    logger.log_recon_slices(reconstructor.reconstructed_volume)
     logger.finish()
 
     end = time.time()

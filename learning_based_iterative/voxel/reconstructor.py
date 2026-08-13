@@ -64,11 +64,13 @@ class VoxelReconstructor:
                  ring_median_width: int = 51,
                  crossval: bool = True,
                  holdout_index: int | None = None,
+                 withhold_eval: bool = False,
                  eval_every: int = 250,
                  patience: int = 8,
-                 holdout_rays: int = 65536,
+                 diag_downsample: int = 2,
+                 figure_every_evals: int = 4,
                  log_every: int = 500,
-                 log_fn=None):
+                 log_fn=None, diag_fn=None):
         self.projections = projections
         self.angles = np.asarray(angles)
         self.geometry = dict(geometry)
@@ -89,14 +91,26 @@ class VoxelReconstructor:
         self.ring_median_width = int(ring_median_width)
         self.crossval = bool(crossval)
         self.holdout_index = holdout_index
+        # Default False: the evaluation projection stays IN the training set
+        # (diagnostic). True = the pre-2026-08-13 held-out behaviour.
+        self.withhold_eval = bool(withhold_eval)
         self.eval_every = int(eval_every)
         self.patience = int(patience)
-        self.holdout_rays = int(holdout_rays)
+        # Evaluation renders the FULL eval projection at this detector
+        # stride (SSIM needs a coherent 2-D image, not random rays).
+        self.diag_downsample = max(1, int(diag_downsample))
+        # Diagnostic figures (SSIM heatmap + power spectrum) are emitted on
+        # every Nth eval — scalars stream at every eval regardless.
+        self.figure_every_evals = max(1, int(figure_every_evals))
         self.log_every = int(log_every)
         # Optional live-metric sink: Callable[[dict, int], None] — called as
         # log_fn(metrics, step). Keeps the backend free of any wandb import;
         # the driver passes ReconLogger.log.
         self.log_fn = log_fn
+        # Optional projection-diagnostics sink: Callable[(pred, target, step),
+        # figures=bool] — the driver passes a wrapper around
+        # ReconLogger.log_projection_diag. Also wandb-free here.
+        self.diag_fn = diag_fn
 
         self.reconstructed_volume = None
         self.crossval_history: list[dict] = []
@@ -157,20 +171,49 @@ class VoxelReconstructor:
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
         gen = torch.Generator(device=device).manual_seed(self.seed)
 
-        # ---- held-out projection (never sampled for training) --------------
+        # ---- evaluation projection -----------------------------------------
+        # Rendered as a coherent 2-D image (strided full detector grid, not
+        # random rays) so SSIM/PSNR and the diagnostic figures are defined.
+        # Withheld from training only when withhold_eval.
         holdout = None
         if self.crossval and scene.n_angles > 1:
             holdout = (int(self.holdout_index) if self.holdout_index is not None
                        else scene.n_angles // 2)
             n_b, n_a = scene.detector_shape
-            hg = torch.Generator(device=device).manual_seed(self.seed + 1)
-            hb = torch.randint(n_b, (self.holdout_rays,), generator=hg, device=device)
-            ha = torch.randint(n_a, (self.holdout_rays,), generator=hg, device=device)
+            ds = self.diag_downsample
+            # Only rows whose rays stay inside the reconstruction z-slab —
+            # outer rows integrate through matter outside the domain and
+            # would score FOV truncation, not the model (same band as the
+            # noise ceiling and the classical backends' final diag).
+            from ...ct_core.projection_diag import covered_detector_rows
+            b0, b1 = covered_detector_rows(self.geometry)
+            b0, b1 = max(0, b0), min(n_b, b1)
+            if b1 - b0 < 16:
+                b0, b1 = 0, n_b
+            hb_keep = torch.arange(b0, b1, ds, device=device)
+            ha_keep = torch.arange(0, n_a, ds, device=device)
+            hbb, haa = torch.meshgrid(hb_keep, ha_keep, indexing="ij")
+            hb, ha = hbb.reshape(-1), haa.reshape(-1)
             hidx = torch.full_like(hb, holdout)
             h_o, h_d, h_t = rays_from_indices(scene, hidx, hb, ha)
-            print(f"  Cross-validation: holding out projection {holdout} "
-                  f"({self.holdout_rays} rays, eval every {self.eval_every}, "
-                  f"patience {self.patience})")
+            h_shape = (hb_keep.numel(), ha_keep.numel())
+            h_target = h_t.reshape(h_shape)
+            mode = ("WITHHELD from training" if self.withhold_eval
+                    else "kept in training (diagnostic; pass withhold_eval "
+                         "for true validation)")
+            print(f"  Evaluation projection {holdout} — {mode}; rendered "
+                  f"{h_shape[0]}x{h_shape[1]} (stride {ds}), eval every "
+                  f"{self.eval_every}, patience {self.patience}")
+
+            def _render_eval() -> torch.Tensor:
+                pred = torch.empty(h_o.shape[0], device=device)
+                with torch.no_grad():
+                    for i0 in range(0, h_o.shape[0], self.rays_per_batch):
+                        i1 = min(i0 + self.rays_per_batch, h_o.shape[0])
+                        pred[i0:i1] = render_rays(
+                            h_o[i0:i1], h_d[i0:i1], model, scene,
+                            num_samples=spp, stratified=False)
+                return pred.reshape(h_shape)
 
         def lr_at(it: int) -> float:
             if self.lr_warmup_iters and it < self.lr_warmup_iters:
@@ -188,7 +231,7 @@ class VoxelReconstructor:
 
             origins, directions, target = sample_random_rays(
                 scene, self.rays_per_batch, generator=gen, device=device,
-                exclude_angle=holdout)
+                exclude_angle=holdout if self.withhold_eval else None)
             pred = render_rays(origins, directions, model, scene,
                                num_samples=spp, stratified=True, generator=gen)
             loss = torch.mean((pred - target) ** 2)
@@ -208,20 +251,33 @@ class VoxelReconstructor:
                                  "train/it_per_s": rate}, it + 1)
 
             if holdout is not None and (it + 1) % self.eval_every == 0:
-                with torch.no_grad():
-                    h_pred = render_rays(h_o, h_d, model, scene,
-                                         num_samples=spp, stratified=False)
-                    h_mse = float(torch.mean((h_pred - h_t) ** 2))
-                self.crossval_history.append({"iter": it + 1, "holdout_mse": h_mse})
-                if self.log_fn is not None:
-                    self.log_fn({"crossval/holdout_mse": h_mse}, it + 1)
+                h_pred = _render_eval()
+                h_mse = float(torch.mean((h_pred - h_target) ** 2))
+                n_evals = len(self.crossval_history) + 1
+                pred_np = h_pred.cpu().numpy()
+                target_np = h_target.cpu().numpy()
+                if self.diag_fn is not None:
+                    m = self.diag_fn(
+                        pred_np, target_np, it + 1,
+                        figures=(n_evals % self.figure_every_evals == 0))
+                else:
+                    from ...ct_core.projection_diag import evaluate_projection
+                    m = evaluate_projection(pred_np, target_np)
+                    if self.log_fn is not None:
+                        self.log_fn({"diag/ssim": m["ssim"],
+                                     "diag/psnr": m["psnr"],
+                                     "diag/mse": m["mse"]}, it + 1)
+                self.crossval_history.append(
+                    {"iter": it + 1, "mse": h_mse,
+                     "ssim": m["ssim"], "psnr": m["psnr"]})
                 if h_mse < best_mse * (1.0 - 1e-4):
                     best_mse, best_it, bad_evals = h_mse, it + 1, 0
                 else:
                     bad_evals += 1
                     if bad_evals >= self.patience:
-                        stop_reason = (f"holdout MSE plateau ({self.patience} evals "
-                                       f"without improvement; best {best_mse:.3e} "
+                        stop_reason = (f"eval-projection MSE plateau "
+                                       f"({self.patience} evals without "
+                                       f"improvement; best {best_mse:.3e} "
                                        f"at iter {best_it})")
                         break
 
@@ -229,8 +285,16 @@ class VoxelReconstructor:
         print(f"  Training finished after {it + 1} iterations "
               f"({elapsed/60:.1f} min): {stop_reason}")
         if holdout is not None and self.crossval_history:
-            print(f"  Holdout MSE: {self.crossval_history[-1]['holdout_mse']:.3e} "
+            print(f"  Eval-projection MSE: "
+                  f"{self.crossval_history[-1]['mse']:.3e} "
                   f"(best {best_mse:.3e} at iter {best_it})")
+            # Guarantee final diagnostic figures even when the last eval
+            # wasn't a figure checkpoint.
+            if (self.diag_fn is not None
+                    and len(self.crossval_history) % self.figure_every_evals != 0):
+                h_pred = _render_eval()
+                self.diag_fn(h_pred.cpu().numpy(), h_target.cpu().numpy(),
+                             it + 1, figures=True, scalars=False)
 
         # ---- export: the parameter grid IS the volume ----------------------
         # mu[0, 0] is (Dz, Hy, Wx) with indices increasing along +z/+y/+x;
