@@ -37,10 +37,11 @@ import numpy as np
 import torch
 
 from ...ct_core.calibration import default_mu_water, mu_to_hu
+from ...ct_core.data_budget import RANDOM, data_budget, measurement_count
 from ...ct_core.preprocessing import preprocess_sinogram
 from ..scene import Scene, model_domain_from_geometry
 from ..ray_sampler import rays_from_indices, sample_random_rays
-from ..renderer import render_rays
+from ..renderer import render_compile_mode, render_rays, set_render_compile
 from .model import VoxelGrid
 
 
@@ -56,6 +57,7 @@ class VoxelReconstructor:
                  init_density: float = 0.001,
                  gpu_index: int = 0,
                  seed: int = 0,
+                 compile_mode: str = "off",
                  bright_field=None, dark_field=None,
                  output_hu: bool = True,
                  mu_water: float | None = None,
@@ -82,6 +84,11 @@ class VoxelReconstructor:
         self.init_density = float(init_density)
         self.gpu_index = int(gpu_index)
         self.seed = int(seed)
+        # torch.compile fusion of the renderer's elementwise kernels. Off by
+        # default: fusion reorders floating-point ops, so a compiled run is
+        # not bit-comparable with an eager one and the mode has to travel
+        # with the run's config. See renderer.set_render_compile.
+        self.compile_mode = str(compile_mode)
         self.bright_field = bright_field
         self.dark_field = dark_field
         self.output_hu = bool(output_hu)
@@ -114,6 +121,14 @@ class VoxelReconstructor:
 
         self.reconstructed_volume = None
         self.crossval_history: list[dict] = []
+        # Filled in by reconstruct(): how much data the run actually consumed.
+        # data_visits is the cross-algorithm unit — one classical iterative
+        # iteration (SIRT, OS-SART) is exactly 1.00 visits per measurement,
+        # so it, not the iteration count, is what compares between backends.
+        self.n_measurements = 0
+        self.iterations_run = 0
+        self.data_visits = 0.0
+        self.data_coverage = 0.0
 
     # ------------------------------------------------------------------ setup
 
@@ -215,11 +230,65 @@ class VoxelReconstructor:
                             num_samples=spp, stratified=False)
                 return pred.reshape(h_shape)
 
+        # ---- data budget ----------------------------------------------------
+        # Rays are drawn uniformly WITH replacement over (angle, row, col), so
+        # after k draws each measurement has been visited k/N times on average
+        # and 1-(1-1/N)^k of them have been seen at least once. Iteration
+        # counts are meaningless across batch sizes and backends; visits are
+        # the common currency (a SIRT/OS-SART iteration = exactly 1.00).
+        n_b_all, n_a_all = scene.detector_shape
+        excluded = 1 if (holdout is not None and self.withhold_eval) else 0
+        n_angles_pool = scene.n_angles - excluded
+        self.n_measurements = measurement_count(
+            scene.n_angles, n_b_all, n_a_all, excluded_angles=excluded)
+
+        def budget_after(n_iters: int) -> dict:
+            return data_budget(self.n_measurements,
+                               rays_drawn=n_iters * self.rays_per_batch,
+                               sampling=RANDOM)
+
+        planned = budget_after(self.iterations)
+        print(f"  Batch: {self.rays_per_batch} rays/iteration drawn from "
+              f"{self.n_measurements / 1e6:.1f} M measurements "
+              f"({n_angles_pool} angles x {n_b_all} x {n_a_all})")
+        print(f"  Data budget: {self.iterations} iterations = "
+              f"{planned['visits']:.2f} visits per measurement "
+              f"({100 * planned['coverage']:.1f}% seen at least once). "
+              f"1.00 visits = one full pass = one SIRT/OS-SART iteration.")
+
         def lr_at(it: int) -> float:
             if self.lr_warmup_iters and it < self.lr_warmup_iters:
                 return self.lr * (it + 1) / self.lr_warmup_iters
             t = (it - self.lr_warmup_iters) / max(1, self.iterations - self.lr_warmup_iters)
             return self.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+
+        # ---- optional kernel fusion ----------------------------------------
+        # Compilation happens on the first call, so do it BEFORE the timer:
+        # otherwise the one-off cost lands in iteration 0 and poisons it/s.
+        # The warmup draws its rays from a SEPARATE generator and never calls
+        # optimizer.step(), so the model, the Adam state and the training RNG
+        # stream are all exactly what an eager run would see — the only
+        # difference between `--compile off` and `--compile on` is the kernels.
+        set_render_compile(self.compile_mode)
+        if render_compile_mode() != "off":
+            t_c = time.time()
+            warm_gen = torch.Generator(device=device).manual_seed(self.seed + 9973)
+            w_o, w_d, w_t = sample_random_rays(
+                scene, self.rays_per_batch, generator=warm_gen, device=device,
+                exclude_angle=holdout if self.withhold_eval else None)
+            w_pred = render_rays(w_o, w_d, model, scene, num_samples=spp,
+                                 stratified=True, generator=warm_gen)
+            torch.mean((w_pred - w_t) ** 2).backward()
+            optimizer.zero_grad(set_to_none=True)
+            del w_o, w_d, w_t, w_pred
+            mode = render_compile_mode()
+            if mode == "off":
+                print("  torch.compile: unavailable — running eager (see warning)")
+            else:
+                print(f"  torch.compile ({mode}): quadrature + integration "
+                      f"kernels fused in {time.time() - t_c:.1f} s. Numerics "
+                      f"differ from eager in the last bits — compare only "
+                      f"against other --compile {mode} runs.")
 
         best_mse, best_it, bad_evals = float("inf"), 0, 0
         t0 = time.time()
@@ -243,12 +312,19 @@ class VoxelReconstructor:
 
             if self.log_every and (it % self.log_every == 0 or it == self.iterations - 1):
                 rate = (it + 1) / max(1e-9, time.time() - t0)
+                seen = budget_after(it + 1)['visits']
                 print(f"  iter {it:6d}/{self.iterations}  loss {loss.item():.3e}  "
-                      f"lr {lr_at(it):.2e}  {rate:.1f} it/s", flush=True)
+                      f"lr {lr_at(it):.2e}  {rate:.1f} it/s  "
+                      f"{seen:.2f} visits/measurement", flush=True)
                 if self.log_fn is not None:
                     self.log_fn({"train/loss": float(loss.item()),
                                  "train/lr": lr_at(it),
-                                 "train/it_per_s": rate}, it + 1)
+                                 "train/it_per_s": rate,
+                                 # per step, so W&B can plot against data
+                                 # visits — the batch-size-independent x-axis
+                                 "train/data_visits": seen,
+                                 "train/rays_per_batch": self.rays_per_batch},
+                                it + 1)
 
             if holdout is not None and (it + 1) % self.eval_every == 0:
                 h_pred = _render_eval()
@@ -282,8 +358,17 @@ class VoxelReconstructor:
                         break
 
         elapsed = time.time() - t0
-        print(f"  Training finished after {it + 1} iterations "
+        self.iterations_run = int(it + 1)
+        final_budget = budget_after(self.iterations_run)
+        self.data_visits = final_budget['visits']
+        self.data_coverage = final_budget['coverage']
+        print(f"  Training finished after {self.iterations_run} iterations "
               f"({elapsed/60:.1f} min): {stop_reason}")
+        print(f"  Data consumed: {self.data_visits:.2f} visits per measurement "
+              f"({self.iterations_run} x {self.rays_per_batch} rays = "
+              f"{self.iterations_run * self.rays_per_batch / 1e6:.1f} M of "
+              f"{self.n_measurements / 1e6:.1f} M measurements; "
+              f"{100 * self.data_coverage:.1f}% seen at least once)")
         if holdout is not None and self.crossval_history:
             print(f"  Eval-projection MSE: "
                   f"{self.crossval_history[-1]['mse']:.3e} "

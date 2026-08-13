@@ -28,6 +28,7 @@ import torch
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
 from .ct_core.calibration import default_mu_water
+from .ct_core.data_budget import SWEEP, data_budget, measurement_count
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
@@ -276,6 +277,17 @@ def main():
     )
 
     reconstructor.reconstruct(display_volume=args.display)
+
+    # How much measured data went in — the unit that compares across
+    # backends. FDK filters and backprojects every measurement exactly once:
+    # 1.00 visits, full coverage, by construction.
+    n_b, n_a = int(ctx.projections.shape[1]), int(ctx.projections.shape[2])
+    logger.set_data_budget(
+        data_budget(measurement_count(int(ctx.projections.shape[0]), n_b, n_a,
+                                      excluded_angles=1 if args.withhold_eval
+                                      else 0),
+                    visits=1.0, sampling=SWEEP),
+        note="single backprojection pass over every measurement")
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)

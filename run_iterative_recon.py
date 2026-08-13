@@ -26,6 +26,7 @@ import numpy as np
 from .iterative.astra import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
 from .iterative.tigre import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
 from .ct_core.calibration import default_mu_water
+from .ct_core.data_budget import classical_budget, measurement_count
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
@@ -277,7 +278,13 @@ def main():
     print(f"Data folder: {args.data_folder}")
     print(f"Backend: {args.backend}")
     if args.algorithm != 'FDK_CUDA':
-        print(f"Iterations: {args.iterations}")
+        # Every classical iteration sweeps the full sinogram exactly once, so
+        # the iteration count IS the data-visit count — the unit the learned
+        # backend reports (train/data_visits) and the only fair way to compare
+        # the two families.
+        print(f"Iterations: {args.iterations} "
+              f"(= {float(args.iterations):.2f} visits per measurement; each "
+              f"iteration uses every measurement exactly once)")
     if args.backend == 'astra':
         if args.min_constraint is not None:
             print(f"Min constraint: {args.min_constraint}")
@@ -428,6 +435,19 @@ def main():
 
     # Run reconstruction
     reconstructor.reconstruct()
+
+    # How much measured data the DELIVERED volume saw. Each classical
+    # iteration sweeps the whole sinogram exactly once, so visits = the
+    # iteration the saved volume comes from — which is best_iter, not the
+    # iteration the run stopped at, when early stopping rolled back to the
+    # peak-SSIM volume.
+    n_b, n_a = int(ctx.projections.shape[1]), int(ctx.projections.shape[2])
+    budget, note, extra = classical_budget(
+        measurement_count(int(ctx.projections.shape[0]), n_b, n_a,
+                          excluded_angles=1 if args.withhold_eval else 0),
+        requested_iterations=args.iterations,
+        crossval_metrics=getattr(reconstructor, 'crossval_metrics', None))
+    logger.set_data_budget(budget, note=note, extra=extra)
 
     # Save convergence figure (no-op if crossval was off)
     if hasattr(reconstructor, 'plot_crossval'):

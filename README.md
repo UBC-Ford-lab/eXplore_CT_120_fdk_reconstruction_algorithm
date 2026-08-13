@@ -77,6 +77,56 @@ CUDA GPU for realistic sizes. `--detector-warp auto` additionally applies the
 per-pixel detector distortion calibration to ray geometry — a correction only
 this family can express.
 
+**Ray batch size adapts to the GPU (`--rays-per-batch auto`, the default).**
+The batch is the only knob that scales with VRAM: the grid, its Adam state
+and the sinogram are fixed costs, so whatever is left over should be spent on
+rays per step. The driver measures free VRAM, subtracts those persistent
+buffers, and sizes the batch to the remainder (the same thing FDK does for
+its projection chunks) — one command fills a 16 GB card (~12 k rays) and an
+80 GB card (~400-500 k rays, i.e. many more epochs over the sinogram in the
+same wall time) without a hardware-specific flag. The chosen value and the
+memory terms behind it are printed and logged to W&B (`rays_per_batch`,
+`rays_per_batch_mode`). Because batch size changes the optimization dynamics,
+**pin an integer (`--rays-per-batch 16384`) when a run must be reproducible
+across different GPUs.**
+
+**Kernel fusion (`--compile on`, default `off`).** A training step is
+bandwidth-bound, not compute-bound. Measured on a P100 at 12288 rays x 1091
+samples/ray (13.4 M samples/step):
+
+| part of the step | time | |
+|---|---|---|
+| stratification RNG | 0.24 ms | |
+| quadrature chain (ray → normalized sample coordinates) | 5.74 ms | **fusible** |
+| `grid_sample` | 1.63 ms | extern kernel |
+| masked Riemann sum | 0.61 ms | **fusible** |
+| forward total | 8.86 ms | |
+| forward + backward | 14.89 ms | |
+
+So 72% of the forward is one elementwise chain that eager mode walks through
+in separate kernels, materializing a 161 MB `(N, S, 3)` intermediate at each
+of `t_samples`, `xyz_mm` and `xyz_norm`. `--compile on` hands that chain to
+`torch.compile`, which fuses it into a single kernel writing only what
+`grid_sample` consumes; AOTAutograd fuses the matching backward. The fusible
+part is 43% of the full step, so halving it is ~1.27x, and the backward
+saving comes on top.
+
+This is fusion, **not** reduced precision. `grid_sample`, the elementwise
+chain and the reduction stay float32 — the ray integral sums ~1091 terms and
+projection residuals live at 1e-2, so a bf16/fp16 accumulator would put
+arithmetic noise at the size of the signal. (`torch.autocast` would in any
+case downcast none of this path, which contains no matmul.)
+
+Off by default because fusion **reorders floating-point operations**: a
+compiled run is comparable with other compiled runs, not with an eager
+baseline. The mode is printed and travels with the run's W&B config
+(`compile`). Compilation is warmed up before the timer, off the training RNG
+stream, so `--compile on` and `--compile off` see the same rays and the same
+optimizer trajectory. Requires Triton, i.e. compute capability >= 7.0 —
+older GPUs (P100 and earlier) warn once and continue eagerly rather than
+failing the run. `--compile max-autotune` benchmarks kernel variants at
+compile time; minutes of extra startup, worth it only for long runs.
+
 ## Geometry self-calibration (standard, all backends)
 
 The detector in-plane rotation (psi) is calibrated automatically for every
@@ -122,6 +172,12 @@ using documented per-backend formulas (e.g. ASTRA needs its whole
 2x(volume+sinogram) workspace at once; TIGRE splits VRAM internally but keeps
 ~4x the volume in host RAM). Verdicts: OK / TIGHT / INSUFFICIENT / NO-GPU.
 
+`--gpu-index` is a *logical* index (the one torch uses, relative to
+`CUDA_VISIBLE_DEVICES`), and the memory query maps it to the physical device
+before asking nvidia-smi — so on a shared scheduler node that hands out, say,
+GPU 2, the report describes the card the job will actually run on rather than
+some other job's.
+
 ```bash
 # Dry run: "would this job fit here?" — prints the report and exits
 python -m reconstruction.run_iterative_recon data/scans/Scan_1510 \
@@ -160,6 +216,37 @@ By default the evaluation projection **stays in** the reconstruction
 the diag metrics into true held-out validation. With `--wandb`, the
 finished volume is additionally logged as a scrollable axial-slice
 sequence (`recon_slices`).
+
+**Data budget (all backends).** Iteration counts do not compare — an OS-SART
+iteration sweeps the whole sinogram, a voxel-trainer iteration touches one
+random ray batch, and FDK has no iterations at all. Every driver therefore
+reports how many times each measurement (one detector pixel at one angle) was
+used on average, and what share of the data was touched at all:
+
+```
+Data budget: 1.00 visits per measurement (196.2 M measurements, 100.0% used at
+least once) — single backprojection pass over every measurement          [FDK]
+Data budget: 100.00 visits per measurement (196.2 M measurements, 100.0% used at
+least once) — each iteration uses every measurement exactly once   [ASTRA/TIGRE]
+Data budget: 1.25 visits per measurement (196.2 M measurements, 71.3% used at
+least once) — 20000 iterations x 12288 rays, sampled with replacement   [voxel]
+```
+
+**1.00 visits = one full pass = exactly one SIRT / OS-SART iteration**, which
+is what makes the families comparable. Two subtleties the numbers capture:
+the learned backend samples *with replacement*, so its coverage is
+`1 - e^-visits` (one visit on average means 63% of the data seen, not 100%) —
+decisive in the sub-one-visit regime, where a run provably never looked at
+most of the sinogram; and when cross-validation stops early, the volume that
+gets saved is the peak-SSIM one, so the budget credits `best_iter` and
+reports the iterations the run burned separately. Withheld projections
+(`--withhold-eval`) leave the measurement pool.
+
+Logged to W&B under the same keys for every backend — `data/visits`,
+`data/coverage`, `data/measurements`, `data/sampling` (+ `data/iterations_run`
+/ `data/iterations_saved` / `data/rays_per_batch` where they apply). The
+learned backend additionally streams `train/data_visits` per step, usable as
+a batch-size-independent x-axis. Implementation: `ct_core/data_budget.py`.
 
 The same figures (plus native live charts: training loss / LR per step for
 the learned backend, per-eval diag metrics for TIGRE and voxel) can be
@@ -215,6 +302,8 @@ Run `--help` for full argument lists.
 | `--bone-bhc-hu` | 3100 | Monochromatic bone HU (from scan.xml `BoneHU`) |
 | `--ring-correction` | on | Sinogram-space ring artifact correction |
 | `--roi auto` | off | ROI from SubVolumeCoordinates.xml |
+| `--rays-per-batch` | `auto` | Learned backend: batch sized from free VRAM |
+| `--compile` | `off` | Learned backend: fuse renderer kernels (needs sm_70+) |
 
 ## Installation
 

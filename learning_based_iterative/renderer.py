@@ -17,15 +17,102 @@ along each ray (weight_i = mu_i * delta_i — the bin's contribution to the
 line integral), and a fine network is evaluated on the union of the coarse
 samples and N_f importance-sampled points. Both networks are supervised by
 their own line-integral MSE.
+
+OPTIONAL KERNEL FUSION (`set_render_compile`). The forward is bandwidth-bound,
+not compute-bound: for a 12288-ray batch at 1091 samples/ray each `(N, S, 3)`
+intermediate is 161 MB, and eager mode materializes `t_unit`, `t_samples`,
+`xyz_mm` and `xyz_norm` in turn. Everything between the ray-domain clip and
+the model query is elementwise, so `torch.compile` fuses it into a single
+kernel that writes only what the model actually consumes (`xyz_norm` and the
+cylinder mask) — roughly halving the traffic, with the same saving again in
+the backward pass. Note this is NOT AMP: `grid_sample`, the elementwise chain
+and the reduction all stay float32 (autocast would downcast none of them
+anyway, as it only targets matmul, of which this path has none).
+
+Off by default, because fusion reorders floating-point operations: results
+move in the last bits, so an fp32 baseline and a compiled run are not exactly
+comparable and a run must record which mode produced it. Turn it on with
+`--compile on` (the driver) or `set_render_compile('on')`.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Callable
 
 import torch
 
 from .scene import Scene, normalize_to_unit_cube
+
+# --------------------------------------------------------------------------
+# kernel fusion control (process-global; the renderer is called from many
+# places and threading a flag through all of them would be worse)
+# --------------------------------------------------------------------------
+
+COMPILE_MODES = ("off", "on", "max-autotune")
+
+_COMPILE_MODE = "off"
+_COMPILED: dict = {}
+_COMPILE_FAILED = False
+
+
+def set_render_compile(mode: str = "off") -> str:
+    """Enable/disable `torch.compile` fusion of the renderer's hot kernels.
+
+    ``'off'``          eager (default) — bit-for-bit the pre-2026-08-13 path.
+    ``'on'``           Inductor default mode.
+    ``'max-autotune'`` benchmarks kernel variants at compile time; minutes of
+                       extra compile for a few percent, worth it only for long
+                       runs.
+
+    Compilation happens on first call. If it raises for any reason (no C++
+    toolchain, no Triton, unsupported GPU) the renderer warns once and falls
+    back to eager for the rest of the process rather than failing the run.
+    """
+    global _COMPILE_MODE, _COMPILE_FAILED
+    mode = str(mode).strip().lower()
+    if mode in ("none", "false", "0"):
+        mode = "off"
+    if mode in ("true", "1", "default"):
+        mode = "on"
+    if mode not in COMPILE_MODES:
+        raise ValueError(f"compile mode must be one of {COMPILE_MODES}, got {mode!r}")
+    if mode != _COMPILE_MODE:
+        _COMPILE_FAILED = False
+    _COMPILE_MODE = mode
+    return _COMPILE_MODE
+
+
+def render_compile_mode() -> str:
+    """The fusion mode actually in force ('off' after a failed compile)."""
+    return "off" if _COMPILE_FAILED else _COMPILE_MODE
+
+
+def _fused(fn, *args, **kwargs):
+    """Call `fn`, compiled when fusion is on, with a one-shot eager fallback.
+
+    OOM is re-raised untouched — that is a real capacity signal the caller's
+    batch sizing needs to see, not a compilation problem.
+    """
+    global _COMPILE_FAILED
+    if _COMPILE_MODE == "off" or _COMPILE_FAILED:
+        return fn(*args, **kwargs)
+    key = (fn.__name__, _COMPILE_MODE)
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        opts = {} if _COMPILE_MODE == "on" else {"mode": _COMPILE_MODE}
+        compiled = torch.compile(fn, **opts)
+        _COMPILED[key] = compiled
+    try:
+        return compiled(*args, **kwargs)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception as exc:                       # pragma: no cover - env dep
+        _COMPILE_FAILED = True
+        warnings.warn(f"torch.compile failed ({type(exc).__name__}: {exc}); "
+                      f"falling back to eager rendering for this process.",
+                      RuntimeWarning, stacklevel=2)
+        return fn(*args, **kwargs)
 
 
 def scale_grad(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -147,6 +234,86 @@ def ray_domain_intersect(origins: torch.Tensor, directions: torch.Tensor, domain
     return ray_aabb_intersect(origins, directions, aabb_min, aabb_max)
 
 
+def _quadrature(
+    origins: torch.Tensor,
+    directions: torch.Tensor,
+    t_near: torch.Tensor,
+    t_far: torch.Tensor,
+    u: torch.Tensor | None,
+    num_samples: int,
+    center: torch.Tensor,
+    half: torch.Tensor,
+    cyl_center_x: float,
+    cyl_center_y: float,
+    cyl_radius: float | None,
+    need_mm: bool,
+):
+    """Lay quadrature points along each ray and normalize them for the model.
+
+    THE fusible block: one elementwise chain from the ray parameters to the
+    model's input coordinates, with no data-dependent control flow, no RNG
+    (the stratification jitter `u` is drawn by the caller so a torch.Generator
+    never enters the graph) and no library calls. Everything it touches is
+    `(N, num_samples[, 3])`.
+
+    `need_mm` returns the mm-space points as well, which the SIRT column
+    preconditioner needs; under fusion that forces the big intermediate to be
+    materialized, so it is False on the hot path. It is a Python bool, so the
+    two variants specialize into separate graphs rather than branching.
+
+    Returns `(xyz_norm, cyl_mask, delta_t, xyz_mm | None)`.
+    """
+    span = (t_far - t_near).unsqueeze(-1)
+    centers = (torch.arange(num_samples, device=origins.device,
+                            dtype=origins.dtype) + 0.5) / num_samples
+    if u is None:
+        t_unit = centers.unsqueeze(0)
+    else:
+        t_unit = centers.unsqueeze(0) + (u - 0.5) / num_samples
+    t_samples = t_near.unsqueeze(-1) + t_unit * span
+    xyz_mm = origins.unsqueeze(1) + t_samples.unsqueeze(-1) * directions.unsqueeze(1)
+
+    xyz_norm = (xyz_mm - center) / half
+
+    if cyl_radius is None:
+        cyl_mask = torch.ones(xyz_mm.shape[:-1], dtype=xyz_mm.dtype,
+                              device=xyz_mm.device)
+    else:
+        dx = xyz_mm[..., 0] - cyl_center_x
+        dy = xyz_mm[..., 1] - cyl_center_y
+        r2 = dx ** 2 + dy ** 2
+        cyl_mask = (r2 < cyl_radius ** 2).to(xyz_mm.dtype)
+
+    delta_t = span / num_samples
+    return xyz_norm, cyl_mask, delta_t, (xyz_mm if need_mm else None)
+
+
+def _integrate(density: torch.Tensor, cyl_mask: torch.Tensor,
+               delta_t: torch.Tensor) -> torch.Tensor:
+    """Mask the samples and Riemann-sum them into a line integral.
+
+    Kept in float32 deliberately: the sum runs over `num_samples` (~1091)
+    terms and our projection residuals live at 1e-2, so a reduced-precision
+    accumulator would put arithmetic noise at the size of the signal.
+    """
+    return ((density * cyl_mask) * delta_t).sum(dim=-1)
+
+
+def _domain_affine(domain, ref: torch.Tensor):
+    """`(center, half)` of the mm -> [-1,1] map, matching ModelDomain.normalize."""
+    amin = domain.aabb_min.to(ref)
+    amax = domain.aabb_max.to(ref)
+    return (amin + amax) * 0.5, (amax - amin) * 0.5
+
+
+def _cylinder_params(domain):
+    """`(cx, cy, radius | None)`; radius None means "no mask" (box domain)."""
+    if getattr(domain, "shape", None) == "box" or domain.radius_xy is None:
+        return 0.0, 0.0, None
+    return (float(domain.center_xy[0]), float(domain.center_xy[1]),
+            float(domain.radius_xy))
+
+
 def render_rays(
     origins: torch.Tensor,
     directions: torch.Tensor,
@@ -198,25 +365,22 @@ def render_rays(
     n = origins.shape[0]
     device = origins.device
 
-    centers = (torch.arange(num_samples, device=device, dtype=origins.dtype) + 0.5) / num_samples
-    if stratified:
-        u = torch.rand(n, num_samples, device=device, generator=generator, dtype=origins.dtype)
-        t_unit = centers.unsqueeze(0) + (u - 0.5) / num_samples
-    else:
-        t_unit = centers.unsqueeze(0).expand(n, num_samples)
+    # RNG stays outside the fused kernel: a torch.Generator cannot be traced,
+    # and drawing here keeps the random stream identical whether or not the
+    # renderer is compiled, so eager and fused runs see the same rays.
+    u = (torch.rand(n, num_samples, device=device, generator=generator,
+                    dtype=origins.dtype) if stratified else None)
 
-    span = (t_far - t_near).unsqueeze(-1)
-    t_samples = t_near.unsqueeze(-1) + t_unit * span
-
-    xyz_mm = origins.unsqueeze(1) + t_samples.unsqueeze(-1) * directions.unsqueeze(1)
-    xyz_norm = normalize_to_unit_cube(xyz_mm, scene)
-
-    # Mask samples outside the cylinder. Under ray_clip='domain' every sample
-    # is already inside by construction and this is a no-op; it stays as the
-    # guard for ray_clip='aabb' (where it does the real work) and for the
-    # tangent-ray corner case where a root lands exactly on the wall.
-    cyl_mask = scene.model_domain.cylinder_mask(xyz_mm)
-    delta_t = span / num_samples
+    # xyz_norm, the cylinder mask and the step width in one pass. `cyl_mask`
+    # zeroes samples outside the cylinder: under ray_clip='domain' every
+    # sample is already inside by construction and this is a no-op; it stays
+    # as the guard for ray_clip='aabb' (where it does the real work) and for
+    # the tangent-ray corner case where a root lands exactly on the wall.
+    center, half = _domain_affine(scene.model_domain, origins)
+    cx, cy, radius = _cylinder_params(scene.model_domain)
+    xyz_norm, cyl_mask, delta_t, xyz_mm = _fused(
+        _quadrature, origins, directions, t_near, t_far, u, num_samples,
+        center, half, cx, cy, radius, grad_scale_fn is not None)
 
     if spectrum is not None:
         # Polychromatic: accumulate two line integrals (A1, A2), then apply
@@ -243,10 +407,7 @@ def render_rays(
         # coverage weight without changing the forward line integral.
         s = grad_scale_fn(xyz_mm).detach()          # (n, num_samples)
         density = scale_grad(density, s.to(density.dtype))
-    density = density * cyl_mask
-    integral = (density * delta_t).sum(dim=-1)
-
-    return integral
+    return _fused(_integrate, density, cyl_mask, delta_t)
 
 
 def _sample_pdf(

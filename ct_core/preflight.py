@@ -47,6 +47,15 @@ F32 = 4
 SAFETY = 1.15          # multiplied onto every estimate
 TIGHT_FRAC = 0.85      # need > 85% of free => "tight"
 
+# Peak VRAM per quadrature sample in the differentiable renderer, in bytes.
+# One ray-sample carries ~24 live fp32 values through the autograd graph
+# (jitter, t-samples, mm points, normalized grid coords, grid_sample output,
+# plus what backward retains). MEASURED on a P100: 16384 rays x 1091 spp
+# added ~3.1 GiB over the persistent buffers = ~174 B/sample including
+# caching-allocator slack; 96 B is the live-tensor estimate that the 0.85
+# budget fraction and SAFETY are applied on top of.
+BATCH_BYTES_PER_SAMPLE = 96
+
 
 def host_mem_available_bytes():
     """MemAvailable from /proc/meminfo, or None off-Linux."""
@@ -132,7 +141,8 @@ def estimate(backend: str, *, n_angles: int, n_b: int, n_a: int, vol_shape,
 
     if backend == "voxel":
         params = vol  # one fp32 parameter per voxel
-        batch = int(rays_per_batch) * max(1, int(samples_per_ray)) * F32 * 6
+        batch = (int(rays_per_batch) * max(1, int(samples_per_ray))
+                 * BATCH_BYTES_PER_SAMPLE)
         gpu = int((4 * params + sino + batch) * SAFETY)
         host = int((2 * sino + vol) * SAFETY)
         notes.append("Voxel grid trains param+grad+Adam(m,v) = 4x volume on "
@@ -140,6 +150,62 @@ def estimate(backend: str, *, n_angles: int, n_b: int, n_a: int, vol_shape,
         return gpu, host, False, notes
 
     raise ValueError(f"unknown backend {backend!r}")
+
+
+# --------------------------------------------------------- auto batch size --
+
+AUTO_BATCH_FLOOR = 4096
+AUTO_BATCH_CAP = 1 << 20        # 1M rays: throughput saturates well before this
+# Fraction of free VRAM the auto batch may plan against. Deliberately below
+# TIGHT_FRAC so a self-sized batch never lands on its own "tight fit" warning,
+# and to leave room for allocator fragmentation over a long run.
+AUTO_BATCH_FILL = 0.75
+
+
+def auto_rays_per_batch(vram_free, *, n_angles: int, n_b: int, n_a: int,
+                        vol_shape, samples_per_ray: int,
+                        floor: int = AUTO_BATCH_FLOOR,
+                        cap: int = AUTO_BATCH_CAP,
+                        fill: float = AUTO_BATCH_FILL) -> dict:
+    """Largest ray batch that fits in free VRAM after the persistent buffers.
+
+    Same pattern the FDK backend uses for its projection chunks: take the
+    memory the card actually has free, subtract what must stay resident for
+    the whole run (4x parameters for fp32 weights + grad + Adam m/v, plus the
+    sinogram), and spend the rest on the per-step ray buffers. This is what
+    lets one command saturate a 16 GB card and an 80 GB card without a
+    hardware-specific flag — the batch is the only knob that scales with VRAM,
+    and on a big GPU it is worth ~30x more rays per step (= more epochs over
+    the sinogram in the same wall time).
+
+    ``vram_free=None`` (no GPU) returns the floor. Returns a dict with the
+    chosen ``rays`` and the terms behind it, so the driver can print the
+    reasoning rather than an unexplained number.
+    """
+    spp = max(1, int(samples_per_ray))
+    persistent = int((4 * _vol_bytes(vol_shape)
+                      + _sino_bytes(n_angles, n_b, n_a)) * SAFETY)
+    per_ray = spp * BATCH_BYTES_PER_SAMPLE
+
+    if vram_free is None:
+        rays, budget, available = int(floor), 0, 0
+    else:
+        budget = int(vram_free * fill)
+        available = max(0, budget - persistent)
+        rays = int(available // per_ray)
+        rays = (rays // 1024) * 1024                  # keep launches aligned
+        rays = int(min(max(rays, floor), cap))
+
+    return {
+        'rays': rays,
+        'samples_per_ray': spp,
+        'persistent_bytes': persistent,
+        'budget_bytes': budget,
+        'available_bytes': available,
+        'bytes_per_ray': per_ray,
+        'floored': vram_free is not None and available // per_ray < floor,
+        'capped': vram_free is not None and available // per_ray > cap,
+    }
 
 
 # ------------------------------------------------------------------ check --

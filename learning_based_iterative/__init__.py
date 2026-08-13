@@ -34,12 +34,15 @@ from .ray_sampler import (
     sample_random_rows,
 )
 from .renderer import (
+    COMPILE_MODES,
     ray_aabb_intersect,
     ray_cylinder_intersect,
     ray_domain_intersect,
+    render_compile_mode,
     render_rays,
     render_rays_hierarchical,
     scale_grad,
+    set_render_compile,
 )
 from .detector_warp import (
     DetectorWarp,
@@ -55,6 +58,7 @@ __all__ = [
     "sample_random_rays", "sample_random_rows",
     "ray_aabb_intersect", "ray_cylinder_intersect", "ray_domain_intersect",
     "render_rays", "render_rays_hierarchical", "scale_grad",
+    "COMPILE_MODES", "render_compile_mode", "set_render_compile",
     "DetectorWarp", "detector_serial_from_scan", "resolve_detector_warp",
     "VoxelGrid", "voxel_grid_shape",
 ]

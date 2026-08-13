@@ -36,7 +36,10 @@ from .ct_core.pipeline import (
     run_preflight,
     save_outputs,
 )
+from .ct_core.data_budget import RANDOM, data_budget
+from .ct_core.preflight import auto_rays_per_batch
 from .ct_core.projection_diag import measure_noise_ceiling
+from .ct_core.utils import query_gpu_memory
 
 SUPPORTED_LEARNED_ALGORITHMS = ("voxel",)
 
@@ -63,8 +66,15 @@ Examples:
                         help='Optimizer steps (default: 20000). On Scan_1510 '
                              'the holdout optimum sat near 16k; crossval stops '
                              'earlier when the holdout MSE plateaus.')
-    parser.add_argument('--rays-per-batch', type=int, default=16384,
-                        help='Rays per optimizer step (default: 16384)')
+    parser.add_argument('--rays-per-batch', default='auto', metavar='N|auto',
+                        help='Rays per optimizer step (default: auto — the '
+                             'largest batch that fits the free VRAM after the '
+                             'grid, Adam state and sinogram, so the same '
+                             'command uses a 16 GB and an 80 GB card fully). '
+                             'The chosen value is printed and logged. Pin an '
+                             'integer for run-to-run reproducibility across '
+                             'different GPUs, since batch size changes the '
+                             'optimization dynamics.')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Adam learning rate on the voxel values '
                              '(default: 1e-4 — ~0.5%% of mu_water per step). '
@@ -84,6 +94,16 @@ Examples:
                         help='Sampling seed (default: 0)')
     parser.add_argument('--gpu-index', type=int, default=0,
                         help='CUDA device index (default: 0)')
+    parser.add_argument('--compile', dest='compile_mode', default='off',
+                        choices=('off', 'on', 'max-autotune'),
+                        help='Fuse the renderer kernels with torch.compile '
+                             '(default: off). The forward is bandwidth-bound, '
+                             'so fusing the quadrature chain cuts the traffic '
+                             'per step roughly in half. Off by default because '
+                             'fusion reorders floating-point ops: a compiled '
+                             'run is comparable with other compiled runs, not '
+                             'with an eager baseline. max-autotune benchmarks '
+                             'kernel variants (minutes of extra compile).')
     parser.add_argument('--detector-warp', default='off',
                         choices=('off', 'auto', 'nonaffine', 'full'),
                         help='Per-pixel detector distortion correction applied '
@@ -113,11 +133,20 @@ def main():
     args = parse_args()
     start = time.time()
 
+    auto_batch = str(args.rays_per_batch).strip().lower() == 'auto'
+    if not auto_batch:
+        try:
+            args.rays_per_batch = int(args.rays_per_batch)
+        except ValueError:
+            sys.exit(f"--rays-per-batch: expected an integer or 'auto', "
+                     f"got {args.rays_per_batch!r}")
+
     print("=" * 60)
     print(f"Learning-based Iterative Reconstruction ({args.algorithm})")
     print("=" * 60)
     print(f"Data folder: {args.data_folder}")
-    print(f"Iterations: {args.iterations}  rays/batch: {args.rays_per_batch}  "
+    print(f"Iterations: {args.iterations}  "
+          f"rays/batch: {'auto' if auto_batch else args.rays_per_batch}  "
           f"lr: {args.lr}")
 
     # Shared front half: scan folder, projections, ROI, geometry, downsample.
@@ -130,6 +159,35 @@ def main():
             f'_recon_{args.algorithm}_{args.iterations}it')
     print(f"\nOutput path: {output_path}")
 
+    # Quadrature samples per ray — needed before the trainer exists, both to
+    # size the ray batch and to estimate VRAM. Mirrors the trainer's auto rule.
+    _spp = args.samples_per_ray or int(np.ceil(
+        min(int(ctx.geometry['vol_shape'][0]), int(ctx.geometry['vol_shape'][1]))
+        / 0.55))
+
+    # ---- ray batch size: fill the card we actually got ---------------------
+    # Same pattern as the FDK backend's chunk sizing: measure free VRAM, put
+    # the persistent buffers aside, spend the rest per step. Pinning an
+    # integer skips this entirely.
+    if auto_batch:
+        gpu = query_gpu_memory(args.gpu_index)
+        n_ang, n_b, n_a = (int(s) for s in ctx.projections.shape)
+        plan = auto_rays_per_batch(
+            (gpu or {}).get('free_bytes'), n_angles=n_ang, n_b=n_b, n_a=n_a,
+            vol_shape=ctx.geometry['vol_shape'], samples_per_ray=_spp)
+        args.rays_per_batch = plan['rays']
+        if gpu is None:
+            print(f"\nRays/batch: auto -> {plan['rays']} (no GPU visible — "
+                  f"floor)")
+        else:
+            limit = ('capped' if plan['capped'] else
+                     'floored' if plan['floored'] else 'VRAM-limited')
+            print(f"\nRays/batch: auto -> {plan['rays']} ({limit}; "
+                  f"{plan['budget_bytes'] / 2**30:.1f} GiB budget - "
+                  f"{plan['persistent_bytes'] / 2**30:.1f} GiB persistent, "
+                  f"{_spp} samples/ray). Pin --rays-per-batch to reproduce "
+                  f"this run on another GPU.")
+
     # Experiment logging: local PNGs next to the output, W&B when --wandb.
     # Created BEFORE preflight (an auto-aborted job is recorded as a FAILED
     # run with the verdict); the trainer then logs LIVE (loss/lr/holdout-MSE
@@ -137,11 +195,13 @@ def main():
     logger = ReconLogger(args, ctx, args.algorithm, output_path, params={
         'iterations': args.iterations,
         'rays_per_batch': args.rays_per_batch,
+        'rays_per_batch_mode': 'auto' if auto_batch else 'pinned',
         'lr': args.lr,
         'lr_warmup_iters': args.lr_warmup_iters,
         'samples_per_ray': args.samples_per_ray,
         'init_density': args.init_density,
         'seed': args.seed,
+        'compile': args.compile_mode,
         'detector_warp': args.detector_warp,
         'crossval': not args.no_crossval,
         'withhold_eval': bool(args.withhold_eval),
@@ -149,10 +209,7 @@ def main():
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
     # The voxel grid's VRAM need is dominated by 4x parameters (Adam), plus
-    # the per-batch ray buffers — mirror the trainer's auto-spp rule here.
-    _spp = args.samples_per_ray or int(np.ceil(
-        min(int(ctx.geometry['vol_shape'][0]), int(ctx.geometry['vol_shape'][1]))
-        / 0.55))
+    # the per-batch ray buffers sized just above.
     run_preflight('voxel', ctx, gpu_index=args.gpu_index, logger=logger,
                   rays_per_batch=args.rays_per_batch, samples_per_ray=_spp,
                   skip=args.skip_preflight, only=args.preflight_only)
@@ -202,6 +259,7 @@ def main():
         init_density=args.init_density,
         gpu_index=args.gpu_index,
         seed=args.seed,
+        compile_mode=args.compile_mode,
         bright_field=ctx.bright_field,
         dark_field=ctx.dark_field,
         output_hu=True,
@@ -220,6 +278,21 @@ def main():
     )
 
     reconstructor.reconstruct()
+
+    # What the trainer ACTUALLY used, read back off the backend (not off args
+    # — early stopping cuts the iteration count, and the batch may have been
+    # auto-sized). Same data/* keys as the classical drivers; the difference
+    # is the sampling mode, which is what makes coverage < 100% here.
+    logger.set_data_budget(
+        data_budget(reconstructor.n_measurements,
+                    rays_drawn=(reconstructor.iterations_run
+                                * reconstructor.rays_per_batch),
+                    sampling=RANDOM),
+        note=f"{reconstructor.iterations_run} iterations x "
+             f"{reconstructor.rays_per_batch} rays, sampled with replacement",
+        extra={'data/iterations_run': reconstructor.iterations_run,
+               'data/rays_per_batch': reconstructor.rays_per_batch,
+               'data/rays_per_batch_mode': 'auto' if auto_batch else 'pinned'})
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)

@@ -386,6 +386,40 @@ class ReconLogger:
                 self.log({f"crossval/{n}": series[n][1][j] for n in names
                           if j < len(series[n][1])}, step=int(it))
 
+    def set_data_budget(self, budget: dict, *, note: str = "",
+                        extra: dict | None = None) -> None:
+        """Print + record how much measured data the run consumed.
+
+        Same call, same `data/*` keys, in every backend — that is what makes
+        a learned run and a classical one comparable (see ct_core.data_budget:
+        1.00 visits = one full pass = one SIRT/OS-SART iteration).
+        """
+        from .data_budget import format_budget
+        print(f"  {format_budget(budget, note=note)}")
+        values = {
+            "data/measurements": int(budget["measurements"]),
+            "data/visits": float(budget["visits"]),
+            "data/coverage": float(budget["coverage"]),
+            "data/sampling": str(budget["sampling"]),
+        }
+        if extra:
+            values.update(extra)
+        self.set_summary(values)
+
+    def set_summary(self, values: dict) -> None:
+        """Record final run-level scalars (W&B summary), best-effort.
+
+        For values that describe the run as a whole rather than a step —
+        e.g. what the trainer ACTUALLY used and consumed, read back off the
+        backend after it finished rather than from the requested args.
+        """
+        if self.run is None or not values:
+            return
+        try:
+            self.run.summary.update(values)
+        except Exception as e:                                # noqa: BLE001
+            print(f"W&B summary update failed ({type(e).__name__}: {e})")
+
     def log_volume_summary(self, volume_hu, ctx) -> None:
         """Three individual midplane views + HU histogram + summary scalars
         for any backend."""
