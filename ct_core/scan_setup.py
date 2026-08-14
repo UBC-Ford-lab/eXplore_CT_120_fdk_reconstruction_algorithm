@@ -241,7 +241,8 @@ def parse_crop_boundary(scan_folder, xml_header):
     return roi
 
 
-def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None):
+def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None,
+                   verbose=True):
     """
     Construct geometry dict from XML header fields and FOV/voxel parameters.
 
@@ -291,8 +292,17 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None
         'dx': voxel_xy,
         'dz': voxel_z,
         'central_pixel_a': float(xml_header['Series']['CentreOfRotation']),
-        'central_pixel_b': float(xml_header['Series']['CentralSlice'])
+        'central_pixel_b': float(xml_header['Series']['CentralSlice']),
+        # Sub-box of vol_shape to write out, or None for the whole grid. Set
+        # by the drivers that separate the RECONSTRUCTION domain (which must
+        # cover every attenuating thing the rays cross — see ct_core.support)
+        # from the region worth saving. FDK leaves it None because its ROI
+        # already IS its grid.
+        'export_roi': None,
     }
+
+    if not verbose:
+        return geometry
 
     print(f"\nGeometry:")
     print(f"  Source-to-isocenter: {geometry['R_s']:.2f} mm")

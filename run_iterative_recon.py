@@ -30,6 +30,8 @@ from .ct_core.data_budget import classical_budget, measurement_count
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
+    add_model_domain_args,
+    crop_to_export_roi,
     prepare_scan,
     resolve_or_measure_detector_psi,
     run_preflight,
@@ -56,6 +58,7 @@ Examples:
         """
     )
     add_common_args(parser)
+    add_model_domain_args(parser)
 
     # Backend selection
     parser.add_argument(
@@ -301,7 +304,7 @@ def main():
             print(f"PWLS: enabled")
 
     # Shared front half: scan folder, projections, ROI, geometry, downsample.
-    ctx = prepare_scan(args)
+    ctx = prepare_scan(args, fit_domain=True)
 
     # Determine output path
     if args.output:
@@ -453,9 +456,6 @@ def main():
     if hasattr(reconstructor, 'plot_crossval'):
         reconstructor.plot_crossval(output_path)
 
-    # Shared back half: HU calibration + bilateral filter + VFF export.
-    save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
-
     if getattr(reconstructor, 'crossval_metrics', None):
         # replay_steps=False: TIGRE already streamed these live via diag_fn;
         # this call only produces the local/uploaded convergence figure.
@@ -477,9 +477,20 @@ def main():
         except Exception as e:
             print(f"  Final projection diagnostics failed "
                   f"({type(e).__name__}: {e})")
+
+    # Crop AFTER the diagnostics above: forward-projecting the volume has to
+    # see the WHOLE domain — the matter outside the export ROI is precisely
+    # what the domain exists to model, and dropping it would make the
+    # predicted projection disagree with the measurement by construction.
+    vol_export, ctx.geometry = crop_to_export_roi(
+        reconstructor.reconstructed_volume, ctx.geometry)
+
+    # Shared back half: HU calibration + bilateral filter + VFF export.
+    save_outputs(vol_export, ctx, args, output_path)
+
     logger.log_sinogram_preview(ctx.projections)
-    logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
-    logger.log_recon_slices(reconstructor.reconstructed_volume)
+    logger.log_volume_summary(vol_export, ctx)
+    logger.log_recon_slices(vol_export)
     logger.finish()
 
     end = time.time()

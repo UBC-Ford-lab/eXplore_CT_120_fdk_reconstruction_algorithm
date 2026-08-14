@@ -275,6 +275,16 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
         print("\nAborting before any large allocation. Reduce the load "
               "(--downsample, smaller --fov-xy/--fov-z, larger --voxel-xy) "
               "or run on a bigger machine. --skip-preflight overrides.")
+        if ctx is not None and ctx.geometry.get('model_domain'):
+            d = ctx.geometry['model_domain']
+            print(f"  This grid is the MEASURED model domain "
+                  f"({2 * d['x_max']:.0f} mm wide, z {d['z_min']:.0f} to "
+                  f"{d['z_max']:.0f} mm) — the region the projections say has "
+                  f"matter in it.\n"
+                  f"  A larger --voxel-xy/--voxel-z keeps the domain and "
+                  f"costs resolution; --model-domain off keeps the resolution "
+                  f"and reintroduces the truncation bias the domain exists to "
+                  f"remove (a smooth HU offset, not a visible artifact).")
         if logger is not None:
             logger.abort(reason)
         sys.exit(1)

@@ -46,6 +46,12 @@ from .scan_setup import (
     parse_crop_boundary,
     postprocess_and_save,
 )
+from .support import (  # noqa: F401 (crop_to_export_roi re-exported for drivers)
+    crop_to_export_roi,
+    explicit_domain_bounds,
+    measure_attenuating_support,
+    support_to_domain_bounds,
+)
 from .preprocessing import downsample_projections
 from .vff_io import detector_serial_from_scan
 from .wandb_logging import ReconLogger, add_wandb_args  # noqa: F401 (ReconLogger re-exported for drivers)
@@ -295,16 +301,27 @@ class ScanContext:
         return self.data_folder.rstrip('/') + suffix
 
 
-def _parse_roi_bounds(args, scan_folder, xml_header):
-    """Resolve --roi into isocenter-centered bounds (or None)."""
+def _parse_roi_bounds(args, scan_folder, xml_header, required=True):
+    """Resolve --roi into isocenter-centered bounds (or None).
+
+    ``required=False`` (the backends where --roi only crops the OUTPUT) turns
+    a missing SubVolumeCoordinates.xml into a fallback to the full volume
+    rather than an error: saving everything is a harmless default. It stays
+    fatal where --roi defines the reconstruction grid itself (FDK), since
+    silently reconstructing the whole FOV instead is a 6.6x surprise.
+    """
     if args.roi is None:
         return None
     if args.roi == ['auto']:
         roi_bounds = parse_crop_boundary(scan_folder, xml_header)
         if roi_bounds is None:
+            where = os.path.join(scan_folder, 'Volumes', 'SubVolumeCoordinates.xml')
+            if not required:
+                print(f"\n  --roi auto: no SubVolumeCoordinates.xml at {where}"
+                      f"\n  falling back to saving the full reconstruction volume.")
+                return None
             print("Error: SubVolumeCoordinates.xml not found or invalid in scan folder.")
-            print("  Looked in: "
-                  + os.path.join(scan_folder, 'Volumes', 'SubVolumeCoordinates.xml'))
+            print("  Looked in: " + where)
             sys.exit(1)
         return roi_bounds
     if len(args.roi) == 6:
@@ -316,6 +333,59 @@ def _parse_roi_bounds(args, scan_folder, xml_header):
         }
     print("Error: --roi requires 'auto' or exactly 6 values "
           "(x_min x_max y_min y_max z_min z_max)")
+    sys.exit(1)
+
+
+def add_model_domain_args(parser):
+    """`--model-domain`, for backends that FIT the projections.
+
+    Only the iterative and learned families call this. FDK does not have a
+    forward model, so its reconstruction grid can be any sub-box without
+    consequence; SIRT/OS-SART and the learned backends cannot (see
+    ct_core.support for the bias this controls).
+    """
+    parser.add_argument(
+        '--model-domain', dest='model_domain', nargs='+', default=['auto'],
+        metavar='auto|off|EXTENT_XY HALF_Z',
+        help='Region the reconstruction must cover so the forward model is '
+             'complete (default: auto — measured from the projections: the '
+             'outermost detector channel above the air noise floor, clamped '
+             'to the fan and the cone). "off" reverts to the pre-2026-08-14 '
+             'behaviour where the grid is just --roi/--fov (fast, but any '
+             'matter outside it — bed, cage — is forced into the '
+             'reconstruction as a smooth HU bias). Two numbers pin it '
+             'explicitly in muNeRF config units, e.g. "88 29".')
+
+
+def model_domain_enabled(args) -> bool:
+    """Whether --model-domain will replace the grid. Cheap, no data needed.
+
+    Answered BEFORE the geometry is built, because 'off' has to keep the old
+    meaning of --roi (it defines the grid) while any other setting demotes
+    --roi to an export crop.
+    """
+    spec = getattr(args, 'model_domain', None) or ['auto']
+    return not (len(spec) == 1
+                and str(spec[0]).lower() in ('off', 'none', 'false'))
+
+
+def resolve_model_domain(args, projections, geometry, bright_field, dark_field):
+    """`--model-domain` -> bounds dict for build_geometry, or None for 'off'."""
+    spec = getattr(args, 'model_domain', ['auto']) or ['auto']
+    if not model_domain_enabled(args):
+        return None, None
+    if len(spec) == 2:
+        extent_xy, half_z = (float(v) for v in spec)
+        print(f"\nModel domain pinned: extent_xy {extent_xy:.1f} mm, "
+              f"half_extent_z {half_z:.1f} mm")
+        return explicit_domain_bounds(extent_xy, half_z), None
+    if len(spec) == 1 and str(spec[0]).lower() == 'auto':
+        support = measure_attenuating_support(
+            projections, geometry,
+            bright_field=bright_field, dark_field=dark_field)
+        return support_to_domain_bounds(support), support
+    print("Error: --model-domain takes 'auto', 'off', or two numbers "
+          "(EXTENT_XY HALF_Z)")
     sys.exit(1)
 
 
@@ -351,12 +421,18 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
     return geometry
 
 
-def prepare_scan(args) -> ScanContext:
+def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     """Run the algorithm-independent front half of every reconstruction.
 
     Resolves the scan folder, loads projections + flat fields, parses the
     ROI, builds the geometry dict, and (optionally) downsamples the detector
     — identically for every backend.
+
+    ``fit_domain=True`` (the backends that FIT the projections: iterative and
+    learned) additionally measures the attenuating support and makes THAT the
+    reconstruction grid, demoting --roi to an export crop. FDK leaves it False:
+    it filters the full-width projections and backprojects into whatever grid
+    it is given, so its ROI never enters a forward model.
     """
     data_folder = args.data_folder
 
@@ -380,12 +456,21 @@ def prepare_scan(args) -> ScanContext:
     bright_field = scan_data['bright_field']
     dark_field = scan_data['dark_field']
 
-    roi_bounds = _parse_roi_bounds(args, scan_folder, scan_data['xml_header'])
+    # With a model domain, --roi selects what to SAVE and the grid comes from
+    # the measured support; without one (FDK, or --model-domain off), --roi IS
+    # the grid and keeps its original meaning.
+    use_domain = fit_domain and model_domain_enabled(args)
+    roi_bounds = _parse_roi_bounds(args, scan_folder, scan_data['xml_header'],
+                                   required=not use_domain)
 
     geometry = build_geometry(
         scan_data['xml_header'],
         args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
-        roi_bounds=roi_bounds,
+        roi_bounds=None if use_domain else roi_bounds,
+        # Under a model domain this grid is provisional — it exists only to
+        # carry the detector parameters into the support measurement, and is
+        # replaced below. Printing it would advertise a volume nobody uses.
+        verbose=not use_domain,
     )
 
     apply_cor_policy(geometry, projections.shape[1], projections.shape[2],
@@ -410,6 +495,31 @@ def prepare_scan(args) -> ScanContext:
         for key in ('central_pixel_a', 'central_pixel_b',
                     'central_pixel_a_xml', 'central_pixel_b_xml'):
             geometry[key] = (geometry[key] - (factor - 1) / 2.0) / factor
+
+    # ---- reconstruction domain (fitting backends only) --------------------
+    # Deliberately AFTER downsampling and the COR policy: the measurement
+    # reads detector channels, so it needs the da/db/central_pixel_* that the
+    # reconstruction will actually use.
+    if use_domain:
+        domain_bounds, support = resolve_model_domain(
+            args, projections, geometry, bright_field, dark_field)
+        if domain_bounds is not None:
+            domain_geom = build_geometry(
+                scan_data['xml_header'],
+                args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
+                roi_bounds=domain_bounds)
+            for key in ('vol_shape', 'vol_origin'):
+                geometry[key] = domain_geom[key]
+            geometry['model_domain'] = domain_bounds
+            geometry['model_domain_support'] = support
+            Nx, Ny, Nz = geometry['vol_shape']
+            print(f"  reconstruction grid: {Nx} x {Ny} x {Nz} = "
+                  f"{Nx * Ny * Nz / 1e6:.1f} M voxels")
+        # --roi now selects the sub-box to WRITE, not what to reconstruct.
+        geometry['export_roi'] = roi_bounds
+        if roi_bounds is None:
+            print("  export: full reconstruction domain "
+                  "(pass --roi auto to save only the scan's ROI)")
 
     return ScanContext(
         data_folder=data_folder,
@@ -592,7 +702,17 @@ def resolve_or_measure_detector_psi(ctx: ScanContext, verbose=True,
 # --------------------------------------------------------------------------
 
 def save_outputs(volume, ctx: ScanContext, args, output_path: str) -> str:
-    """HU calibration + optional bilateral filter + VFF export."""
+    """Crop to the export ROI, then HU-calibrate, filter and write the VFF.
+
+    The crop happens BEFORE calibration on purpose: the two-point HU fit reads
+    air and tissue peaks out of the volume, and it should read them from the
+    voxels being shipped, not from a domain padded out with bed and cage.
+
+    ScanContext.geometry is updated to describe the cropped grid so the VFF
+    header and every downstream plot agree with the pixels. No-op when no
+    export ROI is set.
+    """
+    volume, ctx.geometry = crop_to_export_roi(volume, ctx.geometry)
     return postprocess_and_save(
         volume=volume,
         geometry=ctx.geometry,

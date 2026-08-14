@@ -31,6 +31,8 @@ from .learning_based_iterative.detector_warp import resolve_detector_warp
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
+    add_model_domain_args,
+    crop_to_export_roi,
     prepare_scan,
     resolve_or_measure_detector_psi,
     run_preflight,
@@ -57,6 +59,7 @@ Examples:
         """
     )
     add_common_args(parser)
+    add_model_domain_args(parser)
 
     parser.add_argument('--algorithm', default='voxel',
                         choices=SUPPORTED_LEARNED_ALGORITHMS,
@@ -150,7 +153,7 @@ def main():
           f"lr: {args.lr}")
 
     # Shared front half: scan folder, projections, ROI, geometry, downsample.
-    ctx = prepare_scan(args)
+    ctx = prepare_scan(args, fit_domain=True)
 
     if args.output:
         output_path = args.output
@@ -294,14 +297,20 @@ def main():
                'data/rays_per_batch': reconstructor.rays_per_batch,
                'data/rays_per_batch_mode': 'auto' if auto_batch else 'pinned'})
 
+    # Crop the reconstruction domain down to what is worth saving, THEN
+    # calibrate and export. Everything downstream reports the delivered
+    # volume, not the padded domain the optimizer needed.
+    vol_export, ctx.geometry = crop_to_export_roi(
+        reconstructor.reconstructed_volume, ctx.geometry)
+
     # Shared back half: HU calibration + bilateral filter + VFF export.
-    save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
+    save_outputs(vol_export, ctx, args, output_path)
 
     # replay_steps=False: the trainer already streamed these live via diag_fn.
     logger.log_convergence(reconstructor.crossval_history, replay_steps=False)
     logger.log_sinogram_preview(ctx.projections)
-    logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
-    logger.log_recon_slices(reconstructor.reconstructed_volume)
+    logger.log_volume_summary(vol_export, ctx)
+    logger.log_recon_slices(vol_export)
     logger.finish()
 
     end = time.time()

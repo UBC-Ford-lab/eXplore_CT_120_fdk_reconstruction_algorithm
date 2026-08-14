@@ -127,6 +127,81 @@ older GPUs (P100 and earlier) warn once and continue eagerly rather than
 failing the run. `--compile max-autotune` benchmarks kernel variants at
 compile time; minutes of extra startup, worth it only for long runs.
 
+## Reconstruction domain vs export ROI (iterative + learned)
+
+A detector pixel measures ∫μ ds along the **whole** ray — through the animal,
+the bed, the cage. A backend that *fits* that measurement (SIRT, OS-SART, the
+learned family) can only reproduce it if its volume covers everything the ray
+crossed. Reconstruct a smaller box and the missing attenuation does not go
+away:
+
+```
+measured        p = A_dom·x_dom + A_out·x_out
+your model          A_dom·x
+least squares   x = x_true + A_dom⁺(A_out·x_out)
+```
+
+That second term is "reconstruct the cage, but you may only put it inside the
+box" — a smooth, low-frequency cup across the **entire** reconstruction, not a
+boundary artifact. On Scan_1510 it is ≈ **96 HU of DC bias**, with individual
+rays demanding 400–480 HU. Edges survive it; the HU scale does not, so it is
+invisible by eye and lethal to a histogram.
+
+**FDK is exempt.** It filters the full-width projections and then backprojects
+into whatever grid you ask for, so its `--roi` never enters a forward model —
+it is purely an output crop. That is why the auto domain is on by default for
+the iterative and learned drivers only, and why the vendor's own volume is an
+ROI-shaped crop of a full-FOV FDK.
+
+So those two drivers separate the two boxes:
+
+| | what it is | set by |
+|---|---|---|
+| **reconstruction domain** | region the forward model must cover | `--model-domain` (default `auto`) |
+| **export ROI** | region written to the VFF | `--roi` (default: the whole domain) |
+
+`--model-domain auto` measures the support from the projections themselves:
+the outermost detector channel above the air noise floor, converted to mm at
+isocentre, then clamped by two hardware limits — the **fan** (nothing outside
+it is measurable) and the **cone** (no ray reaches beyond it, so voxels past
+it can never receive a gradient; on Scan_1510's old `fov_z 120` default that
+was 347 M of 576 M parameters, dead but still carrying 4× Adam state). Every
+ambiguous case widens the domain, never narrows it — a domain is only ever
+wrong for being too small. On Scan_1510:
+
+```
+Attenuating support measured from the projections:
+  16 views sampled
+  transaxial: radius 40.63 mm at isocentre (outermost shadow 39.63 mm
+              + 1.0 mm margin, threshold 0.0890; detector reaches 43.76 mm)
+  axial:      z in [-31.63, 31.63] mm (object runs past both ends —
+              cone-limited; cone reaches +-31.63 mm)
+  reconstruction grid: 1083 x 1083 x 844 = 989.9 M voxels
+```
+
+which independently reproduces the `extent_xy: 88.0 / half_extent_z: 29.0`
+pinned by hand in muNeRF's `configs/scan_1510_h100_base.yaml`.
+
+Overrides: `--model-domain off` reverts to the old behaviour (grid = `--roi`
+/`--fov`), and `--model-domain 88 29` pins it in muNeRF's config units
+(`EXTENT_XY HALF_Z`).
+
+**The domain costs memory** — it is the honest size of the problem, and it is
+routinely several times the ROI. Preflight sizes it before anything is
+allocated and says so. A larger `--voxel-xy`/`--voxel-z` keeps the domain and
+costs resolution; `--model-domain off` keeps the resolution and puts the bias
+back.
+
+**Export.** `--roi auto` writes only the scan's `SubVolumeCoordinates.xml`
+box; six numbers write that box; no `--roi` writes the whole domain. When
+`--roi auto` finds no XML these drivers fall back to writing the full volume
+(for FDK it stays an error, since there `--roi` decides what is *computed*).
+The crop happens **before** HU calibration, so the two-point fit reads air and
+tissue from the voxels being shipped rather than from a domain padded out with
+bed and cage — and before the plots, so every figure shows the delivered
+volume. The forward-projection diagnostics run *before* the crop, on the whole
+domain, because that is the projection the measurement should be compared to.
+
 ## Geometry self-calibration (standard, all backends)
 
 The detector in-plane rotation (psi) is calibrated automatically for every
@@ -301,7 +376,8 @@ Run `--help` for full argument lists.
 | `--bone-bhc-threshold` | 1500 | HU threshold for bone segmentation |
 | `--bone-bhc-hu` | 3100 | Monochromatic bone HU (from scan.xml `BoneHU`) |
 | `--ring-correction` | on | Sinogram-space ring artifact correction |
-| `--roi auto` | off | ROI from SubVolumeCoordinates.xml |
+| `--roi auto` | off | ROI from SubVolumeCoordinates.xml (FDK: the grid; iterative/learned: the export crop) |
+| `--model-domain` | `auto` | Iterative/learned: region the forward model must cover, measured from the projections (`off` / `EXTENT_XY HALF_Z`) |
 | `--rays-per-batch` | `auto` | Learned backend: batch sized from free VRAM |
 | `--compile` | `off` | Learned backend: fuse renderer kernels (needs sm_70+) |
 
