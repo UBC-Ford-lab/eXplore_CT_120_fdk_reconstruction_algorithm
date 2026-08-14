@@ -63,6 +63,7 @@ class VoxelReconstructor:
                  mu_water: float | None = None,
                  bhc_coeffs=None,
                  ring_correction: bool = False,
+                 air_normalization: bool = True,
                  ring_median_width: int = 51,
                  crossval: bool = True,
                  holdout_index: int | None = None,
@@ -95,6 +96,7 @@ class VoxelReconstructor:
         self.mu_water = mu_water
         self.bhc_coeffs = bhc_coeffs
         self.ring_correction = bool(ring_correction)
+        self.air_normalization = bool(air_normalization)
         self.ring_median_width = int(ring_median_width)
         self.crossval = bool(crossval)
         self.holdout_index = holdout_index
@@ -155,6 +157,7 @@ class VoxelReconstructor:
             self.projections, self.bright_field, self.dark_field,
             bhc_coeffs=self.bhc_coeffs,
             ring_correction=self.ring_correction,
+            air_normalization=self.air_normalization,
             ring_median_width=self.ring_median_width,
         )
 
@@ -196,17 +199,16 @@ class VoxelReconstructor:
                        else scene.n_angles // 2)
             n_b, n_a = scene.detector_shape
             ds = self.diag_downsample
-            # Only rows whose rays stay inside the reconstruction z-slab —
-            # outer rows integrate through matter outside the domain and
-            # would score FOV truncation, not the model (same band as the
-            # noise ceiling and the classical backends' final diag).
-            from ...ct_core.projection_diag import covered_detector_rows
-            b0, b1 = covered_detector_rows(self.geometry)
-            b0, b1 = max(0, b0), min(n_b, b1)
-            if b1 - b0 < 16:
-                b0, b1 = 0, n_b
+            # Only the detector window whose rays stay inside the domain —
+            # outer rows exit the z-slab and outer columns miss the FOV
+            # cylinder entirely, so both integrate through matter the volume
+            # does not contain and would score FOV truncation, not the model
+            # (same window as the noise ceiling and the classical backends'
+            # final diag).
+            from ...ct_core.projection_diag import covered_detector_window
+            b0, b1, a0, a1 = covered_detector_window(self.geometry, n_b, n_a)
             hb_keep = torch.arange(b0, b1, ds, device=device)
-            ha_keep = torch.arange(0, n_a, ds, device=device)
+            ha_keep = torch.arange(a0, a1, ds, device=device)
             hbb, haa = torch.meshgrid(hb_keep, ha_keep, indexing="ij")
             hb, ha = hbb.reshape(-1), haa.reshape(-1)
             hidx = torch.full_like(hb, holdout)
@@ -217,8 +219,10 @@ class VoxelReconstructor:
                     else "kept in training (diagnostic; pass withhold_eval "
                          "for true validation)")
             print(f"  Evaluation projection {holdout} — {mode}; rendered "
-                  f"{h_shape[0]}x{h_shape[1]} (stride {ds}), eval every "
-                  f"{self.eval_every}, patience {self.patience}")
+                  f"{h_shape[0]}x{h_shape[1]} (stride {ds}) from detector "
+                  f"rows [{b0}, {b1}) of {n_b} and columns [{a0}, {a1}) of "
+                  f"{n_a}, eval every {self.eval_every}, patience "
+                  f"{self.patience}")
 
             def _render_eval() -> torch.Tensor:
                 pred = torch.empty(h_o.shape[0], device=device)

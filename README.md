@@ -9,14 +9,63 @@ currently a dense voxel grid).
 ## Pipeline
 
 ```
-Raw projections → flat-field + log → BHC → ring correction
+Raw projections → flat-field + log → BHC → air normalization → ring correction
   → FDK: cone-weight + ramp filter + Parker + backprojection
     OR iterative: ASTRA SIRT / TIGRE OS-SART
   → [bone BHC (FDK only): segment → forward-project → re-reconstruct]
   → physics HU → two-point calibration (air→-1000, water→0) → VFF
 ```
 
-BHC (water, 80 kVp) and ring correction are on by default. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula) — self-calibrating regardless of filter or BHC settings.
+BHC (water, 80 kVp), air normalization and ring correction are on by default. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula) — self-calibrating regardless of filter or BHC settings.
+
+### Air normalization (`--air-normalization`, default on)
+
+An object-free ray must read `p = -ln(I/I_0) = 0`. On Scan_1510 it does not:
+the never-shadowed columns sit at **-0.012** on average and drift from -0.002
+to -0.025 across the scan, almost perfectly linearly in frame index (residual
+sd 0.0025 after a straight-line fit). That is source/detector gain drift over
+the scan duration — the same ~2% the conjugate-ray audit found.
+
+Subtracting one number per projection is the *exact* inverse, not a fudge.
+Drift is multiplicative in intensity, so a true flux of `g*I_0` gives
+
+```
+p_measured = -ln(I / I_0) = p_true - ln g
+```
+
+— a constant additive offset on every ray of that frame, whatever it passed
+through. Measured effect on Scan_1510 (ds3, 127 object-free columns):
+
+| | air level | frame-to-frame spread | object band |
+|---|---|---|---|
+| off | -0.01191 | 0.01753 | 0.13913 |
+| on | +0.00042 | 0.00046 | 0.15128 |
+
+It is orthogonal to ring correction — one is a per-frame scalar, the other a
+static per-column pattern, and ring correction's 51-px median smoothing does
+not touch the former. It runs first, so the ring profile is estimated from
+time-consistent frames.
+
+**This changes absolute HU.** Every line integral rises by the removed offset
+(+8.7% on the object band here), so reconstructed mu and HU rise with it.
+That is the point — the old level was set by an uncorrected air offset — but
+it means numbers from earlier runs are not comparable. `--no-air-normalization`
+is the exact revert path.
+
+Two limits worth knowing. A **static lateral profile** (span 0.016 on
+Scan_1510) survives this and is deliberately left alone: a per-frame scalar is
+provably the inverse of gain drift, whereas removing a lateral shape means
+extrapolating from the margins to underneath the object, where the physical
+cause is not established. And a scan whose object fills the detector has no
+air reference — the correction reports that it skipped rather than inventing
+an offset.
+
+Unrelated but discovered alongside: preprocess's soft upper transmission clamp
+is a softplus that stays slightly active below its 1.05 knee, so it perturbs
+every transmission above 0.65 — adding **+0.0016** to a `p = 0` air ray and
++0.005 to a `p = -0.025` one. It is static and negligible above `p ~ 0.05`, so
+it does not drift or distort the object, but it is why the air level after
+preprocessing settles at +0.0004 rather than exactly 0.
 
 ## Structure
 
@@ -283,9 +332,23 @@ line integrals: the other acquisition phase when the scan has one (e.g.
 acq-01 frames), else the neighbouring projection (conservative), and is
 printed, logged per-step for chart overlay, and drawn into the heatmap's
 ceiling panel and the power spectrum's noise floor. All projection
-diagnostics are restricted to the detector rows whose rays stay inside the
-reconstruction z-slab — outer rows integrate through matter the volume does
-not contain and would score FOV truncation, not the reconstruction.
+diagnostics — including the noise ceiling, so both sides are measured on the
+same pixels — are restricted to the **covered detector window**
+(`covered_detector_window`): the rows whose rays stay inside the
+reconstruction z-slab, and the columns whose rays cross the in-plane FOV
+cylinder. Outside it the forward projection is exactly zero by construction,
+so comparing there scores FOV truncation rather than the reconstruction. The
+crop is reported in the run log, e.g. `rows [0, 765) of 765 and columns
+[39, 1128) of 1166`. How much it removes depends entirely on the grid: ~7% of
+the detector width for a measured `--model-domain` (r = 40.6 mm on Scan_1510),
+but ~72% for an FDK run on a small `--roi` grid (r = 12.4 mm), where the
+volume simply does not extend under most of the fan.
+
+Note this fixes only the columns the model *cannot* predict. Air columns
+*inside* the domain can still score badly for a different reason: SSIM's
+luminance term is a ratio of local means, so where the true signal is ~0 it
+is dominated by whatever residual offset flat-fielding left behind, and a
+`mu >= 0` model cannot follow a measured air level that sits below zero.
 By default the evaluation projection **stays in** the reconstruction
 (diagnostic); pass `--withhold-eval` to remove it from the input and turn
 the diag metrics into true held-out validation. With `--wandb`, the
@@ -375,7 +438,8 @@ Run `--help` for full argument lists.
 | `--bone-bhc` | off | Two-pass bone BHC (Joseph & Spital, FDK only) |
 | `--bone-bhc-threshold` | 1500 | HU threshold for bone segmentation |
 | `--bone-bhc-hu` | 3100 | Monochromatic bone HU (from scan.xml `BoneHU`) |
-| `--ring-correction` | on | Sinogram-space ring artifact correction |
+| `--ring-correction` | on | Sinogram-space ring artifact correction (static per-COLUMN pattern) |
+| `--air-normalization` | on | Per-projection air level from object-free columns (per-FRAME scalar) |
 | `--roi auto` | off | ROI from SubVolumeCoordinates.xml (FDK: the grid; iterative/learned: the export crop) |
 | `--model-domain` | `auto` | Iterative/learned: region the forward model must cover, measured from the projections (`off` / `EXTENT_XY HALF_Z`) |
 | `--rays-per-batch` | `auto` | Learned backend: batch sized from free VRAM |

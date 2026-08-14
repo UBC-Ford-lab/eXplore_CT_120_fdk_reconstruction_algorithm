@@ -269,6 +269,7 @@ def main():
         metal_artifact_reduction=args.metal_artifact_reduction,
         mar_threshold=args.mar_threshold,
         ring_correction=args.ring_correction,
+        air_normalization=args.air_normalization,
         ring_median_width=args.ring_median_width,
         bhc_coeffs=args.bhc_coeffs,
         bone_bhc=args.bone_bhc,

@@ -139,7 +139,8 @@ class ASTRAReconstructor:
                  upper_clamp_value=1.05,
                  mu_water=None, output_hu=True,
                  bhc_coeffs=None,
-                 ring_correction=False, ring_median_width=51):
+                 ring_correction=False, ring_median_width=51,
+                 air_normalization=True):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -199,6 +200,7 @@ class ASTRAReconstructor:
         # BHC and ring correction
         self.bhc_coeffs = bhc_coeffs
         self.ring_correction = ring_correction
+        self.air_normalization = air_normalization
         self.ring_median_width = ring_median_width
 
         self.reconstructed_volume = None
@@ -224,6 +226,7 @@ class ASTRAReconstructor:
             chunk_angles=chunk_angles,
             bhc_coeffs=self.bhc_coeffs,
             ring_correction=self.ring_correction,
+            air_normalization=self.air_normalization,
             ring_median_width=self.ring_median_width,
         )
 

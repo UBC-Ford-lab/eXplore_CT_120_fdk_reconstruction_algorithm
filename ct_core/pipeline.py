@@ -229,6 +229,25 @@ def add_common_args(parser):
         help='Disable ring artifact correction.'
     )
     parser.add_argument(
+        '--air-normalization',
+        action='store_true',
+        default=True,
+        dest='air_normalization',
+        help='Level each projection on its object-free air columns (default: '
+             'on). Removes the source gain drift over the scan — a constant '
+             'additive offset per frame in the log domain, ~0.023 across '
+             'Scan_1510 — which otherwise makes the same physical ray '
+             'inconsistent between the start and end of a short scan.'
+    )
+    parser.add_argument(
+        '--no-air-normalization',
+        action='store_false',
+        dest='air_normalization',
+        help='Disable air normalization (the pre-2026-08-14 behaviour; use it '
+             'to reproduce older runs, whose absolute HU level was set by an '
+             'uncorrected air offset).'
+    )
+    parser.add_argument(
         '--ring-median-width',
         type=int,
         default=51,
@@ -296,6 +315,11 @@ class ScanContext:
     total_angle: float = 0.0
     downsample: int = 1
     detector_psi: Optional[dict] = field(default=None)
+    # Carried on the context rather than threaded through every diagnostic
+    # signature so the noise-ceiling frames are levelled exactly like the
+    # sinogram the backend trains on — an unlevelled ceiling would be
+    # compared against a levelled reconstruction.
+    air_normalization: bool = True
 
     def default_output_path(self, suffix: str = '_recon') -> str:
         return self.data_folder.rstrip('/') + suffix
@@ -534,6 +558,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         roi_bounds=roi_bounds,
         total_angle=scan_data['total_angle'],
         downsample=factor,
+        air_normalization=bool(getattr(args, 'air_normalization', True)),
     )
 
 

@@ -266,6 +266,7 @@ class TIGREReconstructor:
                  mu_water=None, output_hu=True,
                  bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51,
+                 air_normalization=True,
                  crossval=True, holdout_index=None,
                  withhold_eval=False,
                  eval_every=10, patience=3,
@@ -435,6 +436,7 @@ class TIGREReconstructor:
         # BHC and ring correction
         self.bhc_coeffs = bhc_coeffs
         self.ring_correction = ring_correction
+        self.air_normalization = air_normalization
         self.ring_median_width = ring_median_width
 
         # Evaluation projection (crossval machinery)
@@ -601,6 +603,7 @@ class TIGREReconstructor:
             upper_clamp_value=self.upper_clamp_value,
             bhc_coeffs=self.bhc_coeffs,
             ring_correction=self.ring_correction,
+            air_normalization=self.air_normalization,
             ring_median_width=self.ring_median_width,
         )
 
@@ -886,18 +889,22 @@ class TIGREReconstructor:
                 cv_psnr.append(psnr)
                 cv_mse.append(mse)
                 if self.diag_fn is not None:
-                    # Columns back to the FDK detector convention, rows cut
-                    # to the band covered by the reconstruction z-slab (the
-                    # same band the noise ceiling and the other backends'
-                    # diagnostics use — outer rows score FOV truncation, not
-                    # the reconstruction).
-                    from ...ct_core.projection_diag import covered_detector_rows
-                    b0, b1 = covered_detector_rows(self.geometry)
-                    b0, b1 = max(0, b0), min(pred.shape[0], b1)
-                    if b1 - b0 < 16:
-                        b0, b1 = 0, pred.shape[0]
-                    self.diag_fn(pred[b0:b1, ::-1],
-                                 holdout_proj[b0:b1, ::-1], i_done)
+                    # Columns back to the FDK detector convention, then cut to
+                    # the detector window covered by the reconstruction domain
+                    # (the same window the noise ceiling and the other
+                    # backends' diagnostics use — outer rows leave the z-slab
+                    # and outer columns miss the FOV cylinder, so both score
+                    # FOV truncation, not the reconstruction).
+                    #
+                    # The [::-1] MUST come first: a0/a1 are ct_core column
+                    # indices (they are derived from geometry's
+                    # central_pixel_a) and this sinogram is still in TIGRE's
+                    # reversed column order until the flip undoes it.
+                    from ...ct_core.projection_diag import covered_detector_window
+                    b0, b1, a0, a1 = covered_detector_window(
+                        self.geometry, pred.shape[0], pred.shape[1])
+                    self.diag_fn(pred[b0:b1, ::-1][:, a0:a1],
+                                 holdout_proj[b0:b1, ::-1][:, a0:a1], i_done)
                 elif self.log_fn is not None:
                     self.log_fn({"diag/ssim": ssim, "diag/psnr": psnr,
                                  "diag/mse": mse}, i_done)

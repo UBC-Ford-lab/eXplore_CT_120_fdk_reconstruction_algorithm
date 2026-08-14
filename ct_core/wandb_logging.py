@@ -233,6 +233,7 @@ def sanitized_config(ctx, args, algorithm: str, params: dict | None) -> dict:
         "downsample": int(getattr(ctx, "downsample", 1) or 1),
         "bhc_coeffs": list(args.bhc_coeffs) if getattr(args, "bhc_coeffs", None) else None,
         "ring_correction": bool(getattr(args, "ring_correction", False)),
+        "air_normalization": bool(getattr(args, "air_normalization", True)),
     }
     for key in _GEOMETRY_KEYS:
         if key in ctx.geometry:

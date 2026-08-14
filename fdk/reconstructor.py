@@ -7,7 +7,8 @@ import os
 import sys
 
 from ..ct_core.calibration import default_mu_water, mu_to_hu
-from ..ct_core.preprocessing import apply_bhc, ring_artifact_correction
+from ..ct_core.preprocessing import (air_normalize_sinogram, apply_bhc,
+                                     ring_artifact_correction)
 
 # Device: use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,6 +133,7 @@ class FDKReconstructor:
                  filter_type='cosine', parker_weighting=True,
                  metal_artifact_reduction=False, mar_threshold=6.0,
                  ring_correction=False, ring_median_width=51,
+                 air_normalization=True,
                  bhc_coeffs=None,
                  bone_bhc=False, bone_bhc_threshold=1500, bone_bhc_hu=3100):
         """
@@ -244,6 +246,7 @@ class FDKReconstructor:
         self.metal_artifact_reduction = metal_artifact_reduction
         self.mar_threshold = mar_threshold
         self.ring_correction = ring_correction
+        self.air_normalization = air_normalization
         self.ring_median_width = ring_median_width
         self.bhc_coeffs = bhc_coeffs
         self.bone_bhc = bone_bhc
@@ -589,6 +592,9 @@ class FDKReconstructor:
             print(f"Ramp filter κ (filter_kernel.max) = {float(filter_kernel.max()):.4f} mm⁻¹")
         if self.metal_artifact_reduction:
             print(f"Metal artifact reduction: enabled (threshold={self.mar_threshold:.1f})")
+        if self.air_normalization:
+            print("Air normalization: enabled (per-projection offset from "
+                  "object-free columns)")
         if self.ring_correction:
             print(f"Ring correction: enabled (median width={self.ring_median_width})")
         if self.bhc_coeffs is not None:
@@ -704,6 +710,15 @@ class FDKReconstructor:
             # Free flat-field GPU memory
             del dark_gpu, I0_gpu
             torch.cuda.empty_cache()
+
+            # --- Air normalization on full sinogram (if enabled) ---
+            # FDK does its own fused flat-field+log on the GPU rather
+            # than calling preprocess_sinogram, so the correction has to
+            # be applied here too — same function, same place in the
+            # order (before ring correction), so every backend sees the
+            # same line integrals.
+            if self.air_normalization:
+                air_normalize_sinogram(float_projections)
 
             # --- Ring correction on full sinogram (if enabled) ---
             if self.ring_correction:

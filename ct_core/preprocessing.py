@@ -85,12 +85,90 @@ def downsample_projections(arr, factor):
     ).mean(axis=(2, 4))
 
 
+def air_normalize_sinogram(sinogram, max_air_p=0.05, verbose=True):
+    """Per-projection gain normalization from object-free detector margins.
+
+    An object-free ray must read p = -ln(I/I_0) = 0. On Scan_1510 it does not:
+    the air columns sit at -0.014 on average and drift from -0.002 to -0.025
+    across the scan, almost perfectly linearly in frame index (residual sd
+    0.0025 after a straight-line fit) — a source/detector gain drift over the
+    scan duration, the same ~2% the conjugate-ray audit found.
+
+    Subtraction is the exact inverse, not a fudge. Drift is multiplicative in
+    intensity, so if the true incident flux is g*I_0 instead of I_0 then
+
+        p_measured = -ln(I / I_0) = p_true - ln g
+
+    — a CONSTANT additive offset on every ray of that frame, whatever the ray
+    passed through. One number per projection removes it exactly.
+
+    Left uncorrected it costs twice over: the same physical ray is
+    inconsistent between the start and end of a short scan (the suspected
+    cause of Scan_1510's lateral shading), and every projection diagnostic is
+    scored against an air level a non-negative density cannot reach — SSIM's
+    luminance term is a ratio of local means, so a rendered 0 against a
+    measured -0.02 collapses to ~0 even though the absolute error is tiny.
+
+    Air columns are found robustly: columns whose 95th-percentile attenuation
+    (over all supplied projections, central row band) stays below the ABSOLUTE
+    threshold ``max_air_p`` — i.e. never shadowed by the object. The
+    per-projection offset is the median over (air columns x central rows),
+    which is immune to the odd hot pixel.
+
+    muNeRF's version instead thresholds at ``min(8th percentile of the column
+    statistic, max_air_p)``. That is a RANK criterion, and it biases: picking
+    the lowest-scoring 8% of columns preferentially picks the ones with
+    downward noise excursions, so the estimated offset comes out too negative.
+    Measured on a synthetic sinogram with sigma = 0.01, the bias was -3.7e-4
+    on a true offset of -0.015. The absolute threshold has no such bias — at
+    Scan_1510's noise level 0.05 sits ~6 sigma above air, so every genuine air
+    column passes regardless of its noise, and no selection happens at all.
+
+    A residual STATIC lateral profile (span 0.016 on Scan_1510) survives this
+    and is deliberately left alone: a per-frame scalar is provably the inverse
+    of gain drift, whereas removing a lateral shape means extrapolating from
+    the margins to underneath the object, where its physical cause (beam
+    profile? scatter?) is not established and a wrong guess would bias the
+    reconstructed HU of the only region that matters.
+
+    In-place on ``sinogram``; returns the (N_angles,) offsets for logging.
+    """
+    sino = np.asarray(sinogram)
+    n_p, n_b, n_a = sino.shape
+    # Central rows only: the outer cone is where scatter and the slab edges
+    # live, and it is not where the offset is best measured.
+    half = max(1, n_b // 8)
+    band = slice(max(0, n_b // 2 - half), min(n_b, n_b // 2 + half))
+    sub = sino[:, band, :]
+    flat = sub.reshape(-1, n_a)
+
+    col_hi = np.percentile(flat, 95.0, axis=0)
+    air_cols = np.nonzero(col_hi <= float(max_air_p))[0]
+    if air_cols.size < 8:
+        if verbose:
+            print(f"  [air-norm] SKIPPED: only {air_cols.size} object-free "
+                  f"columns found (need >=8) — the object fills the detector, "
+                  f"so there is no air reference to level against")
+        return np.zeros(n_p, dtype=np.float32)
+
+    offsets = np.median(sub[:, :, air_cols].reshape(n_p, -1),
+                        axis=1).astype(np.float32)
+    sino -= offsets[:, None, None]
+    if verbose:
+        print(f"  Air normalization: {air_cols.size} object-free columns; "
+              f"per-projection offset [{offsets.min():+.5f}, "
+              f"{offsets.max():+.5f}], drift removed "
+              f"{offsets.max() - offsets.min():.5f}")
+    return offsets
+
+
 def preprocess_sinogram(projections, bright_field, dark_field,
                         clamp_mode='none', soft_clip_transmission=True,
                         soft_clip_sharpness=50.0, upper_clamp=True,
                         upper_clamp_value=1.05, chunk_angles=20,
                         bhc_coeffs=None,
-                        ring_correction=False, ring_median_width=51):
+                        ring_correction=False, ring_median_width=51,
+                        air_normalization=True):
     """
     Apply flat-field correction, log transform, BHC, and ring correction.
 
@@ -112,6 +190,12 @@ def preprocess_sinogram(projections, bright_field, dark_field,
             Applied after log transform: p_corrected = c1*p + c2*p^2 + ...
         ring_correction: Apply sinogram-space ring artifact correction
         ring_median_width: Median filter width for ring correction (odd int)
+        air_normalization: Subtract each projection's object-free air level
+            (default True). See air_normalize_sinogram — this is the source
+            gain drift over the scan, and it is orthogonal to ring
+            correction: one is a per-frame scalar, the other a static
+            per-column pattern, and ring correction's median smoothing does
+            not touch the former.
 
     Returns:
         np.ndarray of line integrals, shape (N_angles, N_b, N_a), float32
@@ -124,6 +208,8 @@ def preprocess_sinogram(projections, bright_field, dark_field,
     if bhc_coeffs is not None:
         coeff_str = ", ".join(f"c{k+1}={c:.6f}" for k, c in enumerate(bhc_coeffs))
         print(f" + BHC ({coeff_str})", end="")
+    if air_normalization:
+        print(" + air normalization", end="")
     if ring_correction:
         print(f" + ring correction (width={ring_median_width})", end="")
     print(" ...")
@@ -199,6 +285,16 @@ def preprocess_sinogram(projections, bright_field, dark_field,
         chunk = apply_bhc(chunk, bhc_coeffs)
 
         sinogram[start:end] = chunk
+
+    # Air normalization BEFORE ring correction: the ring profile is meant to
+    # estimate a static detector pattern, so it should see time-consistent
+    # frames rather than absorb the scan's gain drift into its column medians.
+    # (Both orders happen to land within ~1e-4 here, since ring correction
+    # subtracts only the unsmoothed part of the profile and a per-frame scalar
+    # is uniform across columns — but this order is the one that means what it
+    # says.)
+    if air_normalization:
+        air_normalize_sinogram(sinogram)
 
     # Ring correction (needs full sinogram — applied after chunked loop)
     if ring_correction:

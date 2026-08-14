@@ -179,11 +179,19 @@ def preprocess_frames(frames: np.ndarray, ctx, bhc_coeffs=None) -> np.ndarray:
     backends' own preprocessing. Ring correction is deliberately skipped: the
     ring pattern is a STATIC detector column offset, identical on both sides
     of every noise-ceiling pair, so it cancels in the comparison.
+
+    Air normalization is deliberately KEPT, for the mirror-image reason: the
+    gain offset is per-frame, so it does NOT cancel — the two phases of a
+    noise-ceiling pair are acquired at different times and drift apart by up
+    to 0.023 on Scan_1510. Leaving it in would inflate the MSE floor with a
+    constant the model is not being asked to reproduce, and would score the
+    reconstruction against an air level its own sinogram no longer has.
     """
     from .preprocessing import preprocess_sinogram
     return preprocess_sinogram(
         np.ascontiguousarray(frames, dtype=np.float32),
         ctx.bright_field, ctx.dark_field, bhc_coeffs=bhc_coeffs,
+        air_normalization=bool(getattr(ctx, 'air_normalization', True)),
     )
 
 
@@ -255,14 +263,18 @@ def measure_noise_ceiling(ctx, eval_index: int, phase: str = "00",
         conservative = True
 
     pp = preprocess_frames(np.stack([p0_raw, pair_raw]), ctx, bhc_coeffs)
-    # Same covered-row band as every other diagnostic in this module, so the
-    # ceiling is measured on exactly the rows the recon is scored on (and so
-    # the stored pair aligns row-for-row with rendered predictions).
+    # Same covered window as every other diagnostic in this module, so the
+    # ceiling is measured on exactly the pixels the recon is scored on (and so
+    # the stored pair aligns pixel-for-pixel with rendered predictions).
+    # This matters more than it looks: outside the window the ceiling compares
+    # two MEASUREMENTS, which share the flat field's residual air offset, while
+    # the model — whose density cannot go negative — is structurally barred
+    # from reproducing it. Scoring both there inflates the reported gap between
+    # the reconstruction and its ceiling.
     try:
-        b_min, b_max = covered_detector_rows(ctx.geometry)
-        b_min, b_max = max(0, b_min), min(pp.shape[1], b_max)
-        if b_max - b_min >= 16:
-            pp = pp[:, b_min:b_max, :]
+        b0, b1, a0, a1 = covered_detector_window(
+            ctx.geometry, pp.shape[1], pp.shape[2])
+        pp = pp[:, b0:b1, a0:a1]
     except (KeyError, TypeError):
         pass  # geometry incomplete (tests) — use the full frame
     p0, p1 = pp[0], pp[1]
@@ -318,6 +330,75 @@ def covered_detector_rows(geometry: dict) -> tuple[int, int]:
     b_lo = cpb + (oz - hz) / reach / db
     b_hi = cpb + (oz + hz) / reach / db
     return int(math.ceil(min(b_lo, b_hi))), int(math.floor(max(b_lo, b_hi))) + 1
+
+
+def covered_detector_columns(geometry: dict) -> tuple[int, int]:
+    """Detector-column interval [a_min, a_max) whose rays cross the in-plane
+    reconstruction domain.
+
+    The counterpart of ``covered_detector_rows`` for the other detector axis.
+    The domain is a cylinder of radius r about the rotation axis — the
+    renderer integrates nothing outside it — while the detector sees the whole
+    fan. A ray through a column beyond this interval never enters the cylinder,
+    so its forward projection is EXACTLY zero by construction. Scoring those
+    columns measures the FOV, not the reconstruction, and it does so harshly:
+    SSIM's luminance term is a ratio of local means, so a rendered zero against
+    a measured air level that flat-fielding left slightly below zero collapses
+    to ~0 (or negative) even though the absolute error is tiny.
+
+    A ray at fan angle gamma passes the axis at perpendicular distance
+    R_s*sin(gamma), so it clips the cylinder iff |sin(gamma)| <= r/R_s, i.e.
+
+        |a_off| <= SDD * r / sqrt(R_s^2 - r^2).
+
+    Note this is WIDER than the isocentre magnification r*SDD/R_s that the
+    support measurement uses to map the other way: the tangent ray touches the
+    cylinder nearer the source than the isocentre plane, so scaling by the
+    isocentre magnification would clip real columns.
+
+    An off-centre domain (an ROI grid under ``--model-domain off``) drifts
+    relative to the source as the gantry turns, so its offset is added to the
+    radius and the interval becomes the union over angles — never narrower
+    than the truth, at worst a few columns too generous.
+    """
+    R_s = float(geometry["R_s"])
+    SDD = R_s + float(geometry["R_d"])
+    da = float(geometry["da"])
+    cpa = float(geometry["central_pixel_a"])
+    Nx, Ny, _Nz = (int(v) for v in geometry["vol_shape"])
+    dx = float(geometry["dx"])
+    ox, oy = (float(v) for v in geometry["vol_origin"][:2])
+    r = min(Nx, Ny) * dx / 2.0 + math.hypot(ox, oy)
+    if r >= R_s:
+        # Domain reaches the source: every ray is inside it. Return an
+        # interval the caller's clamp collapses onto the full detector.
+        return 0, 1 << 30
+    a_off = SDD * r / math.sqrt(R_s * R_s - r * r)
+    return (int(math.ceil(cpa - a_off / da)),
+            int(math.floor(cpa + a_off / da)) + 1)
+
+
+def covered_detector_window(geometry: dict, n_b: int, n_a: int,
+                            min_size: int = 16) -> tuple[int, int, int, int]:
+    """(b_min, b_max, a_min, a_max): the detector rectangle the forward model
+    can actually predict, clamped to the frame.
+
+    Every projection diagnostic in the repo scores this window and nothing
+    else, so SSIM/PSNR/MSE and the noise ceiling are all measured on the same
+    pixels. An axis whose covered band comes out degenerate (< `min_size`
+    pixels — pathological geometry, or the tiny synthetic frames in the tests)
+    falls back to the full extent rather than to an unusable sliver.
+    """
+    b0, b1 = covered_detector_rows(geometry)
+    b0, b1 = max(0, b0), min(int(n_b), b1)
+    if b1 - b0 < min_size:
+        b0, b1 = 0, int(n_b)
+    a0, a1 = covered_detector_columns(geometry)
+    a0, a1 = max(0, a0), min(int(n_a), a1)
+    if a1 - a0 < min_size:
+        a0, a1 = 0, int(n_a)
+    return b0, b1, a0, a1
+
 
 def render_projection_from_volume(volume, ctx, angle_index: int,
                                   measured: np.ndarray, *,
@@ -375,16 +456,14 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
         samples_per_ray = max(64, int(math.ceil(chord / (0.55 * dx))))
 
     n_b, n_a = scene.detector_shape
-    b_min, b_max = covered_detector_rows(geometry)
-    b_min, b_max = max(0, b_min), min(n_b, b_max)
-    if b_max - b_min < 16:            # degenerate geometry: keep everything
-        b_min, b_max = 0, n_b
-    else:
-        print(f"  [diag] evaluating detector rows [{b_min}, {b_max}) of "
-              f"{n_b} — rays outside exit the reconstruction z-slab and "
-              f"cannot be predicted from the volume.")
+    b_min, b_max, a_min, a_max = covered_detector_window(geometry, n_b, n_a)
+    if (b_max - b_min, a_max - a_min) != (n_b, n_a):
+        print(f"  [diag] evaluating detector rows [{b_min}, {b_max}) of {n_b} "
+              f"and columns [{a_min}, {a_max}) of {n_a} — rays outside exit "
+              f"the reconstruction domain and cannot be predicted from the "
+              f"volume.")
     b_keep = torch.arange(b_min, b_max, downsample)
-    a_keep = torch.arange(0, n_a, downsample)
+    a_keep = torch.arange(a_min, a_max, downsample)
     bb, aa = torch.meshgrid(b_keep, a_keep, indexing="ij")
     b_flat, a_flat = bb.reshape(-1), aa.reshape(-1)
     angle_flat = torch.zeros_like(b_flat)
