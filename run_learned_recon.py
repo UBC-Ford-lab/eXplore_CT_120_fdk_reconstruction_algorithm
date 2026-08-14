@@ -269,6 +269,7 @@ def main():
         bhc_coeffs=args.bhc_coeffs,
         ring_correction=args.ring_correction,
         air_normalization=args.air_normalization,
+        soft_clip_sharpness=args.soft_clip_sharpness,
         ring_median_width=args.ring_median_width,
         crossval=not args.no_crossval,
         holdout_index=args.holdout_index,

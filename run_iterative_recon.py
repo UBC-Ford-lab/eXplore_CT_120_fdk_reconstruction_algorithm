@@ -397,6 +397,7 @@ def main():
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             air_normalization=args.air_normalization,
+            soft_clip_sharpness=args.soft_clip_sharpness,
             ring_median_width=args.ring_median_width,
         )
     elif args.backend == 'tigre':
@@ -417,6 +418,7 @@ def main():
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             air_normalization=args.air_normalization,
+            soft_clip_sharpness=args.soft_clip_sharpness,
             ring_median_width=args.ring_median_width,
             geometry_autocal=args.geometry_autocal,
             crossval=not args.no_crossval,

@@ -248,6 +248,16 @@ def add_common_args(parser):
              'uncorrected air offset).'
     )
     parser.add_argument(
+        '--soft-clip-sharpness',
+        type=float,
+        default=200.0,
+        help='Sharpness of the softplus transmission clamps (default: 200). '
+             'The clamps leak below their knee by ln(1+e^-x)/s; at the '
+             'historical 50 that put +0.0049 into every air ray and made air '
+             'normalization under-correct the object by ~1.8%%. Pass 50 to '
+             'reproduce pre-2026-08-14 line integrals.'
+    )
+    parser.add_argument(
         '--ring-median-width',
         type=int,
         default=51,

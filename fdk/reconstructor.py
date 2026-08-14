@@ -8,7 +8,8 @@ import sys
 
 from ..ct_core.calibration import default_mu_water, mu_to_hu
 from ..ct_core.preprocessing import (air_normalize_sinogram, apply_bhc,
-                                     ring_artifact_correction)
+                                     ring_artifact_correction,
+                                     soft_clamp_transmission)
 
 # Device: use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -128,7 +129,7 @@ class FDKReconstructor:
                  mu_water=None, output_hu=False,
                  bright_field=None, dark_field=None,
                  clamp_mode="none", soft_clip_transmission=True,
-                 soft_clip_sharpness=50.0, upper_clamp=True, upper_clamp_value=1.05,
+                 soft_clip_sharpness=200.0, upper_clamp=True, upper_clamp_value=1.05,
                  physical_normalization=False, filter_cutoff=1.0,
                  filter_type='cosine', parker_weighting=True,
                  metal_artifact_reduction=False, mar_threshold=6.0,
@@ -162,7 +163,8 @@ class FDKReconstructor:
         soft_clip_transmission: bool, if True, use soft clipping for transmission floor (default: True)
             - True: Smooth transition at epsilon, prevents center ringing from saturated pixels
             - False: Hard clip at epsilon (legacy behavior, causes Gibbs ringing)
-        soft_clip_sharpness: float, sharpness of soft clip transition (default: 50.0)
+        soft_clip_sharpness: float, sharpness of soft clip transition (default: 200.0 —
+            see ct_core.preprocessing.preprocess_sinogram for why not 50)
             - Lower values = broader transition = less center ringing
             - 50.0 gives ~0.06 transition width (affects T < 0.06)
             - 1000.0 gives ~0.003 transition width (effectively hard clip)
@@ -667,12 +669,21 @@ class FDKReconstructor:
             print(f"  GPU memory: {total_mem / 2**30:.2f} GiB total, "
                   f"{free_mem / 2**30:.2f} GiB free → budget {budget / 2**30:.2f} GiB")
 
-        # When ring correction is enabled, split into two passes:
-        #   Pass 1: flat-field + log + MAR → sinogram on CPU
-        #   Ring correction on full sinogram (needs all angles)
-        #   Pass 2: cone-beam weighting + ramp filter + Parker
-        if (self.ring_correction or self.bone_bhc) and do_preprocess:
-            # --- Pass 1: flat-field + log + MAR ---
+        # ---- Pass 1: flat-field + log + MAR + BHC -> full sinogram --------
+        # There used to be a second, "single-pass" copy of this loop that fused
+        # preprocessing straight into the filtering below, taken whenever no
+        # whole-sinogram correction was enabled. It is gone: it duplicated this
+        # block almost verbatim (and the filter block below), which is how the
+        # air-normalization wiring came to miss a branch. Its only real saving
+        # was one PCIe round trip of the sinogram in pass 2 (~1.4 s at ds1) —
+        # NOT memory, since `float_projections` is allocated full-size for both
+        # paths either way. With ring correction and air normalization both on
+        # by default it was also unreachable in practice.
+        needs_pass1 = (do_preprocess or self.metal_artifact_reduction
+                       or self.bhc_coeffs is not None)
+        sinogram_out = float_projections if do_preprocess else self.projections
+
+        if needs_pass1:
             print(f"  Pass 1 (flat-field + log): chunk_size={chunk_size}")
             for start in range(0, self.N_angles, chunk_size):
                 end = min(start + chunk_size, self.N_angles)
@@ -680,99 +691,13 @@ class FDKReconstructor:
                     np.array(self.projections[start:end], dtype=np.float32)
                 ).to(device)
 
-                T = (chunk - dark_gpu) / (I0_gpu + epsilon)
-                if self.soft_clip_transmission:
-                    T = epsilon + F.softplus(T - epsilon, beta=sharpness, threshold=20.0)
-                    if self.upper_clamp:
-                        T = upper_val - F.softplus(upper_val - T, beta=sharpness, threshold=20.0)
-                else:
-                    if self.upper_clamp:
-                        T = torch.clamp(T, min=epsilon, max=upper_val)
-                    else:
-                        T = torch.clamp(T, min=epsilon)
-                chunk = -torch.log(T)
-                if self.clamp_mode == "soft":
-                    chunk = F.softplus(chunk, beta=50.0, threshold=20.0)
-                elif self.clamp_mode == "hard":
-                    chunk = torch.clamp(chunk, min=0.0)
-                del T
-
-                if self.metal_artifact_reduction:
-                    metal_mask = chunk > self.mar_threshold
-                    if metal_mask.any():
-                        _interpolate_metal_pixels(chunk, metal_mask)
-                    del metal_mask
-
-                chunk = self._apply_bhc(chunk)
-
-                float_projections[start:end] = chunk.cpu().numpy()
-
-            # Free flat-field GPU memory
-            del dark_gpu, I0_gpu
-            torch.cuda.empty_cache()
-
-            # --- Air normalization on full sinogram (if enabled) ---
-            # FDK does its own fused flat-field+log on the GPU rather
-            # than calling preprocess_sinogram, so the correction has to
-            # be applied here too — same function, same place in the
-            # order (before ring correction), so every backend sees the
-            # same line integrals.
-            if self.air_normalization:
-                air_normalize_sinogram(float_projections)
-
-            # --- Ring correction on full sinogram (if enabled) ---
-            if self.ring_correction:
-                ring_artifact_correction(float_projections,
-                                         median_width=self.ring_median_width)
-
-            # Store unfiltered sinogram for bone BHC (after ring correction, before filtering)
-            if self.bone_bhc:
-                self._unfiltered_sinogram = float_projections.copy()
-
-            # --- Pass 2: cone-beam weighting + ramp filter + Parker ---
-            # Re-measure GPU budget (flat-field tensors freed)
-            budget = self._gpu_free_bytes()
-            persistent = 2 * bytes_per_proj  # cone_weight + filter_kernel
-            chunk_size = int((budget - persistent) // (6 * bytes_per_proj))
-            chunk_size = max(1, min(chunk_size, self.N_angles))
-            print(f"  Pass 2 (weighting + filtering): chunk_size={chunk_size}")
-            for start in range(0, self.N_angles, chunk_size):
-                end = min(start + chunk_size, self.N_angles)
-                chunk = torch.from_numpy(
-                    float_projections[start:end]
-                ).to(device)
-
-                chunk = chunk * cone_weight
-                chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
-                chunk = chunk * filter_kernel
-                chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
-                if parker_weight_gpu is not None:
-                    chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
-
-                float_projections[start:end] = chunk.cpu().numpy()
-
-        else:
-            # --- Single-pass pipeline (no ring correction) ---
-            print(f"  Preprocessing: chunk_size={chunk_size}")
-            for start in range(0, self.N_angles, chunk_size):
-                end = min(start + chunk_size, self.N_angles)
-
-                chunk = torch.from_numpy(
-                    np.array(self.projections[start:end], dtype=np.float32)
-                ).to(device)
-
-                # 1. Flat-field + log (only for HU path)
                 if do_preprocess:
                     T = (chunk - dark_gpu) / (I0_gpu + epsilon)
-                    if self.soft_clip_transmission:
-                        T = epsilon + F.softplus(T - epsilon, beta=sharpness, threshold=20.0)
-                        if self.upper_clamp:
-                            T = upper_val - F.softplus(upper_val - T, beta=sharpness, threshold=20.0)
-                    else:
-                        if self.upper_clamp:
-                            T = torch.clamp(T, min=epsilon, max=upper_val)
-                        else:
-                            T = torch.clamp(T, min=epsilon)
+                    # Same function the numpy path calls, on GPU tensors.
+                    T = soft_clamp_transmission(
+                        T, sharpness=sharpness, upper_clamp_value=upper_val,
+                        epsilon=epsilon, soft=self.soft_clip_transmission,
+                        upper_clamp=self.upper_clamp)
                     chunk = -torch.log(T)
                     if self.clamp_mode == "soft":
                         chunk = F.softplus(chunk, beta=50.0, threshold=20.0)
@@ -780,33 +705,54 @@ class FDKReconstructor:
                         chunk = torch.clamp(chunk, min=0.0)
                     del T
 
-                # 1b. Metal artifact reduction
                 if self.metal_artifact_reduction:
                     metal_mask = chunk > self.mar_threshold
                     if metal_mask.any():
                         _interpolate_metal_pixels(chunk, metal_mask)
                     del metal_mask
 
-                # 1c. Beam hardening correction
                 chunk = self._apply_bhc(chunk)
+                sinogram_out[start:end] = chunk.cpu().numpy()
 
-                # 2. Cone-beam weighting
-                chunk = chunk * cone_weight
+        # ---- Whole-sinogram corrections (need every angle at once) ---------
+        if do_preprocess:
+            # Free the flat-field tensors before pass 2 re-measures the budget.
+            del dark_gpu, I0_gpu
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-                # 3. Ramp filter (FFT → multiply → IFFT)
-                chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
-                chunk = chunk * filter_kernel
-                chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
+            if self.air_normalization:
+                air_normalize_sinogram(float_projections)
+            if self.ring_correction:
+                ring_artifact_correction(float_projections,
+                                         median_width=self.ring_median_width)
+            # Unfiltered sinogram for bone BHC: after the corrections above,
+            # before filtering.
+            if self.bone_bhc:
+                self._unfiltered_sinogram = float_projections.copy()
 
-                # 3b. Parker (short-scan) redundancy weighting
-                if parker_weight_gpu is not None:
-                    chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
+            # Re-measure the GPU budget now the flat-field tensors are gone.
+            budget = self._gpu_free_bytes()
+            persistent = 2 * bytes_per_proj  # cone_weight + filter_kernel
+            chunk_size = int((budget - persistent) // (6 * bytes_per_proj))
+            chunk_size = max(1, min(chunk_size, self.N_angles))
 
-                result_np = chunk.cpu().numpy()
-                if do_preprocess:
-                    float_projections[start:end] = result_np
-                else:
-                    self.projections[start:end] = result_np
+        # ---- Pass 2: cone-beam weighting + ramp filter + Parker ------------
+        print(f"  Pass 2 (weighting + filtering): chunk_size={chunk_size}")
+        for start in range(0, self.N_angles, chunk_size):
+            end = min(start + chunk_size, self.N_angles)
+            chunk = torch.from_numpy(
+                np.ascontiguousarray(sinogram_out[start:end], dtype=np.float32)
+            ).to(device)
+
+            chunk = chunk * cone_weight
+            chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
+            chunk = chunk * filter_kernel
+            chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
+            if parker_weight_gpu is not None:
+                chunk = chunk * parker_weight_gpu[start:end].unsqueeze(1)
+
+            sinogram_out[start:end] = chunk.cpu().numpy()
 
         # Finalize
         if do_preprocess:

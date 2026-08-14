@@ -229,7 +229,7 @@ def flat_field_correction(
     dark_field: np.ndarray,
     epsilon: float = 1e-6,
     soft_clip: bool = True,
-    soft_clip_sharpness: float = 50.0,
+    soft_clip_sharpness: float = 200.0,
     upper_clamp: bool = True,
     upper_clamp_value: float = 1.05
 ) -> np.ndarray:

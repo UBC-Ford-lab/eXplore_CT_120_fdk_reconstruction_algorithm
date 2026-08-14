@@ -64,6 +64,7 @@ class VoxelReconstructor:
                  bhc_coeffs=None,
                  ring_correction: bool = False,
                  air_normalization: bool = True,
+                 soft_clip_sharpness: float = 200.0,
                  ring_median_width: int = 51,
                  crossval: bool = True,
                  holdout_index: int | None = None,
@@ -97,6 +98,7 @@ class VoxelReconstructor:
         self.bhc_coeffs = bhc_coeffs
         self.ring_correction = bool(ring_correction)
         self.air_normalization = bool(air_normalization)
+        self.soft_clip_sharpness = float(soft_clip_sharpness)
         self.ring_median_width = int(ring_median_width)
         self.crossval = bool(crossval)
         self.holdout_index = holdout_index
@@ -158,6 +160,7 @@ class VoxelReconstructor:
             bhc_coeffs=self.bhc_coeffs,
             ring_correction=self.ring_correction,
             air_normalization=self.air_normalization,
+            soft_clip_sharpness=self.soft_clip_sharpness,
             ring_median_width=self.ring_median_width,
         )
 

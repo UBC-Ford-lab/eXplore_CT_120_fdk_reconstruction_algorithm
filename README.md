@@ -18,6 +18,14 @@ Raw projections → flat-field + log → BHC → air normalization → ring corr
 
 BHC (water, 80 kVp), air normalization and ring correction are on by default. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula) — self-calibrating regardless of filter or BHC settings.
 
+**One definition per stage.** `apply_bhc` and `soft_clamp_transmission` are
+written to work on numpy arrays *and* torch tensors, so FDK's fused GPU path
+and the chunked numpy path used by ASTRA/TIGRE/voxel call the same function
+rather than carrying parallel implementations. FDK itself is a single
+preprocessing pass followed by a single filtering pass; it previously also had
+a fused "single-pass" variant, which duplicated both blocks and was the reason
+a correction could be wired into one path and silently miss the other.
+
 ### Air normalization (`--air-normalization`, default on)
 
 An object-free ray must read `p = -ln(I/I_0) = 0`. On Scan_1510 it does not:
@@ -60,12 +68,55 @@ cause is not established. And a scan whose object fills the detector has no
 air reference — the correction reports that it skipped rather than inventing
 an offset.
 
-Unrelated but discovered alongside: preprocess's soft upper transmission clamp
-is a softplus that stays slightly active below its 1.05 knee, so it perturbs
-every transmission above 0.65 — adding **+0.0016** to a `p = 0` air ray and
-+0.005 to a `p = -0.025` one. It is static and negligible above `p ~ 0.05`, so
-it does not drift or distort the object, but it is why the air level after
-preprocessing settles at +0.0004 rather than exactly 0.
+### Soft-clip sharpness (`--soft-clip-sharpness`, default 200)
+
+Transmission is kept inside `(0, 1.05]` by softplus clamps rather than
+`np.clip`, so the ramp filter never meets a derivative corner. But softplus
+leaks below its knee —
+
+```
+softplus(x)/s = x/s + ln(1 + e^-x)/s
+```
+
+— and the leak only decays exponentially in `s x (distance from the knee)`.
+At the historical `s = 50` this was not a rounding detail. Air transmission
+sits right on the knee's shoulder (mean T = 1.014, sd 0.024; 70.8% of air
+pixels above T = 1.0 and 7.65% above 1.05 at full resolution), so the leak
+lands squarely on it:
+
+| sharpness | air bias | object bias | air-norm offset error |
+|---|---|---|---|
+| 50 | +0.00487 | +0.000028 | **+0.00271** |
+| 100 | +0.00183 | +0.000000 | — |
+| **200** | **+0.00111** | 0.000000 | **+0.00000** |
+| 500 | +0.00093 | 0.000000 | +0.00000 |
+| hard clip | +0.00090 | 0.000000 | +0.00000 |
+
+The hard-clip row is the irreducible part — the truncation the clamp is
+actually *for*. At `s = 50`, **82% of the bias was leak, not clamping.**
+
+It mattered because air normalization estimates its offset as a median over
+air pixels. The median is immune to the truncation (only the 7.65% tail is
+clipped, far from the median) but not to the leak, which shifts the whole
+distribution: at `s = 50` the offset came out -0.00887 against a true -0.01158,
+so the object was **under-corrected by 0.0027 in p, ~1.8% of its line
+integral**. Measured on Scan_1510 at ds3, moving to 200 raised the object band
+from 0.15128 to 0.15387 and the recovered drift from 0.01769 to 0.02065.
+
+Sharpness is shared with the FLOOR clamp, which is the other reason to raise
+it: at 50 that clamp starts distorting any ray above `p ~ 0.92` (a `p = 3` ray
+came out 0.032 low, `p = 4` came out 0.31 low). Scan_1510 tops out at 0.79 so
+it never fired, but a denser specimen or a metal implant would have crossed it
+silently. At 200 the onset moves to `p ~ 2.3`.
+
+Sharpening does **not** reintroduce ringing — measured, not assumed. Ramp-
+filtered high-band power (> 0.7 x Nyquist) relative to no clamp at all:
+`s=50` 0.914x, `s=200` 0.993x, `s=500` 0.998x, hard clip 0.998x. Every variant
+*removes* high-frequency energy; none manufactures it, because the clamp fires
+on isolated noise excursions in air rather than on a coherent edge. The old
+`s = 50` was quietly low-passing 8.6% of the sinogram's high-band power.
+
+Pass `--soft-clip-sharpness 50` to reproduce pre-2026-08-14 line integrals.
 
 ## Structure
 
@@ -78,7 +129,8 @@ run_learned_recon.py
   └─ ct_core/pipeline.py    shared CLI args, prepare_scan() → ScanContext,
                             detector-psi calibration JSON, save_outputs()
        ├─ ct_core/scan_setup.py      scan.xml, projections, geometry, VFF export
-       ├─ ct_core/preprocessing.py   flat-field+log, BHC, ring corr., downsample
+       ├─ ct_core/preprocessing.py   flat-field+log, transmission clamp, BHC,
+       │                             air norm., ring corr., downsample
        ├─ ct_core/calibration.py     mu_water constants, mu→HU conversion
        └─ ct_core/utils.py           GPU memory query
 
@@ -341,8 +393,15 @@ so comparing there scores FOV truncation rather than the reconstruction. The
 crop is reported in the run log, e.g. `rows [0, 765) of 765 and columns
 [39, 1128) of 1166`. How much it removes depends entirely on the grid: ~7% of
 the detector width for a measured `--model-domain` (r = 40.6 mm on Scan_1510),
-but ~72% for an FDK run on a small `--roi` grid (r = 12.4 mm), where the
-volume simply does not extend under most of the fan.
+but **~58%** for an FDK run on Scan_1510's `--roi auto` grid, where the volume
+does not extend under most of the fan.
+
+That FDK figure is not `r` alone. The ROI is off-centre — origin
+`(2.71, -5.53, 0.19) mm`, i.e. 6.16 mm from the axis — and an off-centre grid
+sweeps relative to the source as the gantry turns, so the window is the union
+over angles and uses `r + |origin_xy|` = 12.38 + 6.16 = 18.5 mm rather than
+12.4 mm. Assuming a centred grid would predict a 72% crop and would wrongly
+discard columns that the ROI really does pass under at some angles.
 
 Note this fixes only the columns the model *cannot* predict. Air columns
 *inside* the domain can still score badly for a different reason: SSIM's
@@ -440,6 +499,7 @@ Run `--help` for full argument lists.
 | `--bone-bhc-hu` | 3100 | Monochromatic bone HU (from scan.xml `BoneHU`) |
 | `--ring-correction` | on | Sinogram-space ring artifact correction (static per-COLUMN pattern) |
 | `--air-normalization` | on | Per-projection air level from object-free columns (per-FRAME scalar) |
+| `--soft-clip-sharpness` | 200 | Softplus transmission-clamp sharpness (50 = pre-2026-08-14) |
 | `--roi auto` | off | ROI from SubVolumeCoordinates.xml (FDK: the grid; iterative/learned: the export crop) |
 | `--model-domain` | `auto` | Iterative/learned: region the forward model must cover, measured from the projections (`off` / `EXTENT_XY HALF_Z`) |
 | `--rays-per-batch` | `auto` | Learned backend: batch sized from free VRAM |

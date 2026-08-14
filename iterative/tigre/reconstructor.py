@@ -261,7 +261,7 @@ class TIGREReconstructor:
                  bright_field=None, dark_field=None,
                  geometry_autocal=True, detector_psi_deg=None,
                  clamp_mode='none', soft_clip_transmission=True,
-                 soft_clip_sharpness=50.0, upper_clamp=True,
+                 soft_clip_sharpness=200.0, upper_clamp=True,
                  upper_clamp_value=1.05,
                  mu_water=None, output_hu=True,
                  bhc_coeffs=None,

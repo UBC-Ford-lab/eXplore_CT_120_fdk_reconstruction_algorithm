@@ -28,6 +28,62 @@ def apply_bhc(chunk, bhc_coeffs):
 _apply_bhc = apply_bhc
 
 
+def _array_module(a):
+    """numpy or torch, whichever ``a`` belongs to.
+
+    ``apply_bhc`` gets dual-backend support for free by using only operators.
+    The transmission clamp needs NAMED functions (where / clip / exp / log1p),
+    so it has to dispatch — but torch spells all four exactly as numpy does,
+    so one implementation still serves both. torch is imported lazily to keep
+    this module usable without it.
+    """
+    if type(a).__module__.split('.')[0] == 'torch':
+        import torch
+        return torch
+    return np
+
+
+def soft_clamp_transmission(T, sharpness=200.0, upper_clamp_value=1.05,
+                            epsilon=1e-6, soft=True, upper_clamp=True):
+    """Clamp transmission into (epsilon, upper_clamp_value], smoothly.
+
+    THE single definition, shared by the chunked numpy path here and FDK's
+    fused GPU path — they used to carry separate implementations of the same
+    formula (numpy ``log1p(exp(...))`` vs torch ``F.softplus``), which meant
+    every change to the clamp had to be made twice and correctness rested on a
+    test asserting the two agreed.
+
+    `T <= 0` from noise would make the following log blow up, and `T > 1` is
+    unphysical. A hard `clip` fixes both but leaves a corner in the first
+    derivative, which rings after FDK's ramp filter — hence softplus mirrors
+    at each end.
+
+    Both mirrors LEAK below their knee by ``ln(1 + e^-x)/sharpness``, decaying
+    exponentially in ``sharpness * (distance from the knee)``. That is why the
+    default is 200 rather than the historical 50: see the ``soft_clip_sharpness``
+    note in ``preprocess_sinogram``.
+
+    Accepts (and returns) either a numpy array or a torch tensor, dtype
+    preserved. Not in place.
+    """
+    xp = _array_module(T)
+    if not soft:
+        return xp.clip(T, epsilon,
+                       upper_clamp_value if upper_clamp else None)
+
+    x = sharpness * (T - epsilon)
+    T = xp.where(x > 20,
+                 T,
+                 epsilon + xp.log1p(xp.exp(xp.clip(x, -700, 20))) / sharpness)
+    if upper_clamp:
+        x = sharpness * (upper_clamp_value - T)
+        T = xp.where(x > 20,
+                     T,
+                     upper_clamp_value
+                     - xp.log1p(xp.exp(xp.clip(x, -700, 20))) / sharpness)
+    return T
+
+
 def ring_artifact_correction(sinogram, median_width=51, verbose=True):
     """Sinogram-space ring artifact correction, in place.
 
@@ -164,7 +220,7 @@ def air_normalize_sinogram(sinogram, max_air_p=0.05, verbose=True):
 
 def preprocess_sinogram(projections, bright_field, dark_field,
                         clamp_mode='none', soft_clip_transmission=True,
-                        soft_clip_sharpness=50.0, upper_clamp=True,
+                        soft_clip_sharpness=200.0, upper_clamp=True,
                         upper_clamp_value=1.05, chunk_angles=20,
                         bhc_coeffs=None,
                         ring_correction=False, ring_median_width=51,
@@ -182,7 +238,19 @@ def preprocess_sinogram(projections, bright_field, dark_field,
             If None, projections are returned as-is (assumed pre-processed).
         clamp_mode: Line integral clamping mode ('none', 'soft', 'hard')
         soft_clip_transmission: Use soft clipping for transmission floor
-        soft_clip_sharpness: Sharpness of soft clip transition
+        soft_clip_sharpness: Sharpness of the soft clip transition
+            (default 200). The clamps are softplus mirrors, and softplus
+            LEAKS below its knee: softplus(x)/s = x/s + ln(1+e^-x)/s, so the
+            transition never fully closes, it only decays exponentially in
+            s*(distance from the knee). At the historical s=50 that leak put
+            +0.0049 into every air ray on Scan_1510 — against only +0.0009
+            from the truncation the clamp is actually FOR — and it biased
+            air normalization's offset estimate by +0.0027, i.e. it
+            under-corrected the object by ~1.8% of its line integral. s=200
+            removes the leak exactly (offset error 0.00000) while staying
+            analytic, so the ramp filter still sees no corner. It also moves
+            the FLOOR clamp's onset from p > 0.92 to p > 2.30, which matters
+            for denser specimens than Scan_1510 (max p 0.79).
         upper_clamp: Clamp transmission from above
         upper_clamp_value: Maximum allowed transmission value
         chunk_angles: Number of projection angles per chunk (default 20)
@@ -241,29 +309,12 @@ def preprocess_sinogram(projections, bright_field, dark_field,
         chunk -= dark_field
         chunk /= (denominator + epsilon)
 
-        # Soft-clip transmission floor (prevents log(0) and Gibbs ringing)
-        if soft_clip_transmission:
-            scaled = sharpness * (chunk - epsilon)
-            chunk = np.where(
-                scaled > 20,
-                chunk,
-                epsilon + np.log1p(np.exp(np.clip(scaled, -700, 20))) / sharpness,
-            ).astype(np.float32)
-            del scaled
-
-            if upper_clamp:
-                scaled = sharpness * (upper_val - chunk)
-                chunk = np.where(
-                    scaled > 20,
-                    chunk,
-                    upper_val - np.log1p(np.exp(np.clip(scaled, -700, 20))) / sharpness,
-                ).astype(np.float32)
-                del scaled
-        else:
-            if upper_clamp:
-                np.clip(chunk, epsilon, upper_val, out=chunk)
-            else:
-                np.clip(chunk, epsilon, None, out=chunk)
+        # Clamp transmission into (epsilon, upper_val] — shared with FDK's
+        # fused GPU path, which calls the same function on torch tensors.
+        chunk = soft_clamp_transmission(
+            chunk, sharpness=sharpness, upper_clamp_value=upper_val,
+            epsilon=epsilon, soft=soft_clip_transmission,
+            upper_clamp=upper_clamp).astype(np.float32, copy=False)
 
         # Log transform: p = -log(T)
         np.log(chunk, out=chunk)

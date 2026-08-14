@@ -259,7 +259,7 @@ def main():
         mu_water=None,
         clamp_mode="none",
         soft_clip_transmission=True,
-        soft_clip_sharpness=50.0,
+        soft_clip_sharpness=args.soft_clip_sharpness,
         upper_clamp=True,
         upper_clamp_value=1.05,
         physical_normalization=True,

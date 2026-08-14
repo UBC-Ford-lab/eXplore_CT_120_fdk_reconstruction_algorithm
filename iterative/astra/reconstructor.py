@@ -135,7 +135,7 @@ class ASTRAReconstructor:
                  gpu_index=0, super_sampling=1,
                  bright_field=None, dark_field=None,
                  clamp_mode='none', soft_clip_transmission=True,
-                 soft_clip_sharpness=50.0, upper_clamp=True,
+                 soft_clip_sharpness=200.0, upper_clamp=True,
                  upper_clamp_value=1.05,
                  mu_water=None, output_hu=True,
                  bhc_coeffs=None,
