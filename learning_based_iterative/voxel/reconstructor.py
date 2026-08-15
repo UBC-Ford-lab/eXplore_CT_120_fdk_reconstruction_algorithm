@@ -9,7 +9,9 @@ ASTRA / TIGRE backends:
 
   consume  raw-count projections (N_angles, N_b, N_a) + angles (radians, FDK
            convention) + ct_core ``build_geometry`` dict
-  return   float32 (Nx, Ny, Nz) volume in HU via ``reconstructed_volume``
+  return   float32 (Nx, Ny, Nz) volume of linear attenuation mu (mm^-1)
+           via ``reconstructed_volume`` -- NOT HU; calibration is a single
+           downstream step shared by every backend (ct_core.hu_calibration)
 
 Recipe notes carried over from the validated config:
   * plain MSE data term (SIRT's objective; no structural terms)
@@ -36,7 +38,6 @@ import time
 import numpy as np
 import torch
 
-from ...ct_core.calibration import default_mu_water, mu_to_hu
 from ...ct_core.data_budget import RANDOM, data_budget, measurement_count
 from ...ct_core.preprocessing import preprocess_sinogram
 from ..scene import Scene, model_domain_from_geometry
@@ -59,8 +60,6 @@ class VoxelReconstructor:
                  seed: int = 0,
                  compile_mode: str = "off",
                  bright_field=None, dark_field=None,
-                 output_hu: bool = True,
-                 mu_water: float | None = None,
                  bhc_coeffs=None,
                  ring_correction: bool = False,
                  air_normalization: bool = True,
@@ -93,8 +92,6 @@ class VoxelReconstructor:
         self.compile_mode = str(compile_mode)
         self.bright_field = bright_field
         self.dark_field = dark_field
-        self.output_hu = bool(output_hu)
-        self.mu_water = mu_water
         self.bhc_coeffs = bhc_coeffs
         self.ring_correction = bool(ring_correction)
         self.air_normalization = bool(air_normalization)
@@ -394,9 +391,7 @@ class VoxelReconstructor:
         vol = model.mu.detach()[0, 0].cpu().numpy().transpose(2, 1, 0)
         vol = np.ascontiguousarray(vol, dtype=np.float32)
 
-        if self.output_hu:
-            mu_w = default_mu_water(self.mu_water, self.bhc_coeffs)
-            vol = mu_to_hu(vol, mu_w)
-
+        # No HU conversion: the parameter grid is μ (mm⁻¹) and stays that way,
+        # unclipped. HU is fitted once downstream (ct_core.hu_calibration).
         self.reconstructed_volume = vol
         return vol

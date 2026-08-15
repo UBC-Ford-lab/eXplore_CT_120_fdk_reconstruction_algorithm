@@ -1,13 +1,27 @@
 """
-HU Calibration Module for CT Reconstruction Pipeline
+Projection preprocessing: transmission -> line integrals.
 
-Provides log transformation and Hounsfield Unit calibration for CT projections.
+This module owns steps 1-2 of the standard chain, which turn raw detector
+counts into the line integrals a reconstructor consumes:
 
-Standard CT reconstruction requires:
 1. Flat-field correction: T = (I - I_dark) / (I_bright - I_dark)
-2. Log transformation: p = -log(T) to convert transmission to line integrals
-3. FDK reconstruction yields linear attenuation coefficient μ (proportional)
-4. HU conversion: HU = (μ - μ_water) / μ_water × 1000
+2. Log transformation:    p = -log(T)
+
+Step 3 is the reconstruction itself, which yields the linear attenuation
+coefficient mu (mm^-1).
+
+Step 4 -- the HU conversion -- deliberately does NOT live here. It is fitted
+once, downstream of every backend, in ``ct_core.hu_calibration``, from two
+anchors measured in the reconstructed volume's own histogram. The one-point
+map that used to live in this file (``mu_to_hu``, plus a family of phantom
+insert-ROI polynomial fitters) has been removed: it fitted a single degree of
+freedom against an affine error, relied on a scanner constant back-fitted to
+one 2022 scan that did not transfer between reconstructions, and clipped to
+[-1024, 4095] before anything could measure the volume -- which pinned 19-44 %
+of all voxels onto the floor and destroyed the air peak.
+
+The name is kept because the flat/dark fields it loads are the scanner's
+calibration frames.
 
 Author: Falk Wiegmann, University of British Columbia
 Date: January 2026
@@ -123,32 +137,6 @@ def default_mu_water(mu_water=None, bhc_coeffs=None) -> float:
     if mu_water is not None:
         return float(mu_water)
     return MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None else MU_WATER_80KV_NO_BHC
-
-
-def mu_to_hu(volume, mu_water, verbose=True):
-    """Physics-based HU conversion: HU = (mu - mu_water) / mu_water * 1000.
-
-    Shared by every reconstruction backend so the output HU convention is
-    identical by construction. Clips to the on-disk range [-1024, 4095] and
-    returns float32. ``volume`` is a numpy array of mu values (mm^-1).
-    """
-    volume = np.asarray(volume, dtype=np.float32)
-    if verbose:
-        print(f"  mu_water = {mu_water:.6f} mm^-1")
-        p1 = float(np.percentile(volume, 1))
-        p85 = float(np.percentile(volume, 85))
-        print(f"  Observed: P1 (air) = {p1:.6f}, P85 (tissue) = {p85:.6f}")
-
-    volume = (volume - mu_water) / mu_water * 1000.0
-    volume = np.clip(volume, -1024, 4095).astype(np.float32)
-
-    if verbose:
-        hu_p1 = float(np.percentile(volume, 1))
-        print(f"  Post-conversion P1 (expect ~-1000 for air): {hu_p1:.0f} HU")
-        print(f"  Range: [{volume.min():.0f}, {volume.max():.0f}] HU")
-    return volume
-
-
 def parse_calibration_from_xml(xml_path: str) -> Dict[str, float]:
     """
     Extract AirValue, WaterValue, and BoneHU from scan XML.
@@ -348,258 +336,3 @@ def log_transform_transmission(
         return np.maximum(line_integral, 0.0).astype(np.float32)
     else:
         raise ValueError(f"Unknown clamp_mode: {clamp_mode}. Use 'none', 'soft', or 'hard'.")
-
-
-def convert_to_hounsfield_units(
-    mu_volume: np.ndarray,
-    mu_water: float
-) -> np.ndarray:
-    """
-    Convert linear attenuation coefficient volume to Hounsfield Units.
-
-    HU = (μ - μ_water) / μ_water × 1000
-
-    Standard HU values:
-        - Air: -1000 HU
-        - Water: 0 HU
-        - Soft tissue: 20-80 HU
-        - Bone: +1000 to +3000 HU
-
-    Args:
-        mu_volume: Reconstructed linear attenuation coefficient volume
-        mu_water: Linear attenuation coefficient of water
-
-    Returns:
-        Volume in Hounsfield Units
-    """
-    hu_volume = ((mu_volume - mu_water) / mu_water) * 1000.0
-    return hu_volume.astype(np.float32)
-
-
-def validate_hu_calibration(
-    volume: np.ndarray,
-    expected_air_hu: float = -1000.0,
-    expected_water_hu: float = 0.0,
-    tolerance: float = 100.0
-) -> Dict[str, float]:
-    """
-    Validate HU calibration by checking volume statistics.
-
-    Args:
-        volume: Reconstructed volume in HU
-        expected_air_hu: Expected HU for air regions
-        expected_water_hu: Expected HU for water regions
-        tolerance: Acceptable deviation from expected values
-
-    Returns:
-        Dictionary with volume statistics
-    """
-    stats = {
-        'min': float(np.min(volume)),
-        'max': float(np.max(volume)),
-        'mean': float(np.mean(volume)),
-        'std': float(np.std(volume)),
-        'percentile_1': float(np.percentile(volume, 1)),
-        'percentile_99': float(np.percentile(volume, 99)),
-    }
-
-    # Check if air regions (low values) are close to -1000 HU
-    if stats['percentile_1'] < expected_air_hu - tolerance:
-        print(f"Warning: Air regions ({stats['percentile_1']:.0f} HU) below expected {expected_air_hu} HU")
-    elif stats['percentile_1'] > expected_air_hu + tolerance:
-        print(f"Warning: Air regions ({stats['percentile_1']:.0f} HU) above expected {expected_air_hu} HU")
-    else:
-        print(f"Air regions: {stats['percentile_1']:.0f} HU (expected ~{expected_air_hu:.0f} HU) - OK")
-
-    return stats
-
-
-# =============================================================================
-# Phantom Insert Calibration Data
-# =============================================================================
-
-# True HU values for each phantom insert (from manufacturer datasheet).
-# Ordered by ascending true HU. Names are descriptive labels.
-# Used by self-calibration mode (--roi-config) for phantom scans.
-PHANTOM_INSERT_TRUE_HU = [
-    ("air",       -940),
-    ("insert_30",   30),
-    ("insert_80",   80),
-    ("insert_130", 130),
-    ("insert_220", 220),
-    ("insert_410", 410),
-    ("insert_770", 770),
-    ("bone",      1460),
-]
-
-
-def fit_hu_calibration(calibration_data: np.ndarray, degree: int = 2):
-    """
-    Fit a polynomial mapping measured physical HU to true HU.
-
-    Args:
-        calibration_data: Nx2 array of (measured_HU, true_HU) pairs
-        degree: Polynomial degree (default 2 = quadratic)
-
-    Returns:
-        (poly_coeffs, residuals_rms, residuals_per_point)
-        poly_coeffs are for np.polyval: HU_true = polyval(coeffs, HU_measured).
-    """
-    measured = calibration_data[:, 0]
-    expected = calibration_data[:, 1]
-    coeffs = np.polyfit(measured, expected, degree)
-    predicted = np.polyval(coeffs, measured)
-    residuals = expected - predicted
-    rms = float(np.sqrt(np.mean(residuals**2)))
-    return coeffs, rms, residuals
-
-
-def measure_insert_rois(volume: np.ndarray, insert_rois: list,
-                        z_range: tuple) -> list:
-    """
-    Measure mean pixel value inside each circular insert ROI.
-
-    Args:
-        volume: 3D array (z, y, x)
-        insert_rois: list of dicts with keys 'name', 'cy', 'cx', 'radius', 'true_hu'
-        z_range: (z_start, z_end) slice range to average over
-
-    Returns:
-        List of dicts with 'name', 'cy', 'cx', 'radius', 'true_hu',
-        'measured_mean', 'measured_std'
-    """
-    sl = volume[z_range[0]:z_range[1]].mean(axis=0)
-    results = []
-    for roi in insert_rois:
-        cy, cx, r = roi['cy'], roi['cx'], roi['radius']
-        yy, xx = np.ogrid[cy - r:cy + r, cx - r:cx + r]
-        mask = ((yy - cy) ** 2 + (xx - cx) ** 2) < r ** 2
-        vals = sl[cy - r:cy + r, cx - r:cx + r][mask]
-        results.append({
-            **roi,
-            'measured_mean': float(vals.mean()),
-            'measured_std': float(vals.std()),
-        })
-    return results
-
-
-def calibrate_volume_polynomial(volume: np.ndarray,
-                                calibration_data: np.ndarray,
-                                degree: int = 2,
-                                clip_range: tuple = (-1024, 4095)
-                                ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """
-    Fit polynomial from calibration pairs and apply to entire volume.
-
-    Args:
-        volume: 3D array (z, y, x) in uncalibrated values
-        calibration_data: Nx2 array of (measured, true_hu) pairs
-        degree: polynomial degree
-        clip_range: (min, max) HU clipping range
-
-    Returns:
-        (calibrated_volume, poly_coeffs, rms_residual)
-    """
-    coeffs, rms, _ = fit_hu_calibration(calibration_data, degree)
-    calibrated = np.polyval(coeffs, volume).astype(np.float32)
-    if clip_range is not None:
-        calibrated = np.clip(calibrated, clip_range[0], clip_range[1])
-    return calibrated, coeffs, rms
-
-
-def plot_calibration_diagnostic(insert_measurements: list,
-                                coeffs: np.ndarray,
-                                volume_slice: np.ndarray,
-                                output_path: str):
-    """
-    Generate a diagnostic figure showing ROI placement and polynomial fit.
-
-    Args:
-        insert_measurements: list of dicts from measure_insert_rois()
-        coeffs: polynomial coefficients from fit
-        volume_slice: 2D slice for background image
-        output_path: where to save the figure (without extension)
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Circle
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-    # (a) ROI overlay on phantom slice
-    ax = axes[0]
-    vmin = float(np.percentile(volume_slice, 1))
-    vmax = float(np.percentile(volume_slice, 99))
-    ax.imshow(volume_slice, cmap='gray', vmin=vmin, vmax=vmax)
-    for m in insert_measurements:
-        circle = Circle((m['cx'], m['cy']), m['radius'],
-                         fill=False, edgecolor='cyan', linewidth=1.5)
-        ax.add_patch(circle)
-        ax.text(m['cx'] + m['radius'] + 5, m['cy'],
-                f"{m['name']}\n{m['measured_mean']:.0f}",
-                fontsize=6, color='yellow', fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.15',
-                          facecolor='black', alpha=0.7))
-    ax.set_title('(a) Insert ROI placement', fontweight='bold')
-
-    # (b) Measured vs True with polynomial fit
-    ax = axes[1]
-    measured = np.array([m['measured_mean'] for m in insert_measurements])
-    true_hu = np.array([m['true_hu'] for m in insert_measurements])
-
-    ax.scatter(measured, true_hu, c='blue', s=60, zorder=5, label='Insert measurements')
-    for m in insert_measurements:
-        ax.annotate(m['name'], (m['measured_mean'], m['true_hu']),
-                    textcoords='offset points', xytext=(5, 5), fontsize=7)
-
-    x_fit = np.linspace(measured.min() - 100, measured.max() + 100, 200)
-    y_fit = np.polyval(coeffs, x_fit)
-    ax.plot(x_fit, y_fit, 'r-', linewidth=1.5, label=f'Poly deg {len(coeffs)-1} fit')
-    ax.plot(x_fit, x_fit, 'k--', linewidth=0.8, alpha=0.5, label='Identity (y=x)')
-
-    ax.set_xlabel('Measured (uncalibrated)')
-    ax.set_ylabel('True HU (datasheet)')
-    ax.set_title('(b) Calibration curve', fontweight='bold')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # (c) Residuals
-    ax = axes[2]
-    predicted = np.polyval(coeffs, measured)
-    residuals = true_hu - predicted
-    rms = float(np.sqrt(np.mean(residuals ** 2)))
-
-    ax.bar(range(len(insert_measurements)),
-           residuals, color='steelblue', edgecolor='black', linewidth=0.5)
-    ax.set_xticks(range(len(insert_measurements)))
-    ax.set_xticklabels([m['name'] for m in insert_measurements],
-                       rotation=45, ha='right', fontsize=7)
-    ax.axhline(0, color='black', linewidth=0.8)
-    ax.set_ylabel('Residual (True - Predicted) [HU]')
-    ax.set_title(f'(c) Residuals (RMS = {rms:.1f} HU)', fontweight='bold')
-    ax.grid(True, alpha=0.3, axis='y')
-
-    plt.tight_layout()
-    for ext in ('.png', '.pdf'):
-        fig.savefig(output_path + ext, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Diagnostic saved: {output_path}.png/.pdf")
-
-
-if __name__ == '__main__':
-    # Test with Scan_1681
-    from .paths import RESULTS_DIR
-    xml_path = str(RESULTS_DIR / '..' / 'scans' / 'Scan_1681' / 'scan.xml')
-
-    print("Testing HU calibration module...")
-    print("=" * 60)
-
-    # Parse calibration
-    cal = parse_calibration_from_xml(str(xml_path))
-    print(f"\nCalibration values from XML:")
-    print(f"  Air Value:   {cal['air_value']}")
-    print(f"  Water Value: {cal['water_value']}")
-    print(f"  Bone HU:     {cal['bone_hu']}")
-    print(f"  Literature mu_water at 80 keV: {MU_WATER_80KV} mm⁻¹")
-
-    print("\n" + "=" * 60)
-    print("Module test complete.")

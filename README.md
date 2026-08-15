@@ -13,10 +13,15 @@ Raw projections → flat-field + log → BHC → air normalization → ring corr
   → FDK: cone-weight + ramp filter + Parker + backprojection
     OR iterative: ASTRA SIRT / TIGRE OS-SART
   → [bone BHC (FDK only): segment → forward-project → re-reconstruct]
-  → physics HU → two-point calibration (air→-1000, water→0) → VFF
+  → μ (mm⁻¹, unclipped) → two-anchor HU calibration → VFF
 ```
 
-BHC (water, 80 kVp), air normalization and ring correction are on by default. HU calibration measures air and water/tissue directly from the reconstructed volume (standard CT two-point formula) — self-calibrating regardless of filter or BHC settings.
+BHC (water, 80 kVp), air normalization and ring correction are on by default.
+
+**Every backend returns μ; HU is decided once, downstream.** No reconstructor
+converts or clips. `save_outputs` is the only place the HU scale is set, so
+FDK, ASTRA, TIGRE and the voxel backend are on the same scale by construction
+rather than by convention — see *HU calibration* below.
 
 **One definition per stage.** `apply_bhc` and `soft_clamp_transmission` are
 written to work on numpy arrays *and* torch tensors, so FDK's fused GPU path
@@ -131,8 +136,17 @@ run_learned_recon.py
        ├─ ct_core/scan_setup.py      scan.xml, projections, geometry, VFF export
        ├─ ct_core/preprocessing.py   flat-field+log, transmission clamp, BHC,
        │                             air norm., ring corr., downsample
-       ├─ ct_core/calibration.py     mu_water constants, mu→HU conversion
+       ├─ ct_core/hu_calibration.py  two-anchor HU calibration (air + bulk
+       │                             tissue), fitted from the volume's own
+       │                             histogram — the only HU conversion
+       ├─ ct_core/calibration.py     flat-field correction + log transform
+       │                             (projection preprocessing only — it no
+       │                             longer converts anything to HU)
        └─ ct_core/utils.py           GPU memory query
+
+run_volume_report.py                          report on a volume that already
+  └─ ct_core/volume_report.py   VFF → (x, y, z) HU, geometry, HU landmarks
+                                (no reconstruction — the inverse of the above)
 
 fdk/                        analytic filtered backprojection
   └─ reconstructor.py
@@ -467,6 +481,176 @@ sensitive. Logging is best-effort: any W&B failure prints a notice and the
 reconstruction continues. Use `--wandb-mode offline` on air-gapped nodes and
 `wandb sync` later.
 
+## HU calibration (all backends)
+
+Every reconstruction here ends on the Hounsfield scale, fitted per volume from
+its own histogram. No phantom, no scanner constant, nothing that goes stale
+when the source or the detector is replaced.
+
+### Why two anchors
+
+A reconstruction's error is affine in attenuation: `μ̂ = g·μ + c`. The gain `g`
+comes from flat-field/I0 error, detector gain and effective-spectrum mismatch;
+the offset `c` from scatter, truncation and the support bias. Two unknowns need
+two anchors, and the pipeline uses the two facts that hold for every scan:
+
+| anchor | value | what it fixes | status |
+|---|---|---|---|
+| air | −1000 HU | the offset `c` | exact — μ_air is zero |
+| bulk soft tissue | `--tissue-hu` (**+120**) | the gain `g` | **a convention** |
+
+There is a trap worth stating explicitly, because it makes a wrong calibration
+look right: under a *one-point* map, air lands on exactly −1000 HU **for any
+gain whatsoever**, since μ_air = 0. A perfect-looking air peak is therefore no
+evidence at all that the scale is correct.
+
+Which is why the second anchor is a convention and not a measurement. Nothing
+in a scan of unknown material pins the absolute scale; `--tissue-hu` declares
+it. That buys comparability — every algorithm and every scan lands on one
+scale, so HU differences between reconstructions mean something — while the
+absolute zero rests on a declaration.
+
+**The default is +120 HU**, chosen to match the scale this scanner's vendor
+reports for the same specimens: the vendor's mouse reconstructions put soft
+tissue at +115 (Scan_1510 thumbnail), +139 (Scan_1510 mouse ROI) and +100
+(Scan_1955 mouse ROI), while its multi-insert phantom reads water at −5 HU.
+Whether mouse tissue genuinely reads ~+120 on this beam or the vendor's mouse
+gain is off by that much cannot be decided without a phantom — adopting the
+vendor's number keeps our volumes comparable with theirs and with the
+historical metrics computed against them. Changing it is a pure linear rescale
+and does not affect algorithm-vs-algorithm comparison at all.
+
+**Pass `--tissue-hu 0` for a water phantom**, whose bulk belongs at 0 HU by
+definition rather than being soft tissue.
+
+`--tissue-hu` applies to `auto` only. Under `--hu-calibration fixed` the second
+anchor is *water*, at 0 HU by the definition of the scale, so the tissue
+convention deliberately does not leak in — letting it would silently change the
+gain of an escape hatch whose purpose is to reproduce a known map. Passing both
+prints a note rather than being ignored in silence.
+
+### How the anchors are found
+
+From the shape of the attenuation histogram alone — the value range comes from
+percentiles of the data, smoothing and peak separation are expressed in bins,
+and the selection thresholds are fractions of the histogram. **No step compares
+a voxel against an absolute number.** So under `μ → a·μ + b` both anchors move
+with it and the calibrated output is unchanged (asserted in
+`tests/test_hu_calibration.py`, which holds it to <0.5 HU across five decades
+of input scaling). That equivariance is what lets one estimator serve raw μ, a
+half-calibrated volume, and someone else's HU volume.
+
+* **air** — the lowest local maximum that is a real population, qualified by
+  basin *mass* and prominence rather than height (height scales with peak
+  width, so it rejects a narrow air peak in a tight crop).
+* **bulk tissue** — the population with the most basin *mass* above air. Mass
+  is what "mostly soft tissue" means, and it is what rejects lung (a smaller
+  population between air and tissue), the scan bed, and the bone tail.
+  Selecting by height or by prominence-against-the-global-maximum fails: in a
+  full-FOV reconstruction air outnumbers tissue ~100:1.
+
+The fit is reported on every run (`hu/*` scalars, `plots/hu_calibration`) and
+flags itself when it is on thin ice: a clipped or saturated volume, no clear
+tissue mode, a crop with almost no air, or a distinct population sitting
+*below* the chosen air anchor — the last being the dangerous case, where too
+little air causes tissue to be anchored to −1000 and bone to 0 while every
+other quality measure looks clean.
+
+### What this replaced
+
+Measured on real finished volumes, the previous path had three defects:
+
+* **A one-point map with a hardcoded `mu_water = 0.0219`**, back-fitted once to
+  a single 2022 scan. It fits the gain only and assumes `c = 0`. It does not
+  transfer: the same constant put soft tissue at −69 HU on one reconstruction
+  and −297 HU on another. Fitting Scan_1510 properly gives μ_water = 0.0200 —
+  the constant was 9.5 % too large, which is exactly the −72 HU it produced.
+* **A clip to [−1024, 4095] applied inside every backend**, before anything
+  could measure the volume. It pinned **19–44 % of all voxels onto exactly the
+  floor**, destroying the air peak that any calibration needs, and amputated
+  the bone tail at the top. Clipping is now a storage concern only: `write_vff`
+  rounds (rather than truncating toward zero) and clips to int16's real range.
+* **A two-point fallback that read water from a fixed 30×30 central box**,
+  which in a mouse is lung. It was disabled by default, so in practice nothing
+  was ever calibrated — and `<output>.vff` and `<output>_uncalibrated.vff` were
+  byte-identical.
+
+`ct_core.calibration.mu_to_hu` has been **removed**, along with the phantom
+insert-ROI polynomial fitters (`fit_hu_calibration`, `measure_insert_rois`,
+`calibrate_volume_polynomial`, `plot_calibration_diagnostic`) and the
+`calibrate_volume.py` driver that drove them. That family needed a phantom in
+the field of view, which is exactly the dependency this scanner cannot carry —
+sources get swapped and detectors replaced, so a phantom fit does not survive
+the next calibration epoch. A run that genuinely wants the one-point convention
+should use `--hu-calibration fixed --mu-water`, which goes through the same
+code path, logging and figure as any other run.
+
+### Flags
+
+```bash
+--hu-calibration auto      # default: fit both anchors from this volume
+--hu-calibration fixed --mu-water 0.0219   # classical one-point map
+--tissue-hu 120            # where bulk tissue lands; this sets the gain
+--tissue-hu 0              #   ...use 0 for a water phantom
+--save-mu                  # also write <output>_mu.npy (float32 μ, mm⁻¹)
+```
+
+Calibration runs *after* the export-ROI crop, so the anchors describe the
+voxels actually shipped. The trade-off is that a very tight ROI can crop away
+the air the offset anchor needs; the fit warns when that happens.
+
+## Reporting on a volume that already exists
+
+The volume-domain half of that panel does not need a sinogram or a training
+loop, so it can be computed for any finished reconstruction — the scanner
+vendor's own `.vff`, an older run's output, a muNeRF export:
+
+```bash
+python -m reconstruction.run_volume_report \
+    data/scans/Scan_1988/Volumes/Half-scan-75um.vff \
+    --wandb-project my-ct-project --algorithm vendor_fdk
+```
+
+It produces `plots/hu_histogram`, `plots/view_axial`, `plots/view_coronal`,
+`plots/view_sagittal`, the `recon_slices` sequence and the `volume/*` scalars
+through the *same* `ReconLogger` calls the reconstruction drivers make, so a
+vendor volume lands next to your own runs on identical axes and identical
+keys. It never writes to the volume it reads.
+
+Two differences from the reconstruction drivers:
+
+* **W&B is ON by default here** (`--no-wandb` opts out). There is no
+  expensive compute to protect, and the point of the tool is comparison
+  against runs that are already in the project.
+* **No projection diagnostics.** `diag/ssim`, the SSIM heatmap, the power
+  spectrum, the noise ceiling and the convergence curve are not volume
+  properties — they compare a forward projection against measured data, which
+  needs the scan, the exact reconstruction grid and the geometry calibration.
+  Reconstruct through the normal drivers to get them.
+
+Three things a finished volume does not carry, and how they are handled:
+
+| | Default | Override |
+|---|---|---|
+| Axis order / y flip | exact inverse of this package's VFF writer, so its own output round-trips unchanged | `--no-y-flip` for a foreign file that comes out mirrored |
+| HU scale | the stored integers **are** HU | `--hu-from-header` |
+| z voxel size, volume position | GE `elementsize` for both xy and z; centre at the isocentre | `--voxel-xy` / `--voxel-z` / `--origin X Y Z` |
+
+`--hu-from-header` applies the GE `water`/`air` anchors as
+`HU = 1000 (v - water) / (water - air)`. It is **off** by default because
+that mapping has already been applied before quantization in every file
+this pipeline sees — on Scan_1988's `Half-scan-75um.vff` the header's float
+`min=-34.353283` maps through it to exactly the stored integer minimum
+`-9949`, so re-applying it would rescale HU by ~254x. Use it only for a
+foreign volume that genuinely stores raw values.
+
+The report measures the air and soft-tissue histogram peaks (whole-array, not
+a central box — a central box is what once made the two-point self-calibration
+lock onto lung) and warns when they are not where HU says they should be. The
+vendor's own Scan_1988 volume trips this: its air peak sits at -1209 HU, i.e.
+it is on a slightly different scale to ours. That is a finding about the file,
+not a failure of the report — nothing is rescaled.
+
 ## Usage
 
 ```bash
@@ -484,6 +668,10 @@ python -m reconstruction.run_fdk_recon data/scans/Scan_1510 --roi auto
 # Iterative (ASTRA SIRT)
 python -m reconstruction.run_iterative_recon data/scans/Scan_1988 \
     --backend astra --algorithm SIRT3D_CUDA --iterations 100
+
+# Report on a volume that already exists (W&B on by default)
+python -m reconstruction.run_volume_report \
+    data/scans/Scan_1988/Volumes/Half-scan-75um.vff --algorithm vendor_fdk
 ```
 
 Run `--help` for full argument lists.
@@ -504,6 +692,12 @@ Run `--help` for full argument lists.
 | `--model-domain` | `auto` | Iterative/learned: region the forward model must cover, measured from the projections (`off` / `EXTENT_XY HALF_Z`) |
 | `--rays-per-batch` | `auto` | Learned backend: batch sized from free VRAM |
 | `--compile` | `off` | Learned backend: fuse renderer kernels (needs sm_70+) |
+| `--hu-calibration` | `auto` | Fit both HU anchors from the volume's histogram; `fixed` = classical one-point map with `--mu-water` |
+| `--tissue-hu` | 120 | Where bulk soft tissue lands (vendor's scale). This one number sets the gain — the assumption reference-free calibration cannot escape. Use 0 for a water phantom; `auto` mode only |
+| `--save-mu` | off | Also write `<output>_mu.npy` (float32 μ, mm⁻¹) |
+| `--wandb` | off (**on** for `run_volume_report`) | Log to Weights & Biases; `--no-wandb` opts the report out |
+| `--recalibrate` / `--diagnose-calibration` | off | `run_volume_report`: fit the anchors on an existing volume, with / without applying them |
+| `--hu-from-header` | off | `run_volume_report`: re-apply the VFF water/air anchors (~254x on vendor files — see above) |
 
 ## Installation
 

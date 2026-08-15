@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import os
 import sys
 
-from ..ct_core.calibration import default_mu_water, mu_to_hu
+from ..ct_core.calibration import default_mu_water
 from ..ct_core.preprocessing import (air_normalize_sinogram, apply_bhc,
                                      ring_artifact_correction,
                                      soft_clamp_transmission)
@@ -126,7 +126,7 @@ def _interpolate_metal_pixels(sinogram_chunk, mask):
 
 class FDKReconstructor:
     def __init__(self, projections, angles, geometry, source_locations, folder_name,
-                 mu_water=None, output_hu=False,
+                 mu_water=None, quantitative=False,
                  bright_field=None, dark_field=None,
                  clamp_mode="none", soft_clip_transmission=True,
                  soft_clip_sharpness=200.0, upper_clamp=True, upper_clamp_value=1.05,
@@ -152,8 +152,15 @@ class FDKReconstructor:
            - central_pixel_a: detector center column
            - central_pixel_b: detector center row
         source_locations: list of source locations in the form [(x1, y1, z1), (x2, y2, z2), ...]
-        mu_water: float, linear attenuation coefficient of water in mm⁻¹ for HU conversion
-        output_hu: bool, if True, convert output to Hounsfield Units
+        mu_water: float, linear attenuation coefficient of water in mm⁻¹. Kept
+            only for callers that still want the one-point convention; the
+            reconstruction itself no longer uses it. HU calibration happens
+            once, downstream, in ct_core.hu_calibration.
+        quantitative: bool, if True (and bright/dark fields are supplied),
+            apply flat-field correction and the log transform so the output is
+            linear attenuation μ in mm⁻¹ rather than raw filtered intensity.
+            Was called output_hu, which was misleading: it gated preprocessing
+            as much as it gated the (now removed) HU conversion.
         bright_field: np.ndarray, unattenuated beam reference (I₀) for flat-field correction [height, width]
         dark_field: np.ndarray, electronic noise reference for flat-field correction [height, width]
         clamp_mode: str, line integral clamping mode ("none", "soft", "hard")
@@ -231,9 +238,10 @@ class FDKReconstructor:
         self.source_locations = source_locations
         self.folder_name = folder_name
 
-        # HU calibration parameters
+        # Reconstruction produces μ; HU calibration is downstream (see
+        # ct_core.hu_calibration). mu_water is retained only for reporting.
         self.mu_water = default_mu_water(mu_water, bhc_coeffs)
-        self.output_hu = output_hu
+        self.quantitative = quantitative
         self.bright_field = bright_field
         self.dark_field = dark_field
         self.clamp_mode = clamp_mode
@@ -566,13 +574,13 @@ class FDKReconstructor:
         in a single GPU pass per chunk. Replaces sequential preprocess() → pre_weight()
         → ramp_filter() calls for ~2× fewer data transfers.
 
-        When output_hu=True with bright/dark fields: applies full flat-field correction,
+        When quantitative=True with bright/dark fields: applies full flat-field correction,
         transmission clamping, log transform, cone-beam weighting, and ramp filtering.
 
-        When output_hu=False (or no bright/dark fields): applies only cone-beam weighting
+        When quantitative=False (or no bright/dark fields): applies only cone-beam weighting
         and ramp filtering on the raw projections.
         """
-        do_preprocess = (self.output_hu and self.bright_field is not None
+        do_preprocess = (self.quantitative and self.bright_field is not None
                          and self.dark_field is not None)
 
         # --- Pre-compute constants on GPU (before loop) ---
@@ -985,27 +993,21 @@ class FDKReconstructor:
             self.reconstructed_volume *= delta_beta
         print(f"Angular step: Δβ = {float(delta_beta):.6f} rad ({float(delta_beta) * 180 / np.pi:.4f}°)")
 
-    def convert_to_hu(self):
-        """
-        Convert reconstructed volume from true μ (mm⁻¹) to Hounsfield Units.
+    def finalize_volume(self):
+        """Move the finished μ volume off the GPU, freeing VRAM.
 
-        Uses physics-based conversion: HU = (μ - μ_water) / μ_water × 1000
-
-        This produces approximate HU values. The final polynomial calibration
-        (from phantom insert measurements) is applied in run_fdk_recon.py.
+        This used to be convert_to_hu(), which folded the device transfer
+        together with a one-point HU conversion and a clip to [-1024, 4095].
+        The conversion is gone (HU is fitted downstream from the volume's own
+        histogram, so it must not be baked in here) but the transfer is not
+        incidental: on a 1 G-voxel reconstruction, releasing the GPU copy
+        before the save stage is what keeps the run inside VRAM.
         """
-        vol_np = self.reconstructed_volume.cpu().numpy() if hasattr(self.reconstructed_volume, 'cpu') else self.reconstructed_volume
+        vol = self.reconstructed_volume
+        vol_np = vol.cpu().numpy() if hasattr(vol, 'cpu') else vol
         del self.reconstructed_volume
         torch.cuda.empty_cache()
-
-        print("=" * 60)
-        print("Physics-based HU Calibration (true μ output)")
-        print("=" * 60)
-
-        print(f"  μ_water pipeline: "
-              f"{'BHC' if self.bhc_coeffs is not None else 'no-BHC'}")
-        self.reconstructed_volume = mu_to_hu(vol_np, self.mu_water)
-        print("=" * 60)
+        self.reconstructed_volume = np.asarray(vol_np, dtype=np.float32)
 
     def display_volume(self):
 
@@ -1059,12 +1061,17 @@ class FDKReconstructor:
         """
         Complete reconstruction pipeline.
 
-        If output_hu is True and bright_field/dark_field are provided:
+        If quantitative is True and bright_field/dark_field are provided:
         1. Applies proper preprocessing (flat-field correction + log transform)
         2. Runs FDK reconstruction
-        3. Converts to Hounsfield Units using theoretical calibration
 
         Otherwise, runs standard FDK on raw intensities.
+
+        Returns linear attenuation μ (mm⁻¹) — NOT Hounsfield Units, and not
+        clipped. HU calibration is a single downstream step shared by every
+        backend (ct_core.hu_calibration, applied in ct_core.pipeline's output
+        stage), so that the scale is fitted once, from the finished volume,
+        rather than baked in here with a stale scanner constant.
         """
         # Step 1+2: Fused preprocessing + weighting + filtering (single GPU pass)
         print("\nApplying fused preprocessing + weighting + filtering...")
@@ -1100,10 +1107,15 @@ class FDKReconstructor:
             print("Pass 2: Backprojecting corrected sinogram...")
             self.backprojection()
 
-        # Step 3: Optional HU conversion
-        if self.output_hu:
-            print("\nConverting to Hounsfield Units...")
-            self.convert_to_hu()
+        # No HU conversion here — the volume stays in μ (mm⁻¹) and unclipped
+        # so the downstream calibrator can see the real air peak. Clipping it
+        # to [-1024, 4095] at this point put 19-44 % of voxels onto exactly
+        # the floor, which destroyed the one anchor that is physically exact.
+        self.finalize_volume()
+        vol = self.reconstructed_volume
+        print(f"\nReconstructed μ range: [{float(vol.min()):.6f}, "
+              f"{float(vol.max()):.6f}] mm⁻¹ (uncalibrated; HU calibration "
+              f"happens once, at save time)")
 
         if display_volume == True:
             self.display_volume()

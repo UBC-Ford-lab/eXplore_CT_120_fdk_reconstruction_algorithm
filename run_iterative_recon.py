@@ -25,7 +25,6 @@ import numpy as np
 
 from .iterative.astra import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
 from .iterative.tigre import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
-from .ct_core.calibration import default_mu_water
 from .ct_core.data_budget import classical_budget, measurement_count
 from .ct_core.pipeline import (
     ReconLogger,
@@ -393,7 +392,6 @@ def main():
             super_sampling=args.super_sampling,
             bright_field=ctx.bright_field,
             dark_field=ctx.dark_field,
-            output_hu=True,
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             air_normalization=args.air_normalization,
@@ -414,7 +412,6 @@ def main():
             gpu_index=args.gpu_index,
             bright_field=ctx.bright_field,
             dark_field=ctx.dark_field,
-            output_hu=True,
             bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             air_normalization=args.air_normalization,
@@ -474,9 +471,11 @@ def main():
             measured = preprocess_frames(
                 ctx.projections[eval_idx:eval_idx + 1], ctx,
                 bhc_coeffs=args.bhc_coeffs)[0]
+            # The volume is mu now, so it goes to the forward model as-is
+            # — no round trip through an assumed mu_water.
             pred, target = render_projection_from_volume(
                 reconstructor.reconstructed_volume, ctx, eval_idx, measured,
-                mu_water=default_mu_water(None, args.bhc_coeffs))
+                volume_is_hu=False)
             logger.log_projection_diag(pred, target)
         except Exception as e:
             print(f"  Final projection diagnostics failed "
@@ -490,11 +489,12 @@ def main():
         reconstructor.reconstructed_volume, ctx.geometry)
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
-    save_outputs(vol_export, ctx, args, output_path)
+    _, _, volume_hu = save_outputs(vol_export, ctx, args, output_path,
+                                   logger=logger)
 
     logger.log_sinogram_preview(ctx.projections)
-    logger.log_volume_summary(vol_export, ctx)
-    logger.log_recon_slices(vol_export)
+    logger.log_volume_summary(volume_hu, ctx)
+    logger.log_recon_slices(volume_hu)
     logger.finish()
 
     end = time.time()

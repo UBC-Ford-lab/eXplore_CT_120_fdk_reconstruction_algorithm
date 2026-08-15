@@ -32,7 +32,6 @@ try:
 except ImportError:
     _ssim_fn = None
 
-from ...ct_core.calibration import default_mu_water, mu_to_hu
 from ...ct_core.preprocessing import preprocess_sinogram
 from ...ct_core.utils import query_gpu_memory
 
@@ -263,7 +262,6 @@ class TIGREReconstructor:
                  clamp_mode='none', soft_clip_transmission=True,
                  soft_clip_sharpness=200.0, upper_clamp=True,
                  upper_clamp_value=1.05,
-                 mu_water=None, output_hu=True,
                  bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51,
                  air_normalization=True,
@@ -308,8 +306,6 @@ class TIGREReconstructor:
             soft_clip_sharpness: Sharpness of soft clip transition
             upper_clamp: Clamp transmission from above
             upper_clamp_value: Maximum allowed transmission value
-            mu_water: Linear attenuation coefficient of water (mm^-1)
-            output_hu: Convert output to Hounsfield Units
             bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None
             ring_correction: Apply sinogram-space ring artifact correction
             ring_median_width: Median filter width for ring correction (odd int)
@@ -429,10 +425,6 @@ class TIGREReconstructor:
         self.upper_clamp = upper_clamp
         self.upper_clamp_value = upper_clamp_value
 
-        # HU conversion parameters
-        self.mu_water = default_mu_water(mu_water, bhc_coeffs)
-        self.output_hu = output_hu
-
         # BHC and ring correction
         self.bhc_coeffs = bhc_coeffs
         self.ring_correction = ring_correction
@@ -534,24 +526,25 @@ class TIGREReconstructor:
           1. transpose to FDK convention (x, y, z) -- reconstruct() step 6
           2. center-crop the (possibly CUDA-hang-padded) volume down to the
              original ROI dimensions -- reconstruct() step 6b
-          3. optional HU conversion (physics-based, skip_calibration
-             convention: no two-point recalibration) -- reconstruct() step 7
-          4. transpose + y-flip to on-disk VFF convention (z, y, x), matching
+          3. transpose + y-flip to on-disk VFF convention (z, y, x), matching
              ct_core/scan_setup.py's write step (vol.transpose(2,1,0)[:, ::-1, :])
 
         Shared by the end-of-reconstruct() final-volume path and the
         per-checkpoint export path so both are calibrated/oriented
         identically -- see checkpoint_dir docstring in __init__.
 
-        Returns a float32 array in (z, y, x) on-disk convention, HU-clipped
-        to [-1024, 4095] if output_hu, uncropped in xy/z (caller slices).
+        Returns a float32 array in (z, y, x) on-disk convention, in μ (mm⁻¹)
+        and unclipped, uncropped in xy/z (caller slices).
+
+        Checkpoints stay in μ deliberately. HU calibration is fitted from the
+        histogram of a whole volume, and a crossval checkpoint is a thin slab
+        that need not contain either anchor population — calibrating each slab
+        against its own histogram would make successive checkpoints drift on
+        an inconsistent scale, which is the opposite of what a convergence
+        series is for.
         """
         vol = vol_tigre.transpose(2, 1, 0).astype(np.float32)  # (x, y, z)
         vol = self._crop_to_roi(vol, Nx_orig, Ny_orig, Nz_orig)
-
-        if self.output_hu:
-            vol = mu_to_hu(vol, self.mu_water, verbose=False)
-
         return vol.transpose(2, 1, 0)[:, ::-1, :]  # (z, y, x), on-disk convention
 
     def _save_checkpoint(self, vol_tigre, i_done, Nx_orig, Ny_orig, Nz_orig):
@@ -565,9 +558,8 @@ class TIGREReconstructor:
             slab = vol_disk[z0:z1]
         out_path = Path(self.checkpoint_dir) / f"iter{i_done:04d}.npy"
         np.save(out_path, slab)
-        unit_str = f"[{slab.min():.0f}, {slab.max():.0f}] HU" if self.output_hu else \
-            f"[{slab.min():.4f}, {slab.max():.4f}] (raw)"
-        print(f"  [checkpoint] saved {out_path.name} {slab.shape} {unit_str}")
+        print(f"  [checkpoint] saved {out_path.name} {slab.shape} "
+              f"[{slab.min():.6f}, {slab.max():.6f}] mm^-1 (uncalibrated μ)")
 
     def reconstruct(self):
         """
@@ -981,12 +973,9 @@ class TIGREReconstructor:
 
         print(f"  Reordered to FDK convention: {self.reconstructed_volume.shape} (x, y, z)")
 
-        # Step 7: Optional HU conversion (shared ct_core definition)
-        if self.output_hu:
-            print("\nConverting to Hounsfield Units...")
-            self.reconstructed_volume = mu_to_hu(self.reconstructed_volume,
-                                                 self.mu_water)
-
+        # No HU conversion: the volume stays in μ (mm⁻¹), unclipped, and is
+        # calibrated once downstream (ct_core.hu_calibration) so every backend
+        # lands on one scale fitted from the finished volume.
         print("\nReconstruction complete.")
         return self.reconstructed_volume
 

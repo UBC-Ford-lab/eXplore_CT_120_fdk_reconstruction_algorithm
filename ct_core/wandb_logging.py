@@ -50,13 +50,21 @@ from .projection_diag import (
 
 # ---------------------------------------------------------------- CLI args --
 
-def add_wandb_args(parser) -> None:
-    """Logging flags shared by every driver (called from add_common_args)."""
+def add_wandb_args(parser, wandb_default: bool = False) -> None:
+    """Logging flags shared by every driver (called from add_common_args).
+
+    ``wandb_default`` flips whether W&B is opt-in or opt-out. The
+    reconstruction drivers leave it off — a run costs GPU hours and should
+    not silently publish. run_volume_report turns it on: it is cheap, and it
+    exists to put a volume next to the runs already in the project. The
+    driver that turns it on is responsible for adding its own ``--no-wandb``.
+    """
     parser.add_argument(
-        '--wandb', action='store_true', default=False,
-        help='Log this reconstruction to Weights & Biases (default: off). '
-             'Requires --wandb-project or the WANDB_PROJECT env var; auth via '
-             '`wandb login` or WANDB_API_KEY. Runs go to your own account.')
+        '--wandb', action='store_true', default=wandb_default,
+        help=f'Log this reconstruction to Weights & Biases '
+             f'(default: {"on" if wandb_default else "off"}). '
+             f'Requires --wandb-project or the WANDB_PROJECT env var; auth via '
+             f'`wandb login` or WANDB_API_KEY. Runs go to your own account.')
     parser.add_argument(
         '--wandb-project', default=None,
         help='W&B project name (default: $WANDB_PROJECT). Never hardcoded — '
@@ -231,10 +239,15 @@ def sanitized_config(ctx, args, algorithm: str, params: dict | None) -> dict:
         "n_angles": int(np.asarray(ctx.angles).shape[0]),
         "total_angle_deg": float(getattr(ctx, "total_angle", 0.0) or 0.0),
         "downsample": int(getattr(ctx, "downsample", 1) or 1),
-        "bhc_coeffs": list(args.bhc_coeffs) if getattr(args, "bhc_coeffs", None) else None,
-        "ring_correction": bool(getattr(args, "ring_correction", False)),
-        "air_normalization": bool(getattr(args, "air_normalization", True)),
     }
+    # Sinogram preprocessing, recorded only when the driver actually has these
+    # knobs. A driver that never touched the projections (run_volume_report)
+    # would otherwise publish a default as if it were a setting.
+    if hasattr(args, "bhc_coeffs"):
+        cfg["bhc_coeffs"] = list(args.bhc_coeffs) if args.bhc_coeffs else None
+    for key in ("ring_correction", "air_normalization"):
+        if hasattr(args, key):
+            cfg[key] = bool(getattr(args, key))
     for key in _GEOMETRY_KEYS:
         if key in ctx.geometry:
             v = ctx.geometry[key]
@@ -421,14 +434,15 @@ class ReconLogger:
         except Exception as e:                                # noqa: BLE001
             print(f"W&B summary update failed ({type(e).__name__}: {e})")
 
-    def log_volume_summary(self, volume_hu, ctx) -> None:
+    def log_volume_summary(self, volume_hu, ctx, hu_window=HU_WINDOW) -> None:
         """Three individual midplane views + HU histogram + summary scalars
         for any backend."""
         vol = np.asarray(volume_hu)
         if self.plots_enabled or self.run is not None:
             for name, sl, xl, yl, extent in midplane_views(vol, ctx.geometry):
                 self._emit(f"view_{name}",
-                           single_view_figure(name, sl, xl, yl, extent))
+                           single_view_figure(name, sl, xl, yl, extent,
+                                              hu_window=hu_window))
             self._emit("hu_histogram", hu_histogram_figure(vol))
         if self.run is not None:
             p = np.percentile(vol, (1, 50, 99, 99.9))
@@ -440,6 +454,26 @@ class ReconLogger:
             })
 
     # -- projection diagnostics (diag/*) --------------------------------
+
+    def log_hu_calibration(self, anchors) -> None:
+        """Record the fitted HU map: the two anchors, the resulting scale and
+        offset, the quality measures behind them, and the annotated histogram.
+
+        Worth logging on every run rather than only when it looks wrong. The
+        scale is fitted per volume, so it is a property OF the run, not of the
+        scanner — two runs whose HU differ may simply have anchored
+        differently, and without these numbers there is no way to tell that
+        apart from a real difference in the reconstruction.
+        """
+        from .hu_calibration import calibration_figure, calibration_scalars
+
+        self.set_summary(calibration_scalars(anchors))
+        for w in getattr(anchors, "warnings", []):
+            print(f"  HU calibration WARNING: {w}")
+        if self.plots_enabled or self.run is not None:
+            fig = calibration_figure(anchors)
+            if fig is not None:
+                self._emit("hu_calibration", fig)
 
     def set_noise_ceiling(self, ceiling: dict | None) -> None:
         """Attach the measured noise ceiling (projection_diag.

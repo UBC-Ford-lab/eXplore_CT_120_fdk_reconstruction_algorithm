@@ -30,14 +30,11 @@ try:
         load_calibration_fields,
         flat_field_correction,
         log_transform_transmission,
-        convert_to_hounsfield_units,
         MU_WATER_80KV,
         MU_WATER_80KV_NO_BHC,
         MU_WATER_80KV_WITH_BHC,
         MU_AIR,
-        fit_hu_calibration,
         default_mu_water,
-        mu_to_hu,
     )
 except ImportError:
     pass
@@ -98,12 +95,10 @@ __all__ = [
     'load_calibration_fields',
     'flat_field_correction',
     'log_transform_transmission',
-    'convert_to_hounsfield_units',
     'MU_WATER_80KV',
     'MU_WATER_80KV_NO_BHC',
     'MU_WATER_80KV_WITH_BHC',
     'MU_AIR',
-    'fit_hu_calibration',
     # TIFF
     'save_vff_to_tiff',
     # Preprocessing
@@ -114,7 +109,6 @@ __all__ = [
     'downsample_projections',
     # HU helpers
     'default_mu_water',
-    'mu_to_hu',
     # System utilities
     'utils',
     'query_gpu_memory',

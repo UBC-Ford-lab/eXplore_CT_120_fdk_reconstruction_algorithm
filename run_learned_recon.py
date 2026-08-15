@@ -265,7 +265,6 @@ def main():
         compile_mode=args.compile_mode,
         bright_field=ctx.bright_field,
         dark_field=ctx.dark_field,
-        output_hu=True,
         bhc_coeffs=args.bhc_coeffs,
         ring_correction=args.ring_correction,
         air_normalization=args.air_normalization,
@@ -306,13 +305,14 @@ def main():
         reconstructor.reconstructed_volume, ctx.geometry)
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
-    save_outputs(vol_export, ctx, args, output_path)
+    _, _, volume_hu = save_outputs(vol_export, ctx, args, output_path,
+                                   logger=logger)
 
     # replay_steps=False: the trainer already streamed these live via diag_fn.
     logger.log_convergence(reconstructor.crossval_history, replay_steps=False)
     logger.log_sinogram_preview(ctx.projections)
-    logger.log_volume_summary(vol_export, ctx)
-    logger.log_recon_slices(vol_export)
+    logger.log_volume_summary(volume_hu, ctx)
+    logger.log_recon_slices(volume_hu)
     logger.finish()
 
     end = time.time()

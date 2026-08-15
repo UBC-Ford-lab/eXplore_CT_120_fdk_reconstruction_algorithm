@@ -42,4 +42,4 @@ Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_
 include = ["ct_core*", "fdk*", "iterative*", "learning_based_iterative*"]
 
 [tool.setuptools]
-py-modules = ["run_fdk_recon", "run_iterative_recon", "run_learned_recon", "run_geometry_calibration"]
+py-modules = ["run_fdk_recon", "run_iterative_recon", "run_learned_recon", "run_geometry_calibration", "run_volume_report"]

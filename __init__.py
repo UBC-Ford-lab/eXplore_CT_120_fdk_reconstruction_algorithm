@@ -34,10 +34,8 @@ try:
         load_calibration_fields,
         flat_field_correction,
         log_transform_transmission,
-        convert_to_hounsfield_units,
         MU_WATER_80KV,
         MU_AIR,
-        fit_hu_calibration,
     )
 except ImportError:
     pass

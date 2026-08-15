@@ -16,7 +16,13 @@ import numpy as np
 import xmltodict
 
 from .vff_io import VFFDataset, write_vff
-from .calibration import load_calibration_fields, MU_WATER_80KV
+from .calibration import load_calibration_fields
+from .hu_calibration import (
+    TISSUE_HU_DEFAULT,
+    find_attenuation_anchors,
+    fixed_anchors,
+    format_calibration,
+)
 
 
 def auto_detect_scan_folder(data_folder: str) -> str:
@@ -347,102 +353,101 @@ def _hist_mode(values, bins=256, clip_pct=(0.5, 99.5)):
     return float(centers[k])
 
 
-def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
+def postprocess_and_save(volume_mu, geometry, output_path,
+                         bilateral_filter=False,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
-                         voxel_xy=0.075, skip_calibration=False):
-    """
-    Apply two-point HU calibration, optional bilateral filter, and save as VFF.
+                         voxel_xy=0.075,
+                         hu_calibration='auto', mu_water=None,
+                         tissue_hu=None, save_mu=False, anchors=None):
+    """Calibrate a reconstructed volume to HU, optionally filter it, write VFF.
 
-    Two-point calibration measures air and water/tissue from the volume itself,
-    then applies the standard CT HU formula:
-        HU = (raw - water) / (water - air) × 1000
-    Self-calibrating — works regardless of BHC, filter, or normalization.
+    ``volume_mu`` is linear attenuation (mm^-1) straight out of a backend:
+    unclipped, unconverted. Every backend now returns exactly that, so this is
+    the single place in the package where the HU scale is decided.
+
+    Calibration fits BOTH degrees of freedom of the affine error a
+    reconstruction carries (gain and offset) against two facts that hold for
+    every scan — air is zero attenuation, and the bulk of what we image is
+    soft tissue. See ct_core.hu_calibration for why that is a two-anchor
+    problem and why the anchors are found from the histogram's shape rather
+    than from thresholds or a fixed central box.
+
+    What this replaced, and why:
+      * a one-point map with a hardcoded scanner constant (mu_water = 0.0219),
+        empirically back-fitted to a single 2022 scan. It fits the gain only,
+        assumes zero offset, and does not transfer: measured on finished
+        volumes, the same constant put soft tissue at -69 HU on one scan and
+        -297 HU on another.
+      * a clip to [-1024, 4095] applied before anything could measure the
+        volume. On real reconstructions that pinned 19-44 % of all voxels onto
+        exactly the floor, destroying the air peak — the one anchor that is
+        physically exact — and saturating the bone tail at the top.
+      * a two-point fallback that read its water anchor from a fixed 30x30
+        central box, which in a mouse is lung. It was disabled by default,
+        so in practice nothing was ever calibrated.
 
     Args:
-        volume: Reconstructed volume as numpy array (x, y, z) in uncalibrated HU
-        geometry: Geometry dict (needs 'dx', 'dz' for VFF spacing)
-        output_path: Base output path (without .vff extension)
-        bilateral_filter: Whether to apply bilateral filter
-        bilateral_sigma_spatial: Bilateral filter spatial sigma in mm
-        bilateral_sigma_range: Bilateral filter intensity sigma in HU
-        voxel_xy: Voxel size in xy plane in mm (for bilateral filter conversion)
-        skip_calibration: If True, skip two-point calibration and save the
-            physics-based HU output directly. Useful when comparing filter
-            settings where the auto-measured water peak varies with noise.
+        volume_mu: (x, y, z) attenuation array (numpy or torch).
+        geometry: geometry dict; 'dx'/'dz' set the VFF voxel size.
+        output_path: base path, no extension.
+        bilateral_filter: apply an edge-preserving denoise after calibration.
+        bilateral_sigma_spatial: bilateral spatial sigma in mm.
+        bilateral_sigma_range: bilateral intensity sigma in HU.
+        voxel_xy: voxel size in mm, for the bilateral sigma conversion.
+        hu_calibration: 'auto' fits both anchors from this volume's histogram;
+            'fixed' pins the gain to ``mu_water`` and air to zero attenuation,
+            reproducing the classical one-point map through the same code path.
+        mu_water: attenuation of water (mm^-1); required by 'fixed'.
+        tissue_hu: where the bulk-tissue anchor should land. Default 120 HU,
+            matching the vendor's scale for the same specimens; pass 0 for a
+            water phantom. This single number IS the gain assumption — see
+            hu_calibration.
+        save_mu: also write the uncalibrated attenuation as <output>_mu.npy.
+            This replaces the old '_uncalibrated.vff', which was written in the
+            same already-converted, already-clipped units as the calibrated
+            file and was therefore byte-identical to it.
+        anchors: a pre-fitted HUAnchors to apply instead of fitting. Use it to
+            put several volumes on one common scale.
 
     Returns:
-        Path to saved VFF file
+        (path to the written VFF, the HUAnchors that were applied, the
+        calibrated HU volume). The volume comes back so callers report and
+        plot the same numbers they shipped, rather than re-deriving them or —
+        as the drivers previously did — plotting the pre-calibration array.
     """
-    # Extract volume as numpy (x, y, z)
-    vol_np = volume.cpu().numpy() if hasattr(volume, 'cpu') else volume
+    vol_np = volume_mu.cpu().numpy() if hasattr(volume_mu, 'cpu') else volume_mu
+    vol_np = np.asarray(vol_np, dtype=np.float32)
 
-    if skip_calibration:
-        print("\n" + "=" * 60)
-        print("Skipping two-point calibration (physics HU only)")
-        print("=" * 60)
-        vol_calibrated = np.clip(vol_np, -1024, 4095).astype(np.float32)
-    elif True:
-        # --- Mode 2: Two-point linear calibration (standard CT formula) ---
-        # Measures air and water/tissue peaks from the volume histogram,
-        # then maps: HU = (raw - water_peak) / (water_peak - air_peak) * 1000
-        # This is the standard CT HU definition and works regardless of
-        # BHC, filter, or normalization settings.
-        print("  Mode: two-point linear calibration (air/water from histogram)")
+    print("\n" + "=" * 60)
+    print("HU calibration")
+    print("=" * 60)
 
-        # --- Measure air value: mode (histogram peak) of voxels below -500 HU ---
-        # The <-500 population is right-skewed (sharp air peak + partial-volume
-        # shoulder toward tissue); its mode, not its median, is the true air
-        # spike. Anchoring the mode to -1000 keeps the air peak cleanly on -1000
-        # instead of pushing it below (median > mode for this skew).
-        air_voxels = vol_np[vol_np < -500.0]
-        air_mode = _hist_mode(air_voxels) if len(air_voxels) > 0 else None
-        if air_mode is not None:
-            hu_air = air_mode
+    if anchors is None:
+        if hu_calibration == 'fixed':
+            if mu_water is None:
+                raise ValueError(
+                    "hu_calibration='fixed' needs an explicit mu_water")
+            # tissue_hu deliberately does NOT apply here: this mode's second
+            # anchor is water at 0 HU by definition, not a measured tissue
+            # peak. Say so rather than ignoring the flag in silence.
+            if tissue_hu is not None:
+                print(f"  NOTE: --tissue-hu {float(tissue_hu):.0f} ignored — "
+                      f"it places the measured bulk-tissue peak, and "
+                      f"hu_calibration='fixed' anchors WATER (0 HU) via "
+                      f"mu_water instead.")
+            anchors = fixed_anchors(float(mu_water))
+        elif hu_calibration == 'auto':
+            anchors = find_attenuation_anchors(
+                vol_np,
+                tissue_hu=(TISSUE_HU_DEFAULT if tissue_hu is None
+                           else float(tissue_hu)))
         else:
-            print("  WARNING: no air voxels found — using -1000")
-            hu_air = -1000.0
+            raise ValueError(
+                f"unknown hu_calibration mode {hu_calibration!r} "
+                f"(expected 'auto' or 'fixed')")
 
-        # --- Measure water/tissue value from central ROI ---
-        # Small central ROI (30×30 voxels ≈ 2.25 mm), only z-slices
-        # where the center is inside the object (not air).
-        # Volume is (x, y, z).
-        Nx, Ny, Nz = vol_np.shape
-        cx, cy = Nx // 2, Ny // 2
-        h = min(15, Nx // 10, Ny // 10)
-        center_line = vol_np[cx - h:cx + h, cy - h:cy + h, :]
-        z_means = center_line.mean(axis=(0, 1))
-        inside_mask = z_means > -500.0  # z-slices where center is object
-        n_inside = int(inside_mask.sum())
-
-        if n_inside > 10:
-            center_inside = center_line[:, :, inside_mask]
-            water_mode = _hist_mode(center_inside.ravel())
-            hu_water = water_mode if water_mode is not None else 0.0
-            print(f"  Water/tissue ROI: {n_inside} z-slices inside object")
-        else:
-            print("  WARNING: could not segment inside/outside — using 0")
-            hu_water = 0.0
-
-        print(f"  Air value:   {hu_air:.1f} HU")
-        print(f"  Water value: {hu_water:.1f} HU")
-
-        if abs(hu_water - hu_air) < 1.0:
-            print("  WARNING: air and water peaks are too close — "
-                  "falling back to literature values")
-            hu_air = -1000.0
-            hu_water = 0.0
-
-        # Standard CT HU formula: water → 0, air → -1000
-        scale = 1000.0 / (hu_water - hu_air)
-        vol_calibrated = ((vol_np - hu_water) * scale).astype(np.float32)
-        vol_calibrated = np.clip(vol_calibrated, -1024, 4095)
-
-        # Verify calibration
-        print(f"  Scale factor: {scale:.4f}")
-        print(f"  Verification: air ({hu_air:.1f}) → "
-              f"{(hu_air - hu_water) * scale:.0f} HU")
-        print(f"  Verification: water ({hu_water:.1f}) → "
-              f"{(hu_water - hu_water) * scale:.0f} HU")
+    print(format_calibration(anchors))
+    vol_calibrated = anchors.apply(vol_np)
 
     # Optional bilateral filter (edge-preserving denoising)
     if bilateral_filter:
@@ -470,7 +475,6 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         print(f"  Bilateral filter applied in {t_bf_end - t_bf:.1f}s "
               f"({Nz_slices} slices)")
 
-    # Save uncalibrated VFF (physics-based HU only, no polynomial).
     # elementsize is the GE `ncaa` scalar voxel size (mm); spacing is kept for
     # the anisotropy warning in write_vff (dz != dx cannot be expressed).
     vff_meta = {
@@ -478,15 +482,25 @@ def postprocess_and_save(volume, geometry, output_path, bilateral_filter=False,
         'elementsize': geometry['dx'],
         'spacing': f"{geometry['dx']} {geometry['dx']} {geometry['dz']}",
     }
-    uncal_path = output_path + '_uncalibrated.vff'
-    vol_uncal_vff = vol_np.astype(np.int16).transpose(2, 1, 0)[:, ::-1, :]
-    write_vff(uncal_path, vff_meta, vol_uncal_vff)
-    print(f"Uncalibrated VFF saved to: {uncal_path}")
 
-    # Save calibrated VFF using write_vff with transpose/y-flip (matching fdk.py:688)
+    # The uncalibrated companion is the ATTENUATION, as float32. Writing it as
+    # a VFF was pointless: int16 cannot represent mu ~ 0.02 mm^-1 at all, and
+    # because the old code had already converted and clipped before this
+    # point, the "_uncalibrated.vff" it produced was byte-identical to the
+    # calibrated one whenever calibration was skipped — which was the default.
+    if save_mu:
+        mu_path = output_path + '_mu.npy'
+        np.save(mu_path, vol_np)
+        print(f"Uncalibrated attenuation (float32 mu, mm^-1) saved to: {mu_path}")
+
+    # Hand write_vff the float HU volume and let it round and clip: it rounds
+    # to nearest (astype truncates toward zero, a systematic +0.5 HU bias on
+    # the air floor) and clips to the full int16 range with a warning, rather
+    # than wrapping. Pre-casting here with .astype(np.int16), as this used to,
+    # bypassed both protections.
     cal_path = output_path + ('_bilateral.vff' if bilateral_filter else '.vff')
-    vol_vff = vol_calibrated.astype(np.int16).transpose(2, 1, 0)[:, ::-1, :]
+    vol_vff = vol_calibrated.transpose(2, 1, 0)[:, ::-1, :]
     write_vff(cal_path, vff_meta, vol_vff)
     print(f"Calibrated VFF saved to: {cal_path}")
 
-    return cal_path
+    return cal_path, anchors, vol_calibrated

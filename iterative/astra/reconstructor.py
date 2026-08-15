@@ -17,7 +17,6 @@ try:
 except ImportError:
     astra = None
 
-from ...ct_core.calibration import default_mu_water, mu_to_hu
 from ...ct_core.preprocessing import preprocess_sinogram
 from ...ct_core.utils import query_gpu_memory
 
@@ -137,7 +136,6 @@ class ASTRAReconstructor:
                  clamp_mode='none', soft_clip_transmission=True,
                  soft_clip_sharpness=200.0, upper_clamp=True,
                  upper_clamp_value=1.05,
-                 mu_water=None, output_hu=True,
                  bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51,
                  air_normalization=True):
@@ -160,8 +158,6 @@ class ASTRAReconstructor:
             soft_clip_sharpness: Sharpness of soft clip transition
             upper_clamp: Clamp transmission from above
             upper_clamp_value: Maximum allowed transmission value
-            mu_water: Linear attenuation coefficient of water (mm^-1)
-            output_hu: Convert output to Hounsfield Units
             bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None
             ring_correction: Apply sinogram-space ring artifact correction
             ring_median_width: Median filter width for ring correction (odd int)
@@ -192,10 +188,6 @@ class ASTRAReconstructor:
         self.soft_clip_sharpness = soft_clip_sharpness
         self.upper_clamp = upper_clamp
         self.upper_clamp_value = upper_clamp_value
-
-        # HU conversion parameters
-        self.mu_water = default_mu_water(mu_water, bhc_coeffs)
-        self.output_hu = output_hu
 
         # BHC and ring correction
         self.bhc_coeffs = bhc_coeffs
@@ -418,11 +410,8 @@ class ASTRAReconstructor:
             if vol_id is not None:
                 astra.data3d.delete(vol_id)
 
-        # Step 8: Optional HU conversion (shared ct_core definition)
-        if self.output_hu:
-            print("\nConverting to Hounsfield Units...")
-            self.reconstructed_volume = mu_to_hu(self.reconstructed_volume,
-                                                 self.mu_water)
-
+        # No HU conversion: the volume stays in μ (mm⁻¹), unclipped, and is
+        # calibrated once downstream (ct_core.hu_calibration) so every backend
+        # lands on one scale fitted from the finished volume.
         print("\nReconstruction complete.")
         return self.reconstructed_volume

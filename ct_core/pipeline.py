@@ -266,19 +266,49 @@ def add_common_args(parser):
              'Larger = more aggressive.'
     )
     parser.add_argument(
-        '--skip-calibration',
-        action='store_true',
-        default=True,
-        help='Skip two-point auto-calibration; save physics-based HU directly '
-             '(default: on). Recommended — auto-calibration maps the central '
-             'ROI to 0 HU, which is unreliable when that ROI is not water.'
+        '--hu-calibration',
+        choices=('auto', 'fixed'),
+        default='auto',
+        help='How the HU scale is set (default: auto). "auto" fits both the '
+             'gain and the offset from the reconstructed volume\'s own '
+             'histogram, anchoring air on -1000 HU and the bulk soft-tissue '
+             'population on --tissue-hu; it needs no phantom and no scanner '
+             'constant, so it survives a source or detector replacement. '
+             '"fixed" pins the gain to --mu-water and puts air at zero '
+             'attenuation, reproducing the classical one-point map (its '
+             'second anchor is water at 0 HU, so --tissue-hu does not apply).'
     )
     parser.add_argument(
-        '--no-skip-calibration',
-        dest='skip_calibration',
-        action='store_false',
-        help='Re-enable two-point auto-calibration '
-             '(not recommended for mouse scans)'
+        '--mu-water',
+        type=float,
+        default=None,
+        help='Linear attenuation of water in mm^-1, used by '
+             '--hu-calibration fixed. Note this is a scanner- AND '
+             'spectrum-specific constant that goes stale when the hardware '
+             'changes; the historical value for this scanner at 80 kVp was '
+             '0.0219.'
+    )
+    parser.add_argument(
+        '--tissue-hu',
+        type=float,
+        default=None,
+        help='Where the bulk soft-tissue anchor lands, in HU (default: 120, '
+             'the scale this scanner\'s vendor reports for the same '
+             'specimens). This single number sets the gain and is the one '
+             'assumption reference-free calibration cannot escape — air pins '
+             'the offset exactly, but nothing in the data pins the scale. '
+             'Changing it rescales the output linearly. Pass 0 for a WATER '
+             'PHANTOM, whose bulk belongs at 0 HU by definition. Applies to '
+             '--hu-calibration auto only.'
+    )
+    parser.add_argument(
+        '--save-mu',
+        action='store_true',
+        default=False,
+        help='Also write the uncalibrated attenuation as <output>_mu.npy '
+             '(float32, mm^-1). Replaces the old _uncalibrated.vff, which '
+             'held already-converted, already-clipped values and was '
+             'byte-identical to the calibrated file.'
     )
 
     parser.add_argument(
@@ -736,25 +766,40 @@ def resolve_or_measure_detector_psi(ctx: ScanContext, verbose=True,
 # Output stage, shared by every driver
 # --------------------------------------------------------------------------
 
-def save_outputs(volume, ctx: ScanContext, args, output_path: str) -> str:
+def save_outputs(volume, ctx: ScanContext, args, output_path: str,
+                 logger=None):
     """Crop to the export ROI, then HU-calibrate, filter and write the VFF.
 
-    The crop happens BEFORE calibration on purpose: the two-point HU fit reads
-    air and tissue peaks out of the volume, and it should read them from the
-    voxels being shipped, not from a domain padded out with bed and cage.
+    This is the one place the HU scale is set, for every backend. The
+    reconstructors all hand over raw attenuation now, so a volume's units are
+    decided here or nowhere.
+
+    The crop happens BEFORE calibration on purpose: the anchors are read out
+    of the volume's own histogram, and they should be read from the voxels
+    being shipped, not from a domain padded out with bed and cage. The
+    trade-off is that a very tight export ROI can crop away most of the air
+    the offset anchor needs — the calibrator warns when that happens.
 
     ScanContext.geometry is updated to describe the cropped grid so the VFF
     header and every downstream plot agree with the pixels. No-op when no
     export ROI is set.
+
+    Returns (vff path, HUAnchors, calibrated HU volume).
     """
     volume, ctx.geometry = crop_to_export_roi(volume, ctx.geometry)
-    return postprocess_and_save(
-        volume=volume,
+    path, anchors, volume_hu = postprocess_and_save(
+        volume_mu=volume,
         geometry=ctx.geometry,
         output_path=output_path,
         bilateral_filter=args.bilateral_filter,
         bilateral_sigma_spatial=args.bilateral_sigma_spatial,
         bilateral_sigma_range=args.bilateral_sigma_range,
         voxel_xy=args.voxel_xy,
-        skip_calibration=args.skip_calibration,
+        hu_calibration=getattr(args, 'hu_calibration', 'auto'),
+        mu_water=getattr(args, 'mu_water', None),
+        tissue_hu=getattr(args, 'tissue_hu', None),
+        save_mu=getattr(args, 'save_mu', False),
     )
+    if logger is not None:
+        logger.log_hu_calibration(anchors)
+    return path, anchors, volume_hu

@@ -27,7 +27,6 @@ import numpy as np
 import torch
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
-from .ct_core.calibration import default_mu_water
 from .ct_core.data_budget import SWEEP, data_budget, measurement_count
 from .ct_core.pipeline import (
     ReconLogger,
@@ -253,7 +252,7 @@ def main():
         geometry=geometry,
         source_locations=None,
         folder_name=output_path,
-        output_hu=True,
+        quantitative=True,
         bright_field=ctx.bright_field,
         dark_field=ctx.dark_field,
         mu_water=None,
@@ -291,7 +290,8 @@ def main():
         note="single backprojection pass over every measurement")
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
-    save_outputs(reconstructor.reconstructed_volume, ctx, args, output_path)
+    _, _, volume_hu = save_outputs(reconstructor.reconstructed_volume, ctx,
+                                   args, output_path, logger=logger)
 
     # Projection diagnostics on the final volume: forward-project at the
     # evaluation angle through the canonical ray tracer -> diag/ssim, psnr,
@@ -300,17 +300,20 @@ def main():
         measured = preprocess_frames(
             ctx.projections[eval_idx:eval_idx + 1], ctx,
             bhc_coeffs=args.bhc_coeffs)[0]
+        # The volume is mu now, so it goes to the forward model as-is —
+        # no round trip through an assumed mu_water, which used to convert
+        # HU back to attenuation with a constant unrelated to this scan.
         pred, target = render_projection_from_volume(
             reconstructor.reconstructed_volume, ctx, eval_idx, measured,
-            mu_water=default_mu_water(None, args.bhc_coeffs))
+            volume_is_hu=False)
         logger.log_projection_diag(pred, target)
     except Exception as e:
         print(f"  Final projection diagnostics failed "
               f"({type(e).__name__}: {e})")
 
     logger.log_sinogram_preview(ctx.projections)
-    logger.log_volume_summary(reconstructor.reconstructed_volume, ctx)
-    logger.log_recon_slices(reconstructor.reconstructed_volume)
+    logger.log_volume_summary(volume_hu, ctx)
+    logger.log_recon_slices(volume_hu)
     logger.finish()
 
     end = time.time()
