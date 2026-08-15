@@ -248,20 +248,28 @@ def resolve_detector_warp(geom_cfg: dict, scan_folder, raw_detector_shape,
 
     Modes
     -----
-    ``off``       disabled.
+    ``off``       disabled. THE DEFAULT when the config says nothing (see below).
     ``auto``      use the calibration for this detector serial if one exists,
-                  otherwise proceed uncorrected with a loud warning (default —
-                  keeps scanners we have no calibration for runnable).
+                  otherwise proceed uncorrected with a loud warning.
     ``nonaffine`` require a calibration; apply its non-affine part (validated).
     ``full``      require a calibration; apply the whole field. Only correct
                   when the calibration comes from the SAME geometry epoch as
                   the scan.
 
+    The fallback is ``off``, NOT ``auto``, as of 2026-08-15. It used to be
+    ``auto``, which resolves to ``nonaffine`` whenever a calibration exists for
+    the detector — so a config that simply omitted the ``detector_warp`` block
+    silently got the warp APPLIED, disagreeing with both entry points (
+    ``configs/default.yaml`` and ``run_learned_recon.py --detector-warp``) that
+    state ``off``. Absent config now means the same thing everywhere: no warp.
+    Set ``mode: auto`` explicitly to get the old opportunistic behaviour.
+
     Raises on a shape mismatch rather than silently applying a field fitted for
     a different detector format — a wrong warp is worse than none.
     """
     cfg = (geom_cfg or {}).get("detector_warp", {}) or {}
-    mode = str(cfg.get("mode", "auto")).lower()
+    # Default `off`: an absent/empty config must never turn the warp on.
+    mode = str(cfg.get("mode", "off")).lower()
     if mode in ("off", "none", "false", "disabled"):
         return None
 
