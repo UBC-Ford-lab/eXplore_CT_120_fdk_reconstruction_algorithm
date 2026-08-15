@@ -136,7 +136,6 @@ class ASTRAReconstructor:
                  clamp_mode='none', soft_clip_transmission=True,
                  soft_clip_sharpness=200.0, upper_clamp=True,
                  upper_clamp_value=1.05,
-                 bhc_coeffs=None,
                  ring_correction=False, ring_median_width=51,
                  air_normalization=True):
         """
@@ -158,7 +157,6 @@ class ASTRAReconstructor:
             soft_clip_sharpness: Sharpness of soft clip transition
             upper_clamp: Clamp transmission from above
             upper_clamp_value: Maximum allowed transmission value
-            bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None
             ring_correction: Apply sinogram-space ring artifact correction
             ring_median_width: Median filter width for ring correction (odd int)
         """
@@ -189,8 +187,7 @@ class ASTRAReconstructor:
         self.upper_clamp = upper_clamp
         self.upper_clamp_value = upper_clamp_value
 
-        # BHC and ring correction
-        self.bhc_coeffs = bhc_coeffs
+        # Ring correction
         self.ring_correction = ring_correction
         self.air_normalization = air_normalization
         self.ring_median_width = ring_median_width
@@ -202,7 +199,7 @@ class ASTRAReconstructor:
 
     def _preprocess(self, chunk_angles=20):
         """
-        Apply flat-field correction, log transform, BHC, and ring correction.
+        Apply flat-field correction, log transform, and ring correction.
 
         Delegates to the shared preprocess_sinogram() function in ct_core.
         """
@@ -216,7 +213,6 @@ class ASTRAReconstructor:
             upper_clamp=self.upper_clamp,
             upper_clamp_value=self.upper_clamp_value,
             chunk_angles=chunk_angles,
-            bhc_coeffs=self.bhc_coeffs,
             ring_correction=self.ring_correction,
             air_normalization=self.air_normalization,
             ring_median_width=self.ring_median_width,

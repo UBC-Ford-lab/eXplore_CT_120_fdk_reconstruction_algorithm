@@ -10,7 +10,7 @@ best noise-resolution trade-off per the filter kernel sweep verification.
 All algorithm-independent stages (scan loading, geometry build, detector-psi
 calibration, HU calibration + VFF export) live in ct_core.pipeline and are
 shared with the iterative drivers — this script only owns what is
-FDK-specific: the filter settings, Parker weighting, MAR, bone BHC, and the
+FDK-specific: the filter settings, Parker weighting, MAR, and the
 FDKReconstructor call.
 
 Usage:
@@ -127,29 +127,6 @@ Examples:
         dest='parker_weighting',
         help='Disable Parker weighting (for comparison experiments).'
     )
-    parser.add_argument(
-        '--bone-bhc',
-        action='store_true',
-        help='Enable two-pass bone BHC (Joseph & Spital method). '
-             'Requires physical_normalization (always on in this pipeline). '
-             'Segments bone from pass-1 reconstruction, forward-projects bone '
-             'contribution, and corrects sinogram before pass-2 backprojection.'
-    )
-    parser.add_argument(
-        '--bone-bhc-threshold',
-        type=float,
-        default=1500,
-        help='HU threshold for bone segmentation in pass-1 volume (default: 1500). '
-             'Voxels above this threshold are classified as bone.'
-    )
-    parser.add_argument(
-        '--bone-bhc-hu',
-        type=float,
-        default=3100,
-        help='Monochromatic bone HU value for correction (default: 3100). '
-             'Used to compute the ideal monochromatic bone attenuation.'
-    )
-
     return parser.parse_args()
 
 
@@ -178,7 +155,6 @@ def main():
         'filter_cutoff': args.filter_cutoff,
         'filter_type': args.filter_type,
         'parker_weighting': bool(args.parker_weighting),
-        'bone_bhc': bool(args.bone_bhc),
         'withhold_eval': bool(args.withhold_eval),
     })
 
@@ -226,11 +202,6 @@ def main():
             f"--filter-cutoff must be in (0.0, 1.0], got {filter_cutoff:.4f}")
     print(f"  Filter type: {args.filter_type}")
 
-    if args.bhc_coeffs is not None:
-        print(f"\n  BHC coefficients: {args.bhc_coeffs}")
-    else:
-        print(f"\n  BHC: disabled (--no-bhc)")
-
     # ---- projection diagnostics: eval angle + noise ceiling ----------------
     # FDK is single-shot, so the diag/* metrics and figures are computed once
     # on the final volume; the ceiling (other acquisition phase if available,
@@ -238,7 +209,7 @@ def main():
     # the logs even if the reconstruction later fails.
     eval_idx = int(ctx.projections.shape[0]) // 2
     logger.set_noise_ceiling(measure_noise_ceiling(
-        ctx, eval_idx, phase=args.phase, bhc_coeffs=args.bhc_coeffs))
+        ctx, eval_idx, phase=args.phase))
 
     fdk_proj, fdk_angles = ctx.projections, ctx.angles
     if args.withhold_eval:
@@ -256,7 +227,6 @@ def main():
         quantitative=True,
         bright_field=ctx.bright_field,
         dark_field=ctx.dark_field,
-        mu_water=None,
         clamp_mode="none",
         soft_clip_transmission=True,
         soft_clip_sharpness=args.soft_clip_sharpness,
@@ -271,10 +241,6 @@ def main():
         ring_correction=args.ring_correction,
         air_normalization=args.air_normalization,
         ring_median_width=args.ring_median_width,
-        bhc_coeffs=args.bhc_coeffs,
-        bone_bhc=args.bone_bhc,
-        bone_bhc_threshold=args.bone_bhc_threshold,
-        bone_bhc_hu=args.bone_bhc_hu,
     )
 
     reconstructor.reconstruct()
@@ -300,8 +266,7 @@ def main():
     # mse + SSIM-heatmap and power-spectrum figures. Best-effort.
     try:
         measured = preprocess_frames(
-            ctx.projections[eval_idx:eval_idx + 1], ctx,
-            bhc_coeffs=args.bhc_coeffs)[0]
+            ctx.projections[eval_idx:eval_idx + 1], ctx)[0]
         # The volume is mu now, so it goes to the forward model as-is —
         # no round trip through an assumed mu_water, which used to convert
         # HU back to attenuation with a constant unrelated to this scan.

@@ -357,7 +357,7 @@ def main():
     eval_idx = (args.holdout_index if args.holdout_index is not None
                 else int(ctx.projections.shape[0]) // 2)
     logger.set_noise_ceiling(measure_noise_ceiling(
-        ctx, eval_idx, phase=args.phase, bhc_coeffs=args.bhc_coeffs))
+        ctx, eval_idx, phase=args.phase))
 
     # Initialize reconstructor based on backend
     if args.backend == 'astra':
@@ -386,7 +386,6 @@ def main():
             super_sampling=args.super_sampling,
             bright_field=ctx.bright_field,
             dark_field=ctx.dark_field,
-            bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             air_normalization=args.air_normalization,
             soft_clip_sharpness=args.soft_clip_sharpness,
@@ -406,7 +405,6 @@ def main():
             gpu_index=args.gpu_index,
             bright_field=ctx.bright_field,
             dark_field=ctx.dark_field,
-            bhc_coeffs=args.bhc_coeffs,
             ring_correction=args.ring_correction,
             air_normalization=args.air_normalization,
             soft_clip_sharpness=args.soft_clip_sharpness,
@@ -463,8 +461,7 @@ def main():
         # tracer. Best-effort — a diagnostics failure never voids the recon.
         try:
             measured = preprocess_frames(
-                ctx.projections[eval_idx:eval_idx + 1], ctx,
-                bhc_coeffs=args.bhc_coeffs)[0]
+                ctx.projections[eval_idx:eval_idx + 1], ctx)[0]
             # The volume is mu now, so it goes to the forward model as-is
             # — no round trip through an assumed mu_water.
             pred, target = render_projection_from_volume(

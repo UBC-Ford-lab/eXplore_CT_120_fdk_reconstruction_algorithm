@@ -251,7 +251,7 @@ def main():
     eval_idx = (args.holdout_index if args.holdout_index is not None
                 else int(ctx.projections.shape[0]) // 2)
     logger.set_noise_ceiling(measure_noise_ceiling(
-        ctx, eval_idx, phase=args.phase, bhc_coeffs=args.bhc_coeffs))
+        ctx, eval_idx, phase=args.phase))
 
     reconstructor = VoxelReconstructor(
         projections=ctx.projections,
@@ -268,7 +268,6 @@ def main():
         compile_mode=args.compile_mode,
         bright_field=ctx.bright_field,
         dark_field=ctx.dark_field,
-        bhc_coeffs=args.bhc_coeffs,
         ring_correction=args.ring_correction,
         air_normalization=args.air_normalization,
         soft_clip_sharpness=args.soft_clip_sharpness,

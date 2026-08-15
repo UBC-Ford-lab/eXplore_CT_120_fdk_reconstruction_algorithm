@@ -60,7 +60,6 @@ class VoxelReconstructor:
                  seed: int = 0,
                  compile_mode: str = "off",
                  bright_field=None, dark_field=None,
-                 bhc_coeffs=None,
                  ring_correction: bool = False,
                  air_normalization: bool = True,
                  soft_clip_sharpness: float = 200.0,
@@ -92,7 +91,6 @@ class VoxelReconstructor:
         self.compile_mode = str(compile_mode)
         self.bright_field = bright_field
         self.dark_field = dark_field
-        self.bhc_coeffs = bhc_coeffs
         self.ring_correction = bool(ring_correction)
         self.air_normalization = bool(air_normalization)
         self.soft_clip_sharpness = float(soft_clip_sharpness)
@@ -154,7 +152,6 @@ class VoxelReconstructor:
     def _preprocess(self) -> np.ndarray:
         return preprocess_sinogram(
             self.projections, self.bright_field, self.dark_field,
-            bhc_coeffs=self.bhc_coeffs,
             ring_correction=self.ring_correction,
             air_normalization=self.air_normalization,
             soft_clip_sharpness=self.soft_clip_sharpness,

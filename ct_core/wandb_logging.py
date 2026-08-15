@@ -243,8 +243,6 @@ def sanitized_config(ctx, args, algorithm: str, params: dict | None) -> dict:
     # Sinogram preprocessing, recorded only when the driver actually has these
     # knobs. A driver that never touched the projections (run_volume_report)
     # would otherwise publish a default as if it were a setting.
-    if hasattr(args, "bhc_coeffs"):
-        cfg["bhc_coeffs"] = list(args.bhc_coeffs) if args.bhc_coeffs else None
     for key in ("ring_correction", "air_normalization"):
         if hasattr(args, key):
             cfg[key] = bool(getattr(args, key))

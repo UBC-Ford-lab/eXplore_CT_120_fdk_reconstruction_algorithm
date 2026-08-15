@@ -174,8 +174,8 @@ def evaluate_projection(pred, target) -> dict:
 # Noise ceiling — two independent measurements of the same line integrals
 # --------------------------------------------------------------------------
 
-def preprocess_frames(frames: np.ndarray, ctx, bhc_coeffs=None) -> np.ndarray:
-    """Flat-field + log + BHC a small stack of raw frames, identically to the
+def preprocess_frames(frames: np.ndarray, ctx) -> np.ndarray:
+    """Flat-field + log a small stack of raw frames, identically to the
     backends' own preprocessing. Ring correction is deliberately skipped: the
     ring pattern is a STATIC detector column offset, identical on both sides
     of every noise-ceiling pair, so it cancels in the comparison.
@@ -190,7 +190,7 @@ def preprocess_frames(frames: np.ndarray, ctx, bhc_coeffs=None) -> np.ndarray:
     from .preprocessing import preprocess_sinogram
     return preprocess_sinogram(
         np.ascontiguousarray(frames, dtype=np.float32),
-        ctx.bright_field, ctx.dark_field, bhc_coeffs=bhc_coeffs,
+        ctx.bright_field, ctx.dark_field,
         air_normalization=bool(getattr(ctx, 'air_normalization', True)),
     )
 
@@ -228,7 +228,7 @@ def _other_phase_frame(ctx, index: int, phase: str):
 
 
 def measure_noise_ceiling(ctx, eval_index: int, phase: str = "00",
-                          bhc_coeffs=None, verbose: bool = True):
+                          verbose: bool = True):
     """Noise-limited SSIM/PSNR ceiling + MSE floor at the evaluation angle.
 
     Compares the measured evaluation projection against a second independent
@@ -262,7 +262,7 @@ def measure_noise_ceiling(ctx, eval_index: int, phase: str = "00",
         source = f"neighbouring projection (index {j})"
         conservative = True
 
-    pp = preprocess_frames(np.stack([p0_raw, pair_raw]), ctx, bhc_coeffs)
+    pp = preprocess_frames(np.stack([p0_raw, pair_raw]), ctx)
     # Same covered window as every other diagnostic in this module, so the
     # ceiling is measured on exactly the pixels the recon is scored on (and so
     # the stored pair aligns pixel-for-pixel with rendered predictions).
@@ -422,7 +422,7 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
     from ..learning_based_iterative.ray_sampler import rays_from_indices
     from ..learning_based_iterative.renderer import render_rays
     from ..learning_based_iterative.voxel.model import VoxelGrid
-    from .calibration import default_mu_water
+    from .calibration import MU_WATER_80KV
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -432,7 +432,10 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
 
     vol = np.asarray(volume, dtype=np.float32)
     if volume_is_hu:
-        mu_w = default_mu_water(mu_water, None)
+        # Legacy path: the drivers all pass volume_is_hu=False now, because
+        # every backend returns mu. Converting HU back to mu needs a scale,
+        # and with no BHC to switch on there is only the one legacy constant.
+        mu_w = MU_WATER_80KV if mu_water is None else float(mu_water)
         vol = mu_w * (1.0 + vol / 1000.0)
     vol = np.clip(vol, 0.0, None)
 

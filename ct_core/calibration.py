@@ -95,48 +95,22 @@ def soft_clamp_upper(x: np.ndarray, max_val: float = 1.0, sharpness: float = 50.
 # Physical Constants
 # =============================================================================
 
-# Literature value for linear attenuation coefficient of water at ~80 kV
-# Reference: NIST XCOM database, effective energy for typical CT beam
-# Units: mm⁻¹ (0.184 cm⁻¹ × 0.1 cm/mm = 0.0184 mm⁻¹)
-# NOTE: Previous value was 0.00184 (10x error in unit conversion)
+# LEGACY one-point HU constant: the effective linear attenuation of water for
+# the GE eXplore CT 120 at 80 kVp, empirically back-calculated by aligning SIRT
+# tissue values with the scanner's own FDK output (~160 HU target). It is a
+# polychromatic effective value (~55 keV), not a literature number.
 #
-# Scanner-specific effective μ_water for the GE eXplore CT 120 at 80 kVp:
-#   MU_WATER_80KV_NO_BHC  — empirically derived by aligning SIRT (no BHC,
-#       physics HU) tissue values with scanner FDK output (~160 HU target).
-#       Back-calculated: 0.0219 mm⁻¹ (polychromatic beam, ~55 keV effective).
-#   MU_WATER_80KV_WITH_BHC — estimated from no-BHC value by applying the
-#       BHC-induced μ reduction factor (4–7.3% from cross-validation data).
-#       Midpoint: 0.0219 × (1 - 0.056) ≈ 0.0207 mm⁻¹. Needs phantom validation.
-MU_WATER_80KV_NO_BHC   = 0.0219  # mm⁻¹  empirical, no-BHC pipeline
-MU_WATER_80KV_WITH_BHC = 0.0207  # mm⁻¹  estimated, BHC pipeline (needs phantom validation)
-
-# Alias for external code and diagnostic prints. Points to the no-BHC value
-# since that is the default pipeline. Backends auto-select the correct constant
-# based on whether BHC is active; this alias is the fallback for external code
-# that imports MU_WATER_80KV directly.
-MU_WATER_80KV = MU_WATER_80KV_NO_BHC
+# NOT used by the reconstruction pipeline, which fits both HU anchors from the
+# volume's own histogram (ct_core.hu_calibration) and needs no scanner
+# constant at all. It survives for `--hu-calibration fixed`, which exists to
+# reproduce the old map, and for muNeRF code that still reads it. Measured
+# against a properly fitted scale it is about 9.5 % too large.
+MU_WATER_80KV = 0.0219  # mm⁻¹
 
 # Linear attenuation coefficient of air (effectively zero)
 MU_AIR = 0.0  # mm⁻¹
 
-# Sinogram-domain BHC polynomial for the GE eXplore CT 120 at 80 kVp.
-# Calibrated from water phantom (Scan_1680) using bhc_sinogram_calibration.py.
-# Applied as: p_corrected = c1*p + c2*p² (no constant term).
-# Scanner-specific (depends on X-ray spectrum), NOT scan-specific.
-BHC_COEFFICIENTS_80KV = [0.856, 0.21]
 
-
-def default_mu_water(mu_water=None, bhc_coeffs=None) -> float:
-    """Resolve the effective mu_water for HU conversion.
-
-    An explicit ``mu_water`` always wins; otherwise the pipeline-matched
-    constant is selected by whether sinogram-domain BHC is active (BHC
-    lowers the effective mu_water by removing beam-hardening inflation).
-    One definition for every backend — FDK, ASTRA, TIGRE, and future ones.
-    """
-    if mu_water is not None:
-        return float(mu_water)
-    return MU_WATER_80KV_WITH_BHC if bhc_coeffs is not None else MU_WATER_80KV_NO_BHC
 def parse_calibration_from_xml(xml_path: str) -> Dict[str, float]:
     """
     Extract AirValue, WaterValue, and BoneHU from scan XML.

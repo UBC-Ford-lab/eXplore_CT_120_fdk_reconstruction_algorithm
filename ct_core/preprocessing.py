@@ -1,7 +1,7 @@
 """
 Shared sinogram preprocessing for iterative backends (ASTRA, TIGRE).
 
-Pipeline: flat-field → log → BHC → ring correction.
+Pipeline: flat-field → log → air normalization → ring correction.
 Cone-beam weighting and ramp filtering are FDK-specific and not applied here
 (iterative algorithms model the forward operator internally).
 """
@@ -9,29 +9,9 @@ Cone-beam weighting and ramp filtering are FDK-specific and not applied here
 import numpy as np
 
 
-def apply_bhc(chunk, bhc_coeffs):
-    """Apply the BHC polynomial: p_corrected = c1*p + c2*p^2 + ...
-
-    Works on numpy arrays AND torch tensors (uses only ``*``/``+``/``**``),
-    so FDK's fused GPU path and the chunked numpy path share one definition.
-    Returns ``chunk`` unchanged when ``bhc_coeffs`` is None.
-    """
-    if bhc_coeffs is None:
-        return chunk
-    result = bhc_coeffs[0] * chunk
-    for k in range(1, len(bhc_coeffs)):
-        result = result + bhc_coeffs[k] * chunk ** (k + 1)
-    return result
-
-
-# Backwards-compatible private alias (pre-refactor name).
-_apply_bhc = apply_bhc
-
-
 def _array_module(a):
     """numpy or torch, whichever ``a`` belongs to.
 
-    ``apply_bhc`` gets dual-backend support for free by using only operators.
     The transmission clamp needs NAMED functions (where / clip / exp / log1p),
     so it has to dispatch — but torch spells all four exactly as numpy does,
     so one implementation still serves both. torch is imported lazily to keep
@@ -222,11 +202,10 @@ def preprocess_sinogram(projections, bright_field, dark_field,
                         clamp_mode='none', soft_clip_transmission=True,
                         soft_clip_sharpness=200.0, upper_clamp=True,
                         upper_clamp_value=1.05, chunk_angles=20,
-                        bhc_coeffs=None,
                         ring_correction=False, ring_median_width=51,
                         air_normalization=True):
     """
-    Apply flat-field correction, log transform, BHC, and ring correction.
+    Apply flat-field correction, log transform, and ring correction.
 
     Processes in chunks along the angle dimension to limit peak memory.
 
@@ -254,8 +233,6 @@ def preprocess_sinogram(projections, bright_field, dark_field,
         upper_clamp: Clamp transmission from above
         upper_clamp_value: Maximum allowed transmission value
         chunk_angles: Number of projection angles per chunk (default 20)
-        bhc_coeffs: BHC polynomial coefficients [c1, c2, ...] or None.
-            Applied after log transform: p_corrected = c1*p + c2*p^2 + ...
         ring_correction: Apply sinogram-space ring artifact correction
         ring_median_width: Median filter width for ring correction (odd int)
         air_normalization: Subtract each projection's object-free air level
@@ -273,9 +250,6 @@ def preprocess_sinogram(projections, bright_field, dark_field,
         return np.array(projections, dtype=np.float32)
 
     print("Preprocessing: flat-field + log", end="")
-    if bhc_coeffs is not None:
-        coeff_str = ", ".join(f"c{k+1}={c:.6f}" for k, c in enumerate(bhc_coeffs))
-        print(f" + BHC ({coeff_str})", end="")
     if air_normalization:
         print(" + air normalization", end="")
     if ring_correction:
@@ -331,9 +305,6 @@ def preprocess_sinogram(projections, bright_field, dark_field,
             del scaled
         elif clamp_mode == "hard":
             np.maximum(chunk, 0.0, out=chunk)
-
-        # Beam hardening correction
-        chunk = apply_bhc(chunk, bhc_coeffs)
 
         sinogram[start:end] = chunk
 

@@ -1,7 +1,7 @@
 """Scene containers for learning-based (differentiable) reconstruction.
 
 A `Scene` bundles four things:
-  * preprocessed line integrals  (sinogram, after flat-field/log/BHC/ring)
+  * preprocessed line integrals  (sinogram, after flat-field/log/ring)
   * cone-beam projection angles  (radians)
   * cone-beam geometry           (ct_core's plain dict; defines the EXPORT ROI)
   * `model_domain`               (the integration domain — usually larger than

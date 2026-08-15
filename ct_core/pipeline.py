@@ -174,23 +174,6 @@ def add_common_args(parser):
              'Controls edge-preservation threshold.'
     )
     parser.add_argument(
-        '--bhc-coeffs',
-        nargs='+',
-        type=float,
-        default=None,
-        help='BHC polynomial coefficients [c1, c2, ...] for sinogram-domain '
-             'beam hardening correction: p_corrected = c1*p + c2*p^2 + ... '
-             'Example: 0.856 0.21 (calibrated from water phantom at 80 kVp). '
-             'Default: disabled (no BHC).'
-    )
-    parser.add_argument(
-        '--no-bhc',
-        dest='bhc_coeffs',
-        action='store_const',
-        const=None,
-        help='Disable sinogram-domain beam hardening correction'
-    )
-    parser.add_argument(
         '--cor-mode',
         default='center',
         choices=('center', 'xml'),

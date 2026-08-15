@@ -23,7 +23,6 @@ from .errors import (
 from .vff_io import read_vff, read_vff_header, read_vff_data, VFFDataset, write_vff
 from .preprocessing import (
     preprocess_sinogram,
-    apply_bhc,
     ring_artifact_correction,
     downsample_projections,
 )
@@ -39,10 +38,7 @@ try:
         flat_field_correction,
         log_transform_transmission,
         MU_WATER_80KV,
-        MU_WATER_80KV_NO_BHC,
-        MU_WATER_80KV_WITH_BHC,
         MU_AIR,
-        default_mu_water,
     )
 except ImportError:
     pass
@@ -111,19 +107,14 @@ __all__ = [
     'flat_field_correction',
     'log_transform_transmission',
     'MU_WATER_80KV',
-    'MU_WATER_80KV_NO_BHC',
-    'MU_WATER_80KV_WITH_BHC',
     'MU_AIR',
     # TIFF
     'save_vff_to_tiff',
     # Preprocessing
     'preprocessing',
     'preprocess_sinogram',
-    'apply_bhc',
     'ring_artifact_correction',
     'downsample_projections',
-    # HU helpers
-    'default_mu_water',
     # System utilities
     'utils',
     'query_gpu_memory',

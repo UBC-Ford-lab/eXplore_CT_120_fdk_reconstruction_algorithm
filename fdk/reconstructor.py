@@ -5,8 +5,7 @@ import numpy as np
 import os
 import sys
 
-from ..ct_core.calibration import default_mu_water
-from ..ct_core.preprocessing import (air_normalize_sinogram, apply_bhc,
+from ..ct_core.preprocessing import (air_normalize_sinogram,
                                      ring_artifact_correction,
                                      soft_clamp_transmission)
 
@@ -125,7 +124,7 @@ def _interpolate_metal_pixels(sinogram_chunk, mask):
 
 class FDKReconstructor:
     def __init__(self, projections, angles, geometry, folder_name,
-                 mu_water=None, quantitative=False,
+                 quantitative=False,
                  bright_field=None, dark_field=None,
                  clamp_mode="none", soft_clip_transmission=True,
                  soft_clip_sharpness=200.0, upper_clamp=True, upper_clamp_value=1.05,
@@ -133,9 +132,7 @@ class FDKReconstructor:
                  filter_type='cosine', parker_weighting=True,
                  metal_artifact_reduction=False, mar_threshold=6.0,
                  ring_correction=False, ring_median_width=51,
-                 air_normalization=True,
-                 bhc_coeffs=None,
-                 bone_bhc=False, bone_bhc_threshold=1500, bone_bhc_hu=3100):
+                 air_normalization=True):
         """
         projections: Tensor of shape (N_angles, N_b, N_a) in float32.
         angles: Tensor of shape (N_angles,) in radians.
@@ -150,10 +147,6 @@ class FDKReconstructor:
            - dz: voxel size in z (mm)
            - central_pixel_a: detector center column
            - central_pixel_b: detector center row
-        mu_water: float, linear attenuation coefficient of water in mm⁻¹. Kept
-            only for callers that still want the one-point convention; the
-            reconstruction itself no longer uses it. HU calibration happens
-            once, downstream, in ct_core.hu_calibration.
         quantitative: bool, if True (and bright/dark fields are supplied),
             apply flat-field correction and the log transform so the output is
             linear attenuation μ in mm⁻¹ rather than raw filtered intensity.
@@ -204,12 +197,6 @@ class FDKReconstructor:
             Controls the spatial scale of features preserved in the column profile.
             Larger values remove broader ring features but risk removing real structure.
             (default: 51)
-        bhc_coeffs: list/tuple of BHC polynomial coefficients [c1, c2, ...], or None.
-            Applied in sinogram domain after log transform:
-            p_corrected = c1*p + c2*p^2 [+ c3*p^3 + ...]
-            Corrects beam hardening (scale error + cupping).
-            Calibrate from water phantom using bhc_calibration.py.
-            (default: None = no BHC)
         """
         self.projections = projections # (N_angles, N_b, N_a)
         self.angles = angles.to(device)
@@ -235,9 +222,6 @@ class FDKReconstructor:
         self.det_psi_rad = float(geometry.get("det_psi_rad", 0.0) or 0.0)
         self.folder_name = folder_name
 
-        # Reconstruction produces μ; HU calibration is downstream (see
-        # ct_core.hu_calibration). mu_water is retained only for reporting.
-        self.mu_water = default_mu_water(mu_water, bhc_coeffs)
         self.quantitative = quantitative
         self.bright_field = bright_field
         self.dark_field = dark_field
@@ -255,15 +239,6 @@ class FDKReconstructor:
         self.ring_correction = ring_correction
         self.air_normalization = air_normalization
         self.ring_median_width = ring_median_width
-        self.bhc_coeffs = bhc_coeffs
-        self.bone_bhc = bone_bhc
-        self.bone_bhc_threshold = bone_bhc_threshold
-        self.bone_bhc_hu = bone_bhc_hu
-        if self.bone_bhc and not self.physical_normalization:
-            raise ValueError(
-                "bone_bhc requires physical_normalization=True — "
-                "V1 must be in mu (mm^-1) for bone segmentation"
-            )
 
         # Determine detector dimensions and center indices
         self.N_angles, self.N_b, self.N_a = self.projections.shape
@@ -271,188 +246,6 @@ class FDKReconstructor:
         self.a_length = self.da * self.N_a
         self.b_center = (self.N_b - 1) / 2.0
         self.b_length = self.db * self.N_b
-
-    def _apply_bhc(self, chunk):
-        """Apply BHC polynomial to line integrals (shared ct_core definition)."""
-        return apply_bhc(chunk, self.bhc_coeffs)
-
-    def _forward_project(self, volume, mask=None):
-        """Voxel-driven GPU forward projection via nearest-neighbor splatting.
-
-        Projects nonzero voxels onto the detector using the same cone-beam
-        geometry as the backprojection.  Each voxel contributes value * dx
-        (line integral weight) to its nearest detector pixel via scatter_add_.
-
-        Args:
-            volume: Tensor or ndarray (Nx, Ny, Nz) — values to project.
-            mask: Bool tensor/ndarray (Nx, Ny, Nz) — only project where True.
-                  If None, projects all nonzero voxels.
-
-        Returns:
-            sinogram: ndarray (N_angles, N_b, N_a) — projected line integrals.
-        """
-        Nx, Ny, Nz = self.vol_shape
-        sinogram = np.zeros((self.N_angles, self.N_b, self.N_a), dtype=np.float32)
-
-        # Coordinate vectors (same as backprojection)
-        x = (torch.arange(Nx, device=device, dtype=torch.float32) - (Nx - 1) / 2) * self.dx + self.vol_origin[0]
-        y = (torch.arange(Ny, device=device, dtype=torch.float32) - (Ny - 1) / 2) * self.dx + self.vol_origin[1]
-        z = (torch.arange(Nz, device=device, dtype=torch.float32) - (Nz - 1) / 2) * self.dz + self.vol_origin[2]
-
-        # Convert inputs to numpy
-        if isinstance(volume, torch.Tensor):
-            volume_np = volume.cpu().numpy() if volume.is_cuda else volume.numpy()
-        else:
-            volume_np = np.asarray(volume, dtype=np.float32)
-
-        if mask is not None:
-            if isinstance(mask, torch.Tensor):
-                mask_np = mask.cpu().numpy() if mask.is_cuda else mask.numpy()
-            else:
-                mask_np = np.asarray(mask, dtype=bool)
-        else:
-            mask_np = volume_np != 0
-
-        # Extract nonzero voxel indices and values
-        nz_ix, nz_iy, nz_iz = np.nonzero(mask_np)
-        n_voxels = len(nz_ix)
-        if n_voxels == 0:
-            return sinogram
-
-        print(f"  Forward projection: {n_voxels} voxels "
-              f"({n_voxels / mask_np.size * 100:.1f}%)")
-
-        # Load nonzero voxel coordinates and values onto GPU
-        voxel_x = x[torch.from_numpy(nz_ix.astype(np.int64)).to(device)]
-        voxel_y = y[torch.from_numpy(nz_iy.astype(np.int64)).to(device)]
-        voxel_z = z[torch.from_numpy(nz_iz.astype(np.int64)).to(device)]
-        voxel_val = torch.from_numpy(
-            volume_np[nz_ix, nz_iy, nz_iz].astype(np.float32)
-        ).to(device) * self.dx  # value * dx -> line integral contribution
-        del nz_ix, nz_iy, nz_iz
-
-        cos_beta = torch.cos(self.angles)
-        sin_beta = torch.sin(self.angles)
-        sino_size = self.N_b * self.N_a
-
-        # Chunk voxels for intermediate tensors (U, ratio, a_pix, b_pix, valid, flat_idx)
-        budget = self._gpu_free_bytes()
-        bytes_per_voxel_tmp = 6 * 4  # 6 intermediate float32/int64 tensors
-        voxel_chunk = int(budget * 0.3 / bytes_per_voxel_tmp)
-        voxel_chunk = max(10000, min(voxel_chunk, n_voxels))
-
-        for i in range(self.N_angles):
-            cb = cos_beta[i]
-            sb = sin_beta[i]
-            sino_flat = torch.zeros(sino_size, device=device, dtype=torch.float32)
-
-            for vs in range(0, n_voxels, voxel_chunk):
-                ve = min(vs + voxel_chunk, n_voxels)
-                vx = voxel_x[vs:ve]
-                vy = voxel_y[vs:ve]
-                vz = voxel_z[vs:ve]
-                vv = voxel_val[vs:ve]
-
-                # Source-to-voxel distance along central ray
-                U = self.R_s + vx * cb + vy * sb
-
-                # Detector pixel coordinates (nearest-neighbor)
-                ratio = self.SDD / U
-                a_pix = torch.round(ratio * (-vx * sb + vy * cb) / self.da + self.N_a / 2.0).long()
-                b_pix = torch.round(ratio * vz / self.db + self.N_b / 2.0).long()
-
-                # Mask valid pixels (within detector bounds)
-                valid = (a_pix >= 0) & (a_pix < self.N_a) & (b_pix >= 0) & (b_pix < self.N_b)
-                if valid.any():
-                    flat_idx = b_pix[valid] * self.N_a + a_pix[valid]
-                    sino_flat.scatter_add_(0, flat_idx, vv[valid])
-
-            sinogram[i] = sino_flat.view(self.N_b, self.N_a).cpu().numpy()
-
-            if (i + 1) % 50 == 0 or i == self.N_angles - 1:
-                print(f"    angle {i+1}/{self.N_angles}")
-
-        del voxel_x, voxel_y, voxel_z, voxel_val
-        torch.cuda.empty_cache()
-        return sinogram
-
-    def _apply_cone_weight_and_filter(self):
-        """Apply cone-beam weighting, ramp filter, and Parker to the unfiltered sinogram.
-
-        Reads self._unfiltered_sinogram (numpy), writes filtered result to
-        self.projections (numpy).  Uses cached filter parameters from
-        _preprocess_and_filter().
-        """
-        print("  Re-applying cone weight + ramp filter...")
-        bytes_per_proj = self.N_b * self.N_a * 4
-        budget = self._gpu_free_bytes()
-        persistent = 2 * bytes_per_proj  # cone_weight + filter_kernel
-        chunk_size = int((budget - persistent) // (6 * bytes_per_proj))
-        chunk_size = max(1, min(chunk_size, self.N_angles))
-
-        for start in range(0, self.N_angles, chunk_size):
-            end = min(start + chunk_size, self.N_angles)
-            chunk = torch.from_numpy(
-                self._unfiltered_sinogram[start:end]
-            ).to(device)
-
-            chunk = chunk * self._cone_weight_gpu
-            chunk = torch.fft.rfft(chunk, dim=2, norm='forward')
-            chunk = chunk * self._filter_kernel_gpu
-            chunk = torch.fft.irfft(chunk, n=self.N_a, dim=2, norm='forward')
-            if self._parker_weight_gpu is not None:
-                chunk = chunk * self._parker_weight_gpu[start:end].unsqueeze(1)
-
-            self.projections[start:end] = chunk.cpu().numpy()
-
-    def _bone_bhc_correction(self):
-        """Joseph & Spital two-pass bone BHC correction.
-
-        After pass-1 backprojection, segments bone from V1 (mu volume),
-        computes correction = FP((mu_bone_mono - V1) * mask) in a single
-        forward projection, and applies it to self._unfiltered_sinogram.
-
-        Memory optimization: combines what would be two forward projections
-        (FP(V1*mask) and FP(mask)) into one: FP((mu_bone_mono - V1)*mask),
-        since mu_bone_mono*FP(mask) - FP(V1*mask) = FP((mu_bone_mono-V1)*mask).
-        """
-        mu_water = self.mu_water
-        mu_thresh = mu_water * (1 + self.bone_bhc_threshold / 1000.0)
-        mu_bone_mono = mu_water * (1 + self.bone_bhc_hu / 1000.0)
-
-        print(f"  Bone segmentation threshold: {mu_thresh:.6f} mm^-1 ({self.bone_bhc_threshold} HU)")
-        print(f"  Bone monochromatic mu: {mu_bone_mono:.6f} mm^-1 ({self.bone_bhc_hu} HU)")
-
-        # Get volume as numpy
-        vol = self.reconstructed_volume
-        if isinstance(vol, torch.Tensor):
-            vol = vol.cpu().numpy() if vol.is_cuda else vol.numpy()
-        vol = np.asarray(vol, dtype=np.float32)
-
-        # Segment bone
-        bone_mask = vol > mu_thresh
-        n_bone = int(bone_mask.sum())
-        print(f"  Bone voxels: {n_bone} ({n_bone / bone_mask.size * 100:.2f}%)")
-
-        if n_bone == 0:
-            print("  No bone voxels found — skipping bone BHC correction")
-            return
-
-        # Single forward projection: FP((mu_bone_mono - V1) * mask)
-        # = mu_bone_mono * FP(mask) - FP(V1 * mask) = correction
-        print("  Forward-projecting correction volume (mu_mono - V1) * mask...")
-        correction_input = mu_bone_mono - vol  # mu difference at each voxel
-        sino_correction = self._forward_project(correction_input, mask=bone_mask)
-        del correction_input, bone_mask
-
-        nonzero = sino_correction != 0
-        if nonzero.any():
-            print(f"  Correction stats: mean={sino_correction[nonzero].mean():.6f}, "
-                  f"|max|={np.abs(sino_correction).max():.6f}")
-
-        # Apply correction to unfiltered sinogram
-        self._unfiltered_sinogram += sino_correction
-        del sino_correction
 
     def _flush_projections(self):
         """Flush projections to disk only when backed by a memmap."""
@@ -642,12 +435,6 @@ class FDKReconstructor:
                   "object-free columns)")
         if self.ring_correction:
             print(f"Ring correction: enabled (median width={self.ring_median_width})")
-        if self.bhc_coeffs is not None:
-            coeff_str = ", ".join(f"c{k+1}={c:.6f}" for k, c in enumerate(self.bhc_coeffs))
-            print(f"Beam hardening correction: enabled ({coeff_str})")
-        if self.bone_bhc:
-            print(f"Bone BHC (two-pass): enabled (threshold={self.bone_bhc_threshold} HU, "
-                  f"mono bone={self.bone_bhc_hu} HU)")
 
         # Flat-field constants (only if preprocessing)
         if do_preprocess:
@@ -675,12 +462,6 @@ class FDKReconstructor:
             if parker_weight is not None:
                 parker_weight_gpu = parker_weight.to(device)  # (N_angles, N_a)
         self._parker_applied = parker_weight_gpu is not None
-
-        # Cache filter parameters for bone BHC second pass
-        if self.bone_bhc:
-            self._cone_weight_gpu = cone_weight
-            self._filter_kernel_gpu = filter_kernel
-            self._parker_weight_gpu = parker_weight_gpu
 
         # Allocate output array
         if do_preprocess:
@@ -712,7 +493,7 @@ class FDKReconstructor:
             print(f"  GPU memory: {total_mem / 2**30:.2f} GiB total, "
                   f"{free_mem / 2**30:.2f} GiB free → budget {budget / 2**30:.2f} GiB")
 
-        # ---- Pass 1: flat-field + log + MAR + BHC -> full sinogram --------
+        # ---- Pass 1: flat-field + log + MAR -> full sinogram --------------
         # There used to be a second, "single-pass" copy of this loop that fused
         # preprocessing straight into the filtering below, taken whenever no
         # whole-sinogram correction was enabled. It is gone: it duplicated this
@@ -722,8 +503,7 @@ class FDKReconstructor:
         # NOT memory, since `float_projections` is allocated full-size for both
         # paths either way. With ring correction and air normalization both on
         # by default it was also unreachable in practice.
-        needs_pass1 = (do_preprocess or self.metal_artifact_reduction
-                       or self.bhc_coeffs is not None)
+        needs_pass1 = do_preprocess or self.metal_artifact_reduction
         sinogram_out = float_projections if do_preprocess else self.projections
 
         if needs_pass1:
@@ -754,7 +534,6 @@ class FDKReconstructor:
                         _interpolate_metal_pixels(chunk, metal_mask)
                     del metal_mask
 
-                chunk = self._apply_bhc(chunk)
                 sinogram_out[start:end] = chunk.cpu().numpy()
 
         # ---- Whole-sinogram corrections (need every angle at once) ---------
@@ -769,10 +548,6 @@ class FDKReconstructor:
             if self.ring_correction:
                 ring_artifact_correction(float_projections,
                                          median_width=self.ring_median_width)
-            # Unfiltered sinogram for bone BHC: after the corrections above,
-            # before filtering.
-            if self.bone_bhc:
-                self._unfiltered_sinogram = float_projections.copy()
 
             # Re-measure the GPU budget now the flat-field tensors are gone.
             budget = self._gpu_free_bytes()
@@ -1064,34 +839,6 @@ class FDKReconstructor:
         self._preprocess_and_filter()
         print("Backprojecting...")
         self.backprojection()
-
-        # Bone BHC two-pass (Joseph & Spital)
-        if self.bone_bhc:
-            print("\n" + "=" * 60)
-            print("Bone BHC — Pass 2 (Joseph & Spital)")
-            print("=" * 60)
-
-            # Free pass-1 filtered projections to reduce peak memory
-            # (will be re-created by _apply_cone_weight_and_filter)
-            self.projections = None
-            import gc; gc.collect()
-
-            self._bone_bhc_correction()
-
-            # Allocate fresh projections array for re-filtered output
-            self.projections = np.empty(self._unfiltered_sinogram.shape,
-                                        dtype=np.float32)
-            self._apply_cone_weight_and_filter()
-
-            # Free unfiltered sinogram, pass-1 volume, and cached filter params
-            del self._unfiltered_sinogram
-            del self.reconstructed_volume
-            del self._cone_weight_gpu, self._filter_kernel_gpu, self._parker_weight_gpu
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            print("Pass 2: Backprojecting corrected sinogram...")
-            self.backprojection()
 
         # No HU conversion here — the volume stays in μ (mm⁻¹) and unclipped
         # so the downstream calibrator can see the real air peak. Clipping it

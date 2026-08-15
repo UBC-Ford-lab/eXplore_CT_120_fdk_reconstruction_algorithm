@@ -9,24 +9,32 @@ currently a dense voxel grid).
 ## Pipeline
 
 ```
-Raw projections → flat-field + log → BHC → air normalization → ring correction
+Raw projections → flat-field + log → air normalization → ring correction
   → FDK: cone-weight + ramp filter + Parker + backprojection
     OR iterative: ASTRA SIRT / TIGRE OS-SART
-  → [bone BHC (FDK only): segment → forward-project → re-reconstruct]
   → μ (mm⁻¹, unclipped) → two-anchor HU calibration → VFF
 ```
 
-BHC (water, 80 kVp), air normalization and ring correction are on by default.
+Air normalization and ring correction are on by default.
+
+**No beam-hardening correction happens here.** Both sinogram-domain forms were
+removed on 2026-08-15: the water BHC polynomial (`p → c₁p + c₂p²`, the
+`[0.856, 0.21]` pair fitted on Scan_1680) and the two-pass Joseph & Spital bone
+BHC. Both had been off by default for a long time, in this package and in
+muNeRF alike. Hardening is now handled the other way round — by *modelling* it
+in the forward operator (`model.polychromatic`, `inr_pipeline/spectrum.py`)
+rather than by pre-distorting the measured line integrals to suit a
+monochromatic model.
 
 **Every backend returns μ; HU is decided once, downstream.** No reconstructor
 converts or clips. `save_outputs` is the only place the HU scale is set, so
 FDK, ASTRA, TIGRE and the voxel backend are on the same scale by construction
 rather than by convention — see *HU calibration* below.
 
-**One definition per stage.** `apply_bhc` and `soft_clamp_transmission` are
-written to work on numpy arrays *and* torch tensors, so FDK's fused GPU path
-and the chunked numpy path used by ASTRA/TIGRE/voxel call the same function
-rather than carrying parallel implementations. FDK itself is a single
+**One definition per stage.** `soft_clamp_transmission` is written to work on
+numpy arrays *and* torch tensors, so FDK's fused GPU path and the chunked numpy
+path used by ASTRA/TIGRE/voxel call the same function rather than carrying
+parallel implementations. FDK itself is a single
 preprocessing pass followed by a single filtering pass; it previously also had
 a fused "single-pass" variant, which duplicated both blocks and was the reason
 a correction could be wired into one path and silently miss the other.
@@ -134,7 +142,7 @@ run_learned_recon.py
   └─ ct_core/pipeline.py    shared CLI args, prepare_scan() → ScanContext,
                             detector-psi calibration JSON, save_outputs()
        ├─ ct_core/scan_setup.py      scan.xml, projections, geometry, VFF export
-       ├─ ct_core/preprocessing.py   flat-field+log, transmission clamp, BHC,
+       ├─ ct_core/preprocessing.py   flat-field+log, transmission clamp,
        │                             air norm., ring corr., downsample
        ├─ ct_core/hu_calibration.py  two-anchor HU calibration (air + bulk
        │                             tissue), fitted from the volume's own
@@ -734,12 +742,9 @@ not a failure of the report — nothing is rescaled.
 ## Usage
 
 ```bash
-# Standard FDK (BHC, ring correction, two-point HU and an auto field of
-# view are all defaults — nothing here is specific to this scan)
+# Standard FDK (ring correction, air normalization, two-point HU and an
+# auto field of view are all defaults — nothing here is specific to this scan)
 python -m reconstruction.run_fdk_recon data/scans/Scan_1988
-
-# Add bone BHC (Joseph & Spital two-pass)
-python -m reconstruction.run_fdk_recon data/scans/Scan_1988 --bone-bhc
 
 # ROI reconstruction (mouse lung)
 python -m reconstruction.run_fdk_recon data/scans/Scan_1510 --roi auto
@@ -759,11 +764,6 @@ Run `--help` for full argument lists.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--bhc-coeffs c1 c2` | `0.856 0.21` | Sinogram-domain water BHC polynomial (80 kVp) |
-| `--no-bhc` | | Disable BHC |
-| `--bone-bhc` | off | Two-pass bone BHC (Joseph & Spital, FDK only) |
-| `--bone-bhc-threshold` | 1500 | HU threshold for bone segmentation |
-| `--bone-bhc-hu` | 3100 | Monochromatic bone HU (from scan.xml `BoneHU`) |
 | `--ring-correction` | on | Sinogram-space ring artifact correction (static per-COLUMN pattern) |
 | `--air-normalization` | on | Per-projection air level from object-free columns (per-FRAME scalar) |
 | `--soft-clip-sharpness` | 200 | Softplus transmission-clamp sharpness (50 = pre-2026-08-14) |
