@@ -192,7 +192,8 @@ def main():
                   f"{_spp} samples/ray). Pin --rays-per-batch to reproduce "
                   f"this run on another GPU.")
 
-    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    # Experiment logging: local PNGs next to the output, plus W&B unless
+    # --no-wandb (on by default; inert until a project is configured).
     # Created BEFORE preflight (an auto-aborted job is recorded as a FAILED
     # run with the verdict); the trainer then logs LIVE (loss/lr/holdout-MSE
     # per step) through the log_fn callback.

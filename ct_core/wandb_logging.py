@@ -6,9 +6,12 @@ Two layers, both driven by the same figures:
     small set of PNGs next to its output volume: orthogonal central slices,
     an HU histogram, a sinogram preview, and (when the backend produced one)
     a convergence curve.
-  * WEIGHTS & BIASES — strictly opt-in (``--wandb``). The same figures are
-    uploaded, plus native per-step charts (training loss / holdout metrics)
-    for backends that log live.
+  * WEIGHTS & BIASES — on by default, disabled with ``--no-wandb``. The same
+    figures are uploaded, plus native per-step charts (training loss / holdout
+    metrics) for backends that log live. "On by default" is really "on once a
+    project is configured": with no ``--wandb-project`` and no
+    ``WANDB_PROJECT`` the logger prints a notice and runs entirely locally, so
+    a fresh clone never uploads anything until its owner asks for it.
 
 PRIVACY — this is a public repository, so the code must not carry or leak
 anything identifying:
@@ -50,14 +53,27 @@ from .projection_diag import (
 
 # ---------------------------------------------------------------- CLI args --
 
-def add_wandb_args(parser, wandb_default: bool = False) -> None:
+def add_wandb_args(parser, wandb_default: bool = True) -> None:
     """Logging flags shared by every driver (called from add_common_args).
 
-    ``wandb_default`` flips whether W&B is opt-in or opt-out. The
-    reconstruction drivers leave it off — a run costs GPU hours and should
-    not silently publish. run_volume_report turns it on: it is cheap, and it
-    exists to put a volume next to the runs already in the project. The
-    driver that turns it on is responsible for adding its own ``--no-wandb``.
+    W&B is ON by default for every driver as of 2026-08-15, and turned off
+    with ``--no-wandb``. It used to be opt-in on the reconstruction drivers
+    (the reasoning was that a run costs GPU hours and should not silently
+    publish), and the failure mode that argues against that is the ordinary
+    one: a long recon finishes, and the run it should be compared against is
+    not there, because the flag was forgotten. The result is not a saved
+    upload — it is a repeated reconstruction. An unlogged run is the expensive
+    outcome, so opting OUT is the exception.
+
+    Silent publication is prevented by configuration rather than by the flag:
+    with no ``--wandb-project`` and no ``WANDB_PROJECT`` the logger prints a
+    notice and stays local (see ``ReconLogger.__init__``). Someone who has
+    never set a project cannot upload by accident; someone who has set one has
+    already said where their runs go.
+
+    ``wandb_default`` remains a parameter so a driver that genuinely should
+    not log can pass ``False``. Both ``--wandb`` and ``--no-wandb`` are defined
+    here, so every driver gets the pair without repeating it.
     """
     parser.add_argument(
         '--wandb', action='store_true', default=wandb_default,
@@ -65,6 +81,10 @@ def add_wandb_args(parser, wandb_default: bool = False) -> None:
              f'(default: {"on" if wandb_default else "off"}). '
              f'Requires --wandb-project or the WANDB_PROJECT env var; auth via '
              f'`wandb login` or WANDB_API_KEY. Runs go to your own account.')
+    parser.add_argument(
+        '--no-wandb', dest='wandb', action='store_false', default=wandb_default,
+        help='Do not log to Weights & Biases. Local PNGs are still written '
+             'next to the output volume unless --no-plots.')
     parser.add_argument(
         '--wandb-project', default=None,
         help='W&B project name (default: $WANDB_PROJECT). Never hardcoded — '

@@ -486,7 +486,7 @@ is dominated by whatever residual offset flat-fielding left behind, and a
 `mu >= 0` model cannot follow a measured air level that sits below zero.
 By default the evaluation projection **stays in** the reconstruction
 (diagnostic); pass `--withhold-eval` to remove it from the input and turn
-the diag metrics into true held-out validation. With `--wandb`, the
+the diag metrics into true held-out validation. When W&B is active, the
 finished volume is additionally logged as a scrollable axial-slice
 sequence (`recon_slices`).
 
@@ -523,12 +523,20 @@ a batch-size-independent x-axis. Implementation: `ct_core/data_budget.py`.
 
 The same figures (plus native live charts: training loss / LR per step for
 the learned backend, per-eval diag metrics for TIGRE and voxel) can be
-logged to **Weights & Biases**, strictly opt-in:
+logged to **Weights & Biases**. This is **on by default** — the flag to
+remember is `--no-wandb`, because the expensive mistake is finishing a long
+reconstruction and finding it is not next to the runs you wanted to compare
+it against.
 
 ```bash
 export WANDB_PROJECT=my-ct-project        # or pass --wandb-project
-python -m reconstruction.run_learned_recon data/scans/Scan_1510 --wandb
+python -m reconstruction.run_learned_recon data/scans/Scan_1510
+python -m reconstruction.run_learned_recon data/scans/Scan_1510 --no-wandb
 ```
+
+Nothing is uploaded until you name a project. With neither `--wandb-project`
+nor `WANDB_PROJECT` set, the logger prints a notice and the run stays local,
+so a fresh clone of this repository cannot publish by accident.
 
 **Privacy** (this is a public repository): no project, entity, API key, or
 path is hardcoded anywhere — project/entity come from flags or the
@@ -776,7 +784,7 @@ Run `--help` for full argument lists.
 | `--tissue-hu` | 120 | Where bulk soft tissue lands (vendor's scale). This one number sets the gain — the assumption reference-free calibration cannot escape. Use 0 for a water phantom; `auto` mode only |
 | `--save-mu` | off | Also write `<output>_mu.npy` (float32 μ, mm⁻¹) |
 | `$CT_CALIBRATION_DIR` | discovered | Env var: where the shared detector-calibration JSON/NPZ live |
-| `--wandb` | off (**on** for `run_volume_report`) | Log to Weights & Biases; `--no-wandb` opts the report out |
+| `--wandb` / `--no-wandb` | **on** (every driver) | Log to Weights & Biases. Inert until `--wandb-project` / `$WANDB_PROJECT` names a project |
 | `--recalibrate` / `--diagnose-calibration` | off | `run_volume_report`: fit the anchors on an existing volume, with / without applying them |
 | `--hu-from-header` | off | `run_volume_report`: re-apply the VFF water/air anchors (~254x on vendor files — see above) |
 

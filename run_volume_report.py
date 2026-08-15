@@ -24,9 +24,9 @@ data, which needs the scan this volume came from, its exact reconstruction
 grid, and its geometry calibration. Reconstruct through run_fdk_recon /
 run_iterative_recon / run_learned_recon to get them.
 
-Unlike the reconstruction drivers, W&B logging is ON by default here (there
-is no expensive compute to protect, and the point of the tool is to put an
-external volume next to the runs) — pass --no-wandb to keep it local.
+W&B logging is ON by default here, as it is on every driver — pass --no-wandb
+to keep it local. (This tool was the first to default it on; the reconstruction
+drivers followed on 2026-08-15.)
 
 Usage:
     # vendor reconstruction, logged to W&B
@@ -207,17 +207,11 @@ Examples:
              'foreign file that comes out mirrored.'
     )
 
-    # Shared logging flags (--wandb-project / --wandb-entity / --wandb-run-name
-    # / --wandb-mode / --no-plots), with --wandb ON: a report is cheap and
-    # exists to be compared against the runs, so opting OUT is the exception.
-    add_wandb_args(parser, wandb_default=True)
-    parser.add_argument(
-        '--no-wandb',
-        dest='wandb',
-        action='store_false',
-        help='Do not log to Weights & Biases (default: logging is ON for this '
-             'tool). Local PNGs are still written unless --no-plots.'
-    )
+    # Shared logging flags (--wandb / --no-wandb / --wandb-project / --entity
+    # / --run-name / --mode / --no-plots). W&B defaults ON here as it does
+    # everywhere else now; this tool no longer needs to say so specially, and
+    # its own --no-wandb has moved into add_wandb_args so every driver has it.
+    add_wandb_args(parser)
 
     return parser.parse_args()
 

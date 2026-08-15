@@ -310,7 +310,8 @@ def main():
 
     print(f"\nOutput path: {output_path}")
 
-    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    # Experiment logging: local PNGs next to the output, plus W&B unless
+    # --no-wandb (on by default; inert until a project is configured).
     # Created BEFORE preflight (an auto-aborted job is recorded as a FAILED
     # run with the verdict) and before the reconstructor (TIGRE streams its
     # crossval metrics live through log_fn while iterating).

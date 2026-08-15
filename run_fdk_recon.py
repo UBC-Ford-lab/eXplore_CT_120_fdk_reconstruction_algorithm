@@ -148,7 +148,8 @@ def main():
     output_path = args.output if args.output else ctx.default_output_path('_recon')
     print(f"\nOutput path: {output_path}")
 
-    # Experiment logging: local PNGs next to the output, W&B when --wandb.
+    # Experiment logging: local PNGs next to the output, plus W&B unless
+    # --no-wandb (on by default; inert until a project is configured).
     # Created BEFORE preflight so an auto-aborted job is recorded (FAILED
     # run with the verdict) rather than leaving no trace.
     logger = ReconLogger(args, ctx, 'fdk', output_path, params={
