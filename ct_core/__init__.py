@@ -10,6 +10,14 @@ Core utilities for CT reconstruction project including:
 from . import vff_io
 from . import preprocessing
 from . import utils
+from . import errors
+from .errors import (
+    ReconstructionError,
+    ScanDataError,
+    ConfigError,
+    PreflightAbort,
+    cli_main,
+)
 
 # Convenience re-exports of commonly used functions
 from .vff_io import read_vff, read_vff_header, read_vff_data, VFFDataset, write_vff
@@ -79,6 +87,13 @@ except ImportError:
     pass
 
 __all__ = [
+    # Errors (raised by the library; drivers turn them into exit codes)
+    'errors',
+    'ReconstructionError',
+    'ScanDataError',
+    'ConfigError',
+    'PreflightAbort',
+    'cli_main',
     # Modules
     'vff_io',
     'calibration',

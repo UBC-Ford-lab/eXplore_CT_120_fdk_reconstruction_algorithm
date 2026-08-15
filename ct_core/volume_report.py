@@ -29,22 +29,49 @@ silently wrong:
     do store raw values.
   * GEOMETRY — the GE header keeps one scalar ``elementsize``, so the z voxel
     size and the volume's position in the scanner frame do not survive the
-    write. Both can be supplied; the header value is the default for the
-    voxel size and the origin defaults to the isocentre (the ``vol_origin``
-    of a full-FOV reconstruction). The header's own ``origin`` field is NOT
-    used — the vendor writes detector-frame numbers there
+    write. For volumes THIS package wrote, both are read back from the
+    ``<volume>.json`` sidecar (``load_sidecar``); for a foreign volume they
+    can be supplied by hand, defaulting to the header voxel size and an
+    isocentre origin. The header's own ``origin`` field is NOT used — the
+    vendor writes detector-frame numbers there
     (``-581.6533 3066.9634 46.4056``), not an isocentre-relative volume
     centre in mm.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 
 from .scan_setup import _hist_mode
 from .vff_io import read_vff
+
+
+def load_sidecar(path, *, verbose: bool = True) -> dict:
+    """The ``<volume>.json`` companion written next to a volume, or ``{}``.
+
+    Absent for any volume this package did not write (the vendor's, an older
+    run), which is not an error — it just means the geometry has to come from
+    the header or the command line.
+    """
+    side = Path(path).with_suffix('.json')
+    if not side.exists():
+        return {}
+    try:
+        record = json.loads(side.read_text())
+    except (OSError, ValueError) as e:
+        if verbose:
+            print(f"  Sidecar {side.name} unreadable ({type(e).__name__}: "
+                  f"{e}) — falling back to the header.")
+        return {}
+    if verbose:
+        made_by = record.get('algorithm', 'unknown')
+        print(f"  Sidecar {side.name}: {made_by}"
+              + (f", scan {record['scan']}" if 'scan' in record else "")
+              + (f", {record['created']}" if 'created' in record else ""))
+    return record
 
 
 # --------------------------------------------------------------------- load --
@@ -115,7 +142,7 @@ def load_reconstructed_volume(path, *, y_flip: bool = True,
 # ----------------------------------------------------------------- geometry --
 
 def resolve_volume_geometry(volume, header: dict, *, voxel_xy=None,
-                            voxel_z=None, origin=(0.0, 0.0, 0.0),
+                            voxel_z=None, origin=None, sidecar=None,
                             verbose: bool = True) -> dict:
     """Build the ``geometry`` dict the figure builders read.
 
@@ -123,10 +150,24 @@ def resolve_volume_geometry(volume, header: dict, *, voxel_xy=None,
     views put physical mm on the axes); the projection-geometry entries are
     absent because no projections are involved.
 
-    Voxel size comes from ``voxel_xy``/``voxel_z`` when given, else the GE
-    ``elementsize`` (or the first token of ``spacing``), else 1.0 mm with a
-    warning — an unlabelled axis is better than a wrong one.
+    Precedence, most specific first: an explicit argument, then the
+    ``<volume>.json`` sidecar (written by every driver in this package, and
+    the only place an anisotropic grid or an ROI's position survives), then
+    the GE ``elementsize``/``spacing`` header for the voxel size and the
+    isocentre for the origin. A last-resort 1.0 mm is used with a warning —
+    an unlabelled axis is better than a wrong one.
     """
+    side = sidecar or {}
+    side_voxel = side.get('voxel_size_mm') or {}
+    if voxel_xy is None and 'xy' in side_voxel:
+        voxel_xy = float(side_voxel['xy'])
+    if voxel_z is None and 'z' in side_voxel:
+        voxel_z = float(side_voxel['z'])
+    if origin is None and side.get('vol_origin_mm') is not None:
+        origin = tuple(float(v) for v in side['vol_origin_mm'])
+    if origin is None:
+        origin = (0.0, 0.0, 0.0)
+
     header_size = None
     if 'elementsize' in header:
         header_size = float(header['elementsize'])

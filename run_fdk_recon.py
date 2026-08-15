@@ -20,7 +20,6 @@ Usage:
 """
 
 import argparse
-import sys
 import time
 
 import numpy as np
@@ -28,6 +27,7 @@ import torch
 
 from .fdk import FDKReconstructor, SUPPORTED_FILTER_TYPES
 from .ct_core.data_budget import SWEEP, data_budget, measurement_count
+from .ct_core.errors import ConfigError, cli_main
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
@@ -183,8 +183,10 @@ def main():
     })
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
-    run_preflight('fdk', ctx, gpu_index=0, logger=logger,
-                  skip=args.skip_preflight, only=args.preflight_only)
+    if run_preflight('fdk', ctx, gpu_index=0, logger=logger,
+                     skip=args.skip_preflight,
+                     only=args.preflight_only).dry_run:
+        return                      # --preflight-only: the question is answered
 
     # Optional center-of-rotation / central-slice overrides (COR recalibration)
     if args.cor is not None:
@@ -220,8 +222,8 @@ def main():
     else:
         filter_cutoff = float(args.filter_cutoff)
     if not 0.0 < filter_cutoff <= 1.0:
-        print(f"Error: filter-cutoff must be in (0.0, 1.0], got {filter_cutoff:.4f}")
-        sys.exit(1)
+        raise ConfigError(
+            f"--filter-cutoff must be in (0.0, 1.0], got {filter_cutoff:.4f}")
     print(f"  Filter type: {args.filter_type}")
 
     if args.bhc_coeffs is not None:
@@ -250,7 +252,6 @@ def main():
         projections=fdk_proj,
         angles=torch.as_tensor(fdk_angles),
         geometry=geometry,
-        source_locations=None,
         folder_name=output_path,
         quantitative=True,
         bright_field=ctx.bright_field,
@@ -276,7 +277,7 @@ def main():
         bone_bhc_hu=args.bone_bhc_hu,
     )
 
-    reconstructor.reconstruct(display_volume=args.display)
+    reconstructor.reconstruct()
 
     # How much measured data went in — the unit that compares across
     # backends. FDK filters and backprojects every measurement exactly once:
@@ -291,7 +292,8 @@ def main():
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     _, _, volume_hu = save_outputs(reconstructor.reconstructed_volume, ctx,
-                                   args, output_path, logger=logger)
+                                   args, output_path, logger=logger,
+                                   algorithm='fdk')
 
     # Projection diagnostics on the final volume: forward-project at the
     # evaluation angle through the canonical ray tracer -> diag/ssim, psnr,
@@ -321,4 +323,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    cli_main(main)

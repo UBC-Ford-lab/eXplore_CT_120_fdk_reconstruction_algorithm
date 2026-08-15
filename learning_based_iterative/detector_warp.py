@@ -57,7 +57,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-CALIB_DIR = Path(__file__).resolve().parents[2] / "data" / "calibration"
+from ..ct_core.paths import calibration_dir
+
+# The shared scanner-calibration directory. Resolved rather than assumed (see
+# ct_core.paths): a hardcoded "three levels up" is right only for the
+# submodule layout and points outside the repo for a standalone clone.
+CALIB_DIR = calibration_dir()
 
 
 # ---------------------------------------------------------------- helpers ---

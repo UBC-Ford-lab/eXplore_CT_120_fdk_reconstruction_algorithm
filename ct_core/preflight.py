@@ -37,9 +37,9 @@ exits without reconstructing (for sizing jobs before submitting them).
 from __future__ import annotations
 
 import math
-import sys
 from dataclasses import dataclass, field
 
+from .errors import PreflightAbort
 from .utils import query_gpu_memory
 
 GiB = float(2 ** 30)
@@ -79,6 +79,11 @@ class PreflightReport:
     ram_free: int | None
     ram_needed: int
     notes: list[str] = field(default_factory=list)
+    # Set by run_preflight for a --preflight-only dry run: the machine-fit
+    # question has been answered and the caller should return WITHOUT
+    # reconstructing. A successful dry run is not an error, so it is a return
+    # value rather than an exception (and never a sys.exit from a library).
+    dry_run: bool = False
 
     @property
     def verdict(self) -> str:
@@ -216,8 +221,14 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
                   logger=None) -> PreflightReport:
     """Print the machine-fit report; abort on a fatal verdict unless skipped.
 
-    ``only=True``: print and sys.exit(0) — a dry run for sizing a job.
+    ``only=True``: print the report and return it with ``dry_run`` set — a
+    dry run for sizing a job. The caller returns without reconstructing;
+    exiting is the driver's decision, not this function's.
     ``skip=True``: print the report but never abort.
+
+    Raises ``PreflightAbort`` when the machine cannot fit the job (and
+    ``skip`` is not set), so a library caller can catch it and try a smaller
+    grid instead of having its process killed.
     ``logger``: optional ReconLogger — the report is recorded on the W&B run
     (config + summary), and a fatal abort marks that run FAILED with the
     reason, so an auto-aborted job is visible in W&B rather than silent.
@@ -264,7 +275,8 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
     if only:
         if logger is not None:
             logger.finish()
-        sys.exit(0)
+        report.dry_run = True
+        return report
     if report.fatal and not skip:
         reason = (f"preflight {report.verdict}: "
                   f"need {report.vram_needed / GiB:.1f} GiB VRAM / "
@@ -287,7 +299,7 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
                   f"remove (a smooth HU offset, not a visible artifact).")
         if logger is not None:
             logger.abort(reason)
-        sys.exit(1)
+        raise PreflightAbort(reason)
     if report.fatal and skip:
         print("  (--skip-preflight: continuing anyway — expect an OOM or "
               "a crash)")

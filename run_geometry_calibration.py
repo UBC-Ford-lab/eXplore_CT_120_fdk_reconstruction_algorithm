@@ -19,8 +19,8 @@ Usage:
 """
 
 import argparse
-import sys
 
+from .ct_core.errors import ScanDataError, cli_main
 from .ct_core.pipeline import (
     add_common_args,
     prepare_scan,
@@ -76,11 +76,11 @@ def main():
     ctx = prepare_scan(args)
     record = measure_detector_psi(ctx)
     if record is None:
-        print("\nCalibration failed — see messages above.")
-        sys.exit(1)
+        raise ScanDataError(
+            "detector-psi calibration failed — see the messages above.")
     print(f"\nDone: psi = {float(record['psi_deg']):+.4f} deg "
           f"(elapsed {float(record.get('elapsed_s', 0.0)):.0f}s).")
 
 
 if __name__ == '__main__':
-    main()
+    cli_main(main)

@@ -53,6 +53,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .paths import calibration_dir
+
 # Guards for unattended use ahead of multi-hour jobs (identical to muNeRF).
 MAX_PSI_DEG = 2.0            # a detector is not mounted that crooked
 MIN_PROMINENCE = 0.05        # (max-min)/|min| of the coarse curve; a flat
@@ -429,9 +431,15 @@ def prepare_estimation_sinogram(projections, bright_field, dark_field,
 
 def calibration_json_path(repo_root, detector_serial: str,
                           scan_tag: str) -> Path:
-    """The scan-keyed calibration file shared with muNeRF."""
-    return (Path(repo_root) / "data" / "calibration"
-            / f"detector_psi_{detector_serial}_{scan_tag}.json")
+    """The scan-keyed calibration file shared with muNeRF.
+
+    ``repo_root=None`` resolves the shared calibration directory through
+    ``ct_core.paths`` (env override, then an existing data/calibration in any
+    ancestor, then the project root) instead of assuming a checkout layout.
+    """
+    base = (calibration_dir() if repo_root is None
+            else Path(repo_root) / "data" / "calibration")
+    return base / f"detector_psi_{detector_serial}_{scan_tag}.json"
 
 
 def write_calibration_json(path: Path, result: dict, *, downsample: int,

@@ -18,7 +18,6 @@ Usage:
 """
 
 import argparse
-import sys
 import time
 
 import numpy as np
@@ -26,6 +25,7 @@ import numpy as np
 from .iterative.astra import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
 from .iterative.tigre import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
 from .ct_core.data_budget import classical_budget, measurement_count
+from .ct_core.errors import ConfigError, cli_main
 from .ct_core.pipeline import (
     ReconLogger,
     add_common_args,
@@ -109,14 +109,6 @@ Examples:
         help='Detector/voxel super-sampling factor (default: 1). '
              'Higher values improve accuracy at the cost of speed.'
     )
-    parser.add_argument(
-        '--calibration-method',
-        default='two_point',
-        help='HU calibration method (default: "two_point"). '
-             'Measures air/water from the volume and applies the standard '
-             'CT HU formula. Self-calibrating, works with any config.'
-    )
-
     # Cross-validation holdout (TIGRE backend only)
     parser.add_argument(
         '--no-crossval',
@@ -251,26 +243,26 @@ def main():
     # Validate algorithm for chosen backend
     if args.backend == 'astra':
         if args.algorithm not in ASTRA_ALGORITHMS:
-            print(f"Error: Algorithm '{args.algorithm}' not supported for ASTRA backend. "
-                  f"Supported: {ASTRA_ALGORITHMS}")
-            sys.exit(1)
+            raise ConfigError(
+                f"algorithm '{args.algorithm}' is not supported by the ASTRA "
+                f"backend. Supported: {ASTRA_ALGORITHMS}")
     elif args.backend == 'tigre':
         if args.algorithm not in SUPPORTED_TIGRE_ALGORITHMS:
-            print(f"Error: Algorithm '{args.algorithm}' not supported for TIGRE backend. "
-                  f"Supported: {SUPPORTED_TIGRE_ALGORITHMS}")
-            sys.exit(1)
+            raise ConfigError(
+                f"algorithm '{args.algorithm}' is not supported by the TIGRE "
+                f"backend. Supported: {SUPPORTED_TIGRE_ALGORITHMS}")
         if args.algorithm == 'mlem' and args.pwls:
-            print("Error: --pwls is not supported with --algorithm mlem. "
-                  "MLEM's constructor unconditionally overrides any custom W "
-                  "weight array with its own sensitivity map, so --pwls would "
-                  "be silently ignored rather than applied — and it's "
-                  "redundant anyway since MLEM already models per-ray photon "
-                  "statistics natively through its Poisson likelihood.")
-            sys.exit(1)
+            raise ConfigError(
+                "--pwls is not supported with --algorithm mlem. MLEM's "
+                "constructor unconditionally overrides any custom W weight "
+                "array with its own sensitivity map, so --pwls would be "
+                "silently ignored rather than applied — and it is redundant "
+                "anyway, since MLEM already models per-ray photon statistics "
+                "natively through its Poisson likelihood.")
 
     if args.checkpoint_dir is not None and args.checkpoint_z_range is None:
-        print("Error: --checkpoint-z-range is required when --checkpoint-dir is set.")
-        sys.exit(1)
+        raise ConfigError(
+            "--checkpoint-z-range is required when --checkpoint-dir is set.")
 
     start = time.time()
 
@@ -336,8 +328,10 @@ def main():
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation
     # — and before psi auto-measurement, which itself needs GPU minutes on a
     # cache miss. ASTRA/TIGRE are CUDA-only: no GPU is a hard abort here.
-    run_preflight(args.backend, ctx, gpu_index=args.gpu_index, logger=logger,
-                  skip=args.skip_preflight, only=args.preflight_only)
+    if run_preflight(args.backend, ctx, gpu_index=args.gpu_index,
+                     skip=args.skip_preflight, logger=logger,
+                     only=args.preflight_only).dry_run:
+        return                      # --preflight-only: the question is answered
 
     # ---- geometry auto-calibration (detector in-plane rotation psi) --------
     # Cached scan-keyed JSON first (written by any pipeline — muNeRF, FDK, or
@@ -490,7 +484,8 @@ def main():
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     _, _, volume_hu = save_outputs(vol_export, ctx, args, output_path,
-                                   logger=logger)
+                                   logger=logger,
+                                   algorithm=f'{args.backend}_{args.algorithm}')
 
     logger.log_sinogram_preview(ctx.projections)
     logger.log_volume_summary(volume_hu, ctx)
@@ -502,4 +497,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    cli_main(main)

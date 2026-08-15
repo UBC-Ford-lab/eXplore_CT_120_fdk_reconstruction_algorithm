@@ -43,7 +43,6 @@ Usage:
 """
 
 import argparse
-import sys
 import time
 from pathlib import Path
 
@@ -55,11 +54,13 @@ from .ct_core.hu_calibration import (
     format_calibration,
     landmark_check,
 )
+from .ct_core.errors import ScanDataError, cli_main
 from .ct_core.pipeline import ScanContext
 from .ct_core.volume_report import (
     format_statistics,
     hu_scale_warnings,
     load_reconstructed_volume,
+    load_sidecar,
     resolve_volume_geometry,
     volume_statistics,
 )
@@ -125,11 +126,12 @@ Examples:
         '--origin',
         nargs=3,
         type=float,
-        default=(0.0, 0.0, 0.0),
+        default=None,
         metavar=('X', 'Y', 'Z'),
-        help='Volume CENTRE in isocentre-centred mm (default: 0 0 0, the '
-             'full-FOV case). Set it for an ROI reconstruction so the view '
-             'axes read in scanner coordinates.'
+        help='Volume CENTRE in isocentre-centred mm (default: the '
+             '<volume>.json sidecar if this package wrote the volume, else '
+             '0 0 0 — the full-FOV case). Set it for a foreign ROI '
+             'reconstruction so the view axes read in scanner coordinates.'
     )
     parser.add_argument(
         '--hu-window',
@@ -235,11 +237,18 @@ def main():
             volume_path, y_flip=args.y_flip,
             hu_from_header=args.hu_from_header)
     except (FileNotFoundError, ValueError) as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        raise ScanDataError(str(e)) from e
+
+    # Volumes this package wrote describe themselves; foreign ones do not, and
+    # then the command line / header defaults apply exactly as before.
+    sidecar = load_sidecar(volume_path)
+    if args.algorithm == 'external' and sidecar.get('algorithm'):
+        args.algorithm = str(sidecar['algorithm'])
+    if args.scan_folder is None and sidecar.get('scan'):
+        args.scan_folder = str(sidecar['scan'])
 
     geometry = resolve_volume_geometry(
-        volume, header,
+        volume, header, sidecar=sidecar,
         voxel_xy=args.voxel_xy, voxel_z=args.voxel_z, origin=args.origin)
 
     # The figure builders and the config whitelist read a ScanContext; this
@@ -313,4 +322,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    cli_main(main)

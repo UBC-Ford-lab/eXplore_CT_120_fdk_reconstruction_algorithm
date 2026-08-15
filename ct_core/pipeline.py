@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -40,11 +39,13 @@ import numpy as np
 import torch
 
 from .scan_setup import (
+    _xml_field,
     auto_detect_scan_folder,
     load_scan_data,
     build_geometry,
     parse_crop_boundary,
     postprocess_and_save,
+    reconstructible_fov,
 )
 from .support import (  # noqa: F401 (crop_to_export_roi re-exported for drivers)
     crop_to_export_roi,
@@ -52,6 +53,8 @@ from .support import (  # noqa: F401 (crop_to_export_roi re-exported for drivers
     measure_attenuating_support,
     support_to_domain_bounds,
 )
+from .errors import ConfigError, ScanDataError
+from .paths import calibration_dir
 from .preprocessing import downsample_projections
 from .vff_io import detector_serial_from_scan
 from .wandb_logging import ReconLogger, add_wandb_args  # noqa: F401 (ReconLogger re-exported for drivers)
@@ -115,16 +118,22 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--fov-xy',
-        type=float,
-        default=45,
-        help='Field of view in the xy plane in mm (default: 45, for most mouse '
-             'scans; use 94 for most phantom scanner studies)'
+        default='auto',
+        metavar='MM|auto',
+        help='Field of view in the xy plane in mm (default: auto — the fan '
+             'the detector actually subtends, tightened to the object the '
+             'projections show, so the grid is a fact about this scanner and '
+             'this scan rather than an assumption about the specimen). '
+             'Ignored when --roi or a model domain defines the grid.'
     )
     parser.add_argument(
         '--fov-z',
-        type=float,
-        default=120.0,
-        help='Field of view in the z direction in mm (default: 120.0)'
+        default='auto',
+        metavar='MM|auto',
+        help='Field of view in the z direction in mm (default: auto — the '
+             'cone height at the rotation axis, tightened to the object). '
+             'Beyond the cone no ray reaches the voxels at all: the historical '
+             '120 mm default put two thirds of the grid outside it.'
     )
     parser.add_argument(
         '--roi',
@@ -143,11 +152,6 @@ def add_common_args(parser):
              '(default: 1). Reduces GPU memory usage. Factor 2 halves each '
              'detector dimension (detector pixel size and central-pixel '
              'indices are converted consistently).'
-    )
-    parser.add_argument(
-        '--display',
-        action='store_true',
-        help='Save reconstruction slice PNGs after completion'
     )
     parser.add_argument(
         '--bilateral-filter',
@@ -384,9 +388,12 @@ def _parse_roi_bounds(args, scan_folder, xml_header, required=True):
                 print(f"\n  --roi auto: no SubVolumeCoordinates.xml at {where}"
                       f"\n  falling back to saving the full reconstruction volume.")
                 return None
-            print("Error: SubVolumeCoordinates.xml not found or invalid in scan folder.")
-            print("  Looked in: " + where)
-            sys.exit(1)
+            raise ScanDataError(
+                f"--roi auto: SubVolumeCoordinates.xml not found or invalid "
+                f"(looked in {where}). For this backend the ROI defines the "
+                f"reconstruction grid, so falling back to the full FOV would "
+                f"silently reconstruct a much larger volume; pass explicit "
+                f"--roi bounds or drop --roi.")
         return roi_bounds
     if len(args.roi) == 6:
         vals = [float(v) for v in args.roi]
@@ -395,9 +402,9 @@ def _parse_roi_bounds(args, scan_folder, xml_header, required=True):
             'y_min': vals[2], 'y_max': vals[3],
             'z_min': vals[4], 'z_max': vals[5],
         }
-    print("Error: --roi requires 'auto' or exactly 6 values "
-          "(x_min x_max y_min y_max z_min z_max)")
-    sys.exit(1)
+    raise ConfigError(
+        f"--roi takes 'auto' or exactly 6 values "
+        f"(x_min x_max y_min y_max z_min z_max), got {len(args.roi)}")
 
 
 def add_model_domain_args(parser):
@@ -448,9 +455,106 @@ def resolve_model_domain(args, projections, geometry, bright_field, dark_field):
             projections, geometry,
             bright_field=bright_field, dark_field=dark_field)
         return support_to_domain_bounds(support), support
-    print("Error: --model-domain takes 'auto', 'off', or two numbers "
-          "(EXTENT_XY HALF_Z)")
-    sys.exit(1)
+    raise ConfigError(
+        f"--model-domain takes 'auto', 'off', or two numbers "
+        f"(EXTENT_XY HALF_Z), got {' '.join(str(v) for v in spec)!r}")
+
+
+def _fov_spec(value, flag: str):
+    """Parse a `--fov-*` value: ``None`` for 'auto', else the number in mm."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ('auto', 'full'):
+        return None
+    try:
+        mm = float(text)
+    except ValueError:
+        raise ConfigError(
+            f"{flag} takes a number of millimetres or 'auto', "
+            f"got {value!r}") from None
+    if mm <= 0:
+        raise ConfigError(f"{flag} must be positive, got {mm}")
+    return mm
+
+
+def resolve_fov(args, xml_header, projections, *, bright_field=None,
+                dark_field=None, measure: bool = True):
+    """`--fov-xy` / `--fov-z` -> the two extents build_geometry wants, in mm.
+
+    The historical defaults (45 mm transaxial, 120 mm axial) were neither
+    scanner facts nor safe: 45 mm is a mouse, and on this scanner it discards
+    a measured field almost twice that wide, while 120 mm is more than twice
+    the cone, so two thirds of the axial grid could never receive a ray. Both
+    numbers describe a specimen, and they travel to the next specimen wrongly.
+
+    'auto' replaces them with two things that are actually knowable:
+
+      1. the RECONSTRUCTIBLE field — how far the fan and cone reach, from the
+         scan.xml geometry alone (``scan_setup.reconstructible_fov``). This is
+         the hard bound: outside it there are no measurements.
+      2. the ATTENUATING SUPPORT — how far the object actually extends,
+         measured from the projections (``ct_core.support``, the same
+         measurement the iterative and learned backends already use for their
+         model domain). This tightens the box so a small specimen in a large
+         field does not pay for the empty part.
+
+    The support is only a tightening, never an extension, and it is skipped
+    (``measure=False``) when --roi or a model domain is going to replace the
+    grid anyway. An explicit number always wins, and is never clamped: asking
+    for a field wider than the fan is a legitimate diagnostic.
+    """
+    want_xy = _fov_spec(getattr(args, 'fov_xy', 'auto'), '--fov-xy')
+    want_z = _fov_spec(getattr(args, 'fov_z', 'auto'), '--fov-z')
+    if want_xy is not None and want_z is not None:
+        return want_xy, want_z
+
+    n_b, n_a = int(projections.shape[1]), int(projections.shape[2])
+    reach = reconstructible_fov(xml_header, n_b, n_a,
+                                cor_mode=getattr(args, 'cor_mode', 'center'))
+    fov_xy = reach['fov_xy'] if want_xy is None else want_xy
+    fov_z = reach['fov_z'] if want_z is None else want_z
+    print(f"\nField of view 'auto': the detector subtends "
+          f"{reach['fov_xy']:.1f} mm transaxially and {reach['fov_z']:.1f} mm "
+          f"axially at the isocentre (magnification "
+          f"{reach['magnification']:.3f})")
+
+    if measure:
+        # A minimal geometry for the support measurement: it reads detector
+        # channels, so it needs only the detector parameters — not a grid.
+        R_s = _xml_field(xml_header, 'ObjectPosition')
+        pitch = _xml_field(xml_header, 'DetectorSpacing')
+        det_geom = {
+            'R_s': R_s,
+            'R_d': _xml_field(xml_header, 'DetectorPosition') - R_s,
+            'da': pitch, 'db': pitch,
+            'central_pixel_a': (n_a - 1) / 2.0,
+            'central_pixel_b': (n_b - 1) / 2.0,
+        }
+        try:
+            support = measure_attenuating_support(
+                projections, det_geom, bright_field=bright_field,
+                dark_field=dark_field, verbose=False)
+        except Exception as e:                                  # noqa: BLE001
+            print(f"  (support measurement unavailable — "
+                  f"{type(e).__name__}: {e}; using the full field)")
+            return fov_xy, fov_z
+
+        # Symmetric about the axis in xy (the object turns), and in z we keep
+        # the box centred on the isocentre so vol_origin stays (0, 0, 0) — an
+        # off-centre z box is what --roi and --model-domain are for.
+        obj_xy = 2.0 * float(support['radius_xy'])
+        obj_z = 2.0 * max(abs(float(support['z_min'])),
+                          abs(float(support['z_max'])))
+        if want_xy is None and obj_xy < fov_xy:
+            print(f"  transaxial: object spans {obj_xy:.1f} mm — tightened "
+                  f"from {fov_xy:.1f} mm")
+            fov_xy = obj_xy
+        if want_z is None and obj_z < fov_z:
+            print(f"  axial:      object spans {obj_z:.1f} mm — tightened "
+                  f"from {fov_z:.1f} mm")
+            fov_z = obj_z
+    return fov_xy, fov_z
 
 
 def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
@@ -504,11 +608,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     if args.scan_folder:
         scan_folder = args.scan_folder
     else:
-        try:
-            scan_folder = auto_detect_scan_folder(data_folder)
-        except ValueError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
+        scan_folder = auto_detect_scan_folder(data_folder)
 
     scan_data = load_scan_data(
         data_folder, scan_folder,
@@ -527,9 +627,17 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     roi_bounds = _parse_roi_bounds(args, scan_folder, scan_data['xml_header'],
                                    required=not use_domain)
 
+    # The FOV only decides anything when nothing else does: --roi and a model
+    # domain both replace the grid outright, and measuring the support for a
+    # grid that is about to be discarded would just cost time.
+    fov_xy, fov_z = resolve_fov(
+        args, scan_data['xml_header'], projections,
+        bright_field=bright_field, dark_field=dark_field,
+        measure=(roi_bounds is None and not use_domain))
+
     geometry = build_geometry(
         scan_data['xml_header'],
-        args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
+        fov_xy, fov_z, args.voxel_xy, args.voxel_z,
         roi_bounds=None if use_domain else roi_bounds,
         # Under a model domain this grid is provisional — it exists only to
         # carry the detector parameters into the support measurement, and is
@@ -570,7 +678,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         if domain_bounds is not None:
             domain_geom = build_geometry(
                 scan_data['xml_header'],
-                args.fov_xy, args.fov_z, args.voxel_xy, args.voxel_z,
+                fov_xy, fov_z, args.voxel_xy, args.voxel_z,
                 roi_bounds=domain_bounds)
             for key in ('vol_shape', 'vol_origin'):
                 geometry[key] = domain_geom[key]
@@ -627,7 +735,7 @@ def resolve_detector_psi(scan_folder, verbose=True,
     try:
         serial = detector_serial_from_scan(scan_folder)
         tag = Path(scan_folder).name
-        cal_path = (Path(__file__).resolve().parents[2] / "data" / "calibration"
+        cal_path = (calibration_dir()
                     / f"detector_psi_{serial}_{tag}.json")
         if not serial or not cal_path.exists():
             if verbose:
@@ -710,8 +818,7 @@ def measure_detector_psi(ctx: ScanContext, verbose=True) -> Optional[dict]:
         record = None
         if serial:
             path = calibration_json_path(
-                Path(__file__).resolve().parents[2],
-                serial, Path(ctx.scan_folder).name)
+                None, serial, Path(ctx.scan_folder).name)
             write_calibration_json(path, result, downsample=total_ds,
                                    detector_serial=serial)
             if verbose:
@@ -767,7 +874,7 @@ def resolve_or_measure_detector_psi(ctx: ScanContext, verbose=True,
 # --------------------------------------------------------------------------
 
 def save_outputs(volume, ctx: ScanContext, args, output_path: str,
-                 logger=None):
+                 logger=None, algorithm: str | None = None):
     """Crop to the export ROI, then HU-calibrate, filter and write the VFF.
 
     This is the one place the HU scale is set, for every backend. The
@@ -784,9 +891,22 @@ def save_outputs(volume, ctx: ScanContext, args, output_path: str,
     header and every downstream plot agree with the pixels. No-op when no
     export ROI is set.
 
+    Alongside the VFF goes a ``<output>.json`` sidecar recording the grid, the
+    position, and the HU map that was applied — the things a GE ncaa header
+    cannot carry (see scan_setup.write_sidecar).
+
     Returns (vff path, HUAnchors, calibrated HU volume).
     """
     volume, ctx.geometry = crop_to_export_roi(volume, ctx.geometry)
+    # Sidecar identity: the scan BASENAME only, never a path (same rule as the
+    # W&B config whitelist — these files travel with the volume).
+    metadata = {'scan': Path(ctx.scan_folder).name,
+                'downsample': int(ctx.downsample or 1)}
+    if algorithm:
+        metadata['algorithm'] = algorithm
+    psi = ctx.geometry.get('det_psi_rad')
+    if psi:
+        metadata['detector_psi_deg'] = float(np.degrees(psi))
     path, anchors, volume_hu = postprocess_and_save(
         volume_mu=volume,
         geometry=ctx.geometry,
@@ -799,6 +919,7 @@ def save_outputs(volume, ctx: ScanContext, args, output_path: str,
         mu_water=getattr(args, 'mu_water', None),
         tissue_hu=getattr(args, 'tissue_hu', None),
         save_mu=getattr(args, 'save_mu', False),
+        metadata=metadata,
     )
     if logger is not None:
         logger.log_hu_calibration(anchors)

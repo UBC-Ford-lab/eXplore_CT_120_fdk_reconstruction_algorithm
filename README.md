@@ -142,6 +142,11 @@ run_learned_recon.py
        ├─ ct_core/calibration.py     flat-field correction + log transform
        │                             (projection preprocessing only — it no
        │                             longer converts anything to HU)
+       ├─ ct_core/paths.py           where the shared scanner calibrations
+       │                             live (`$CT_CALIBRATION_DIR`, else a
+       │                             discovered/created `data/calibration`)
+       ├─ ct_core/errors.py          ScanDataError / ConfigError /
+       │                             PreflightAbort + the cli_main wrapper
        └─ ct_core/utils.py           GPU memory query
 
 run_volume_report.py                          report on a volume that already
@@ -241,6 +246,48 @@ optimizer trajectory. Requires Triton, i.e. compute capability >= 7.0 —
 older GPUs (P100 and earlier) warn once and continue eagerly rather than
 failing the run. `--compile max-autotune` benchmarks kernel variants at
 compile time; minutes of extra startup, worth it only for long runs.
+
+## Field of view: `auto` (all backends)
+
+`--fov-xy` / `--fov-z` default to `auto`. The old defaults — 45 mm transaxial,
+120 mm axial — described a mouse, not a scanner, and both were wrong in a way
+that does not announce itself:
+
+| | old default | what the scanner gives (Scan_1510) |
+|---|---|---|
+| transaxial | 45 mm | **87.6 mm** — half the measured field was being thrown away |
+| axial | 120 mm | **57.5 mm** — two thirds of the grid was outside the cone, where no ray reaches |
+
+`auto` computes both from facts instead. The hard bound is the
+**reconstructible field**: the fan and cone the detector subtends, taken to
+the outer pixel edge and mapped to the isocentre, from `scan.xml` alone. It is
+then tightened by the **attenuating support** measured from the projections —
+the same measurement the iterative and learned backends already use for their
+model domain, so all three families now choose a grid the same way. The
+support can only shrink the box, never grow it past what was measured.
+
+```
+Field of view 'auto': the detector subtends 87.6 mm transaxially and
+                      57.5 mm axially at the isocentre (magnification 1.131)
+  transaxial: object spans 81.2 mm — tightened from 87.6 mm
+```
+
+An explicit number is honoured exactly and never clamped (asking for more than
+the fan reaches is a legitimate diagnostic). `--roi` and `--model-domain`
+replace the grid outright, and then the FOV is not consulted at all — nor is
+the support measured, so nothing is paid for it.
+
+## Short scan vs full circle
+
+Parker weighting corrects the double-counted rays of a **short** scan, and
+must not be applied to a full circle, where every ray already has its
+conjugate. The test for "full" is the angular **coverage**, `N·Δβ` — not the
+first-to-last span `(N−1)·Δβ`, which undercounts a full scan by exactly one
+step. 36 views at 10° cover the whole circle but span only 350°; judged on the
+span they were treated as a short scan, and the resulting weights shaded the
+volume and **shifted a synthetic sphere by 0.65 mm**. Real scans here step by
+well under 1°, so no measured reconstruction was affected — the classifier was
+simply wrong wherever the sampling is coarse.
 
 ## Reconstruction domain vs export ROI (iterative + learned)
 
@@ -343,6 +390,13 @@ vendor reconstruction) showed psi alone matches the vendor while
 psi + XML COR re-splits the tube. All backends therefore place the rotation
 axis at the detector geometric centre; `--cor-mode xml` restores the legacy
 scan.xml values (kept in the geometry dict under `central_pixel_*_xml`).
+
+**Where the JSON lives.** A calibration belongs to a DETECTOR, not to a scan
+or a run, so all pipelines share one directory. It is resolved rather than
+assumed (`ct_core/paths.py`): `$CT_CALIBRATION_DIR` if set, else an existing
+`data/calibration` in any ancestor directory, else `data/calibration` under
+the project root. Set the environment variable to point a cluster job at a
+shared read-only store, or to keep measurements on scratch.
 
 Standalone (pre-)calibration, e.g. on a cluster GPU node before submitting
 long jobs:
@@ -599,6 +653,32 @@ Calibration runs *after* the export-ROI crop, so the anchors describe the
 voxels actually shipped. The trade-off is that a very tight ROI can crop away
 the air the offset anchor needs; the fit warns when that happens.
 
+## What a saved volume knows about itself
+
+Every backend writes `<output>.json` next to `<output>.vff`. A GE `ncaa`
+header holds one *scalar* voxel size and an `origin` in the vendor's own
+absolute frame, so on its own a saved volume cannot say whether its z spacing
+differs from its xy spacing, where an ROI sits in the scanner, or which HU map
+was applied — and the map is fitted per volume, so without it a stored HU
+number cannot be traced back to attenuation.
+
+```json
+{
+  "vff": "recon.vff", "units": "HU", "created": "2026-08-15",
+  "voxel_size_mm": {"xy": 0.075, "z": 0.075},
+  "volume_shape": [330, 345, 764],          // reconstruction (x, y, z) order
+  "vol_origin_mm": [6.16, -1.20, 0.50],     // volume centre, isocentre-centred
+  "scan": "Scan_1510", "algorithm": "fdk", "downsample": 1,
+  "detector_psi_deg": -0.70,
+  "hu_calibration": {"scale": 55832.3, "offset": -1010.4, "...": "..."}
+}
+```
+
+`run_volume_report` reads it automatically, so a volume this package produced
+reports itself with no flags; `--voxel-z` / `--origin` are only needed for a
+foreign volume, and an explicit flag still wins. Scan identity is a
+**basename**, never a path — the file is meant to travel with the volume.
+
 ## Reporting on a volume that already exists
 
 The volume-domain half of that panel does not need a sinogram or a training
@@ -654,13 +734,12 @@ not a failure of the report — nothing is rescaled.
 ## Usage
 
 ```bash
-# Standard FDK (BHC + ring correction + two-point HU are all defaults)
-python -m reconstruction.run_fdk_recon data/scans/Scan_1988 \
-    --fov-xy 93.5 --fov-z 70
+# Standard FDK (BHC, ring correction, two-point HU and an auto field of
+# view are all defaults — nothing here is specific to this scan)
+python -m reconstruction.run_fdk_recon data/scans/Scan_1988
 
 # Add bone BHC (Joseph & Spital two-pass)
-python -m reconstruction.run_fdk_recon data/scans/Scan_1988 \
-    --bone-bhc --fov-xy 93.5 --fov-z 70
+python -m reconstruction.run_fdk_recon data/scans/Scan_1988 --bone-bhc
 
 # ROI reconstruction (mouse lung)
 python -m reconstruction.run_fdk_recon data/scans/Scan_1510 --roi auto
@@ -688,6 +767,7 @@ Run `--help` for full argument lists.
 | `--ring-correction` | on | Sinogram-space ring artifact correction (static per-COLUMN pattern) |
 | `--air-normalization` | on | Per-projection air level from object-free columns (per-FRAME scalar) |
 | `--soft-clip-sharpness` | 200 | Softplus transmission-clamp sharpness (50 = pre-2026-08-14) |
+| `--fov-xy` / `--fov-z` | `auto` | Grid extent in mm, or `auto`: the fan/cone the detector subtends, tightened to the measured object |
 | `--roi auto` | off | ROI from SubVolumeCoordinates.xml (FDK: the grid; iterative/learned: the export crop) |
 | `--model-domain` | `auto` | Iterative/learned: region the forward model must cover, measured from the projections (`off` / `EXTENT_XY HALF_Z`) |
 | `--rays-per-batch` | `auto` | Learned backend: batch sized from free VRAM |
@@ -695,9 +775,47 @@ Run `--help` for full argument lists.
 | `--hu-calibration` | `auto` | Fit both HU anchors from the volume's histogram; `fixed` = classical one-point map with `--mu-water` |
 | `--tissue-hu` | 120 | Where bulk soft tissue lands (vendor's scale). This one number sets the gain — the assumption reference-free calibration cannot escape. Use 0 for a water phantom; `auto` mode only |
 | `--save-mu` | off | Also write `<output>_mu.npy` (float32 μ, mm⁻¹) |
+| `$CT_CALIBRATION_DIR` | discovered | Env var: where the shared detector-calibration JSON/NPZ live |
 | `--wandb` | off (**on** for `run_volume_report`) | Log to Weights & Biases; `--no-wandb` opts the report out |
 | `--recalibrate` / `--diagnose-calibration` | off | `run_volume_report`: fit the anchors on an existing volume, with / without applying them |
 | `--hu-from-header` | off | `run_volume_report`: re-apply the VFF water/air anchors (~254x on vendor files — see above) |
+
+## Errors: the library raises, only the driver exits
+
+This package is a set of CLI drivers *and* a library muNeRF imports. Those want
+opposite things from a bad input, so they are separated:
+
+```
+ct_core.*         raise ScanDataError / ConfigError / PreflightAbort
+run_*.py main()   let them propagate — still importable from a notebook or a test
+__main__          cli_main(main) → "Error: <message>" on stderr, exit 1
+```
+
+A `sys.exit` inside `load_scan_data` used to kill a muNeRF training run outright:
+nothing to catch, no way to try another scan folder, and no way for a test to
+assert anything finer than `SystemExit`. All of these derive from
+`ReconstructionError`, which means *the inputs or the machine are wrong* — a
+genuine bug still surfaces as an unhandled traceback rather than a tidy
+one-liner. `--preflight-only` is a **success**, so it returns a report with
+`dry_run` set rather than raising; Ctrl-C exits 130 without a traceback.
+
+## Tests
+
+`tests/` covers the units, and `tests/test_recon_drivers_e2e.py` covers the
+seams: it writes a complete miniature scan to a temp dir — `scan.xml`,
+bright/dark fields, and 36 projection VFFs of an **analytic sphere** whose line
+integrals are exact — then runs the FDK and voxel drivers on it exactly as the
+command line would, and asserts the sphere comes back where it was put.
+
+That single assertion is what pins the conventions no unit test reaches: the
+loader's gantry-to-angle mapping, the geometry from `scan.xml`, the
+centre-of-rotation policy, each backend's own ray frame, the export
+transpose+flip, and the sidecar geometry. The sphere sits off-centre in all
+three axes, so a transpose, a sign flip, a half-pixel offset or an off-by-one
+in the angles cannot cancel out. FDK lands it within **0.07 mm**; the two
+backends share no reconstruction code, so their agreement is meaningful.
+
+It needs no GPU and no scanner data, and runs in a few seconds.
 
 ## Installation
 
@@ -709,3 +827,11 @@ pip install astra-toolbox       # Optional: ASTRA iterative
 ## Scanner Specifics
 
 Tailored for the **GE eXplore CT 120**: cone-beam geometry, VFF projections, `scan.xml` metadata, `bright.vff`/`dark.vff` flat-field. Algorithms are general-purpose — adapting to other scanners requires only changing geometry and file I/O.
+
+A scan folder is identified by the `bright.vff`/`dark.vff` sitting with its
+projections, so a folder does **not** have to be named `Scan_XXXX`; the naming
+convention is only consulted for a *derived* projection folder (infilled
+sinograms, re-exports) that carries no calibration frames of its own, and
+`--scan-folder` overrides both. The acquisition geometry is read from
+`Series/{ObjectPosition, DetectorPosition, DetectorSpacing, CentreOfRotation,
+CentralSlice}` in `scan.xml`; a missing field names itself in the error.

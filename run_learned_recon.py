@@ -21,7 +21,6 @@ Usage:
 """
 
 import argparse
-import sys
 import time
 
 import numpy as np
@@ -39,6 +38,7 @@ from .ct_core.pipeline import (
     save_outputs,
 )
 from .ct_core.data_budget import RANDOM, data_budget
+from .ct_core.errors import ConfigError, cli_main
 from .ct_core.preflight import auto_rays_per_batch
 from .ct_core.projection_diag import measure_noise_ceiling
 from .ct_core.utils import query_gpu_memory
@@ -141,8 +141,9 @@ def main():
         try:
             args.rays_per_batch = int(args.rays_per_batch)
         except ValueError:
-            sys.exit(f"--rays-per-batch: expected an integer or 'auto', "
-                     f"got {args.rays_per_batch!r}")
+            raise ConfigError(
+                f"--rays-per-batch: expected an integer or 'auto', "
+                f"got {args.rays_per_batch!r}") from None
 
     print("=" * 60)
     print(f"Learning-based Iterative Reconstruction ({args.algorithm})")
@@ -213,9 +214,11 @@ def main():
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
     # The voxel grid's VRAM need is dominated by 4x parameters (Adam), plus
     # the per-batch ray buffers sized just above.
-    run_preflight('voxel', ctx, gpu_index=args.gpu_index, logger=logger,
-                  rays_per_batch=args.rays_per_batch, samples_per_ray=_spp,
-                  skip=args.skip_preflight, only=args.preflight_only)
+    if run_preflight('voxel', ctx, gpu_index=args.gpu_index, logger=logger,
+                     rays_per_batch=args.rays_per_batch, samples_per_ray=_spp,
+                     skip=args.skip_preflight,
+                     only=args.preflight_only).dry_run:
+        return                      # --preflight-only: the question is answered
 
     # ---- geometry auto-calibration (detector in-plane rotation psi) --------
     # Cached scan-keyed JSON first; on a miss the half-scan-consistency
@@ -306,7 +309,7 @@ def main():
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     _, _, volume_hu = save_outputs(vol_export, ctx, args, output_path,
-                                   logger=logger)
+                                   logger=logger, algorithm=args.algorithm)
 
     # replay_steps=False: the trainer already streamed these live via diag_fn.
     logger.log_convergence(reconstructor.crossval_history, replay_steps=False)
@@ -320,4 +323,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    cli_main(main)

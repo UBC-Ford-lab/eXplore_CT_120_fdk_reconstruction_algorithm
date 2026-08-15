@@ -2,7 +2,6 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
 import os
 import sys
 
@@ -125,7 +124,7 @@ def _interpolate_metal_pixels(sinogram_chunk, mask):
 
 
 class FDKReconstructor:
-    def __init__(self, projections, angles, geometry, source_locations, folder_name,
+    def __init__(self, projections, angles, geometry, folder_name,
                  mu_water=None, quantitative=False,
                  bright_field=None, dark_field=None,
                  clamp_mode="none", soft_clip_transmission=True,
@@ -151,7 +150,6 @@ class FDKReconstructor:
            - dz: voxel size in z (mm)
            - central_pixel_a: detector center column
            - central_pixel_b: detector center row
-        source_locations: list of source locations in the form [(x1, y1, z1), (x2, y2, z2), ...]
         mu_water: float, linear attenuation coefficient of water in mm⁻¹. Kept
             only for callers that still want the one-point convention; the
             reconstruction itself no longer uses it. HU calibration happens
@@ -235,7 +233,6 @@ class FDKReconstructor:
         # and never allocates the 3-D a-coordinate. Before 2026-08-11 FDK had no
         # psi term at all, so 0.0 reproduces every historical reconstruction.
         self.det_psi_rad = float(geometry.get("det_psi_rad", 0.0) or 0.0)
-        self.source_locations = source_locations
         self.folder_name = folder_name
 
         # Reconstruction produces μ; HU calibration is downstream (see
@@ -486,6 +483,39 @@ class FDKReconstructor:
             print("  GPU OOM during projection preload — falling back to CPU")
             return torch.from_numpy(proj_np)
 
+    # Coverage at or above this counts as a full circle: every ray then has a
+    # conjugate partner, so short-scan redundancy weighting does not apply.
+    FULL_SCAN_DEG = 350.0
+
+    def angular_coverage_deg(self) -> float:
+        """How much of the circle this scan actually covers, in degrees.
+
+        NOT ``angles[-1] - angles[0]``, which is the span between the FIRST and
+        LAST view and so undercounts a full scan by exactly one step: 36 views
+        at 10 deg cover the whole circle but span only 350 deg. Judging
+        "is this a full scan?" on the span therefore misclassifies any full
+        scan whose step exceeds 360 - FULL_SCAN_DEG, and then applies
+        short-scan Parker weights to a circle where every ray already has its
+        conjugate — which shades the reconstruction and shifts the object
+        (measured: 0.65 mm on a synthetic sphere at 10 deg/view).
+
+        Each view stands for a slab of width dbeta, so the coverage is the
+        span plus one step. ``np.unwrap`` first, because the angles come out of
+        the loader modulo 360.
+        """
+        angles = np.asarray(self.angles.cpu() if hasattr(self.angles, 'cpu')
+                            else self.angles, dtype=np.float64).ravel()
+        if angles.size < 2:
+            return 360.0
+        steps = np.diff(np.unwrap(angles))
+        if not steps.size:
+            return 360.0
+        return float(np.degrees(abs(steps.sum()) + abs(np.median(steps))))
+
+    def is_full_scan(self) -> bool:
+        """Whether the views cover the whole circle (see angular_coverage_deg)."""
+        return self.angular_coverage_deg() >= self.FULL_SCAN_DEG
+
     def _compute_parker_weights(self):
         """Compute Parker (short-scan) redundancy weights for fan-beam geometry.
 
@@ -493,14 +523,19 @@ class FDKReconstructor:
         is counted exactly once, eliminating intensity shading from redundant
         measurements in short scans (π + 2γ_m < Λ < 2π).
 
-        For full-circle scans (Λ ≥ 350°) returns None (no correction needed).
+        For full-circle scans returns None (no correction needed) — judged on
+        the COVERAGE, not on the first-to-last span; see angular_coverage_deg.
         """
-        # Total angular range of the scan
-        Lambda = float(self.angles[-1] - self.angles[0])
-
-        # Skip for (near-)full circle scans: all weights would be ~1
-        if Lambda >= np.deg2rad(350.0):
+        # Skip for (near-)full circle scans: every ray already has a conjugate
+        if self.is_full_scan():
             return None
+
+        # Total angular range swept between the first and last view. This stays
+        # the span (not the coverage) because it parameterises the ramp
+        # regions below, where beta runs from 0 at the first view to Lambda at
+        # the last one — changing it would move every weight in every
+        # short-scan reconstruction ever validated.
+        Lambda = float(self.angles[-1] - self.angles[0])
 
         epsilon = Lambda - np.pi  # scan excess over π
         if epsilon <= 0:
@@ -776,7 +811,7 @@ class FDKReconstructor:
         Nx, Ny, Nz = self.vol_shape
 
         with torch.no_grad():
-            # Create 1D coordinate vectors (kept on self for display_volume())
+            # Voxel-centre coordinate vectors, used by the backprojection
             self.x = (torch.arange(Nx, device=device, dtype=torch.float32) - (Nx - 1) / 2) * self.dx + self.vol_origin[0]
             self.y = (torch.arange(Ny, device=device, dtype=torch.float32) - (Ny - 1) / 2) * self.dx + self.vol_origin[1]
             self.z = (torch.arange(Nz, device=device, dtype=torch.float32) - (Nz - 1) / 2) * self.dz + self.vol_origin[2]
@@ -970,8 +1005,7 @@ class FDKReconstructor:
             delta_beta = 2 * np.pi  # Single projection edge case
         if self.physical_normalization:
             parker_applied = getattr(self, '_parker_applied', False)
-            angle_range_deg = abs(float(self.angles[-1] - self.angles[0])) * 180 / np.pi
-            is_full_scan = angle_range_deg >= 350.0
+            is_full_scan = self.is_full_scan()
 
             if parker_applied:
                 # Parker weights (conjugate pairs sum to 1) already ensure each
@@ -1009,55 +1043,7 @@ class FDKReconstructor:
         torch.cuda.empty_cache()
         self.reconstructed_volume = np.asarray(vol_np, dtype=np.float32)
 
-    def display_volume(self):
-
-        torch.cuda.empty_cache()
-        self.x = self.x.cpu().numpy()
-        self.y = self.y.cpu().numpy()
-        self.z = self.z.cpu().numpy()
-
-        num_bytes = self.reconstructed_volume.element_size() * self.reconstructed_volume.nelement()
-        num_megabytes = num_bytes / (1024 ** 2)
-        print(f"Reconstructed volume uses approximately {num_megabytes:.2f} MB")
-
-        # normalise the reconstruction values by gamma factor
-        gamma = 1 # gamma correction to brighten low values
-        torch.cuda.empty_cache()
-
-        self.reconstructed_volume /= self.reconstructed_volume.max()
-        self.reconstructed_volume *= 256
-
-        for i in range(self.reconstructed_volume.shape[2]):
-            z_slice = self.reconstructed_volume[:, :, i].cpu().numpy()
-
-            if i == len(self.z)-1:
-                break
-            os.makedirs(self.folder_name, exist_ok=True)
-
-            fig, ax = plt.subplots()
-
-            # Display using standard imshow convention (no transpose)
-            # z_slice is (Nx, Ny), displayed as (rows=x, cols=y) to match VFF loading convention
-            ax.imshow(z_slice, cmap='gray', origin='lower',
-                     extent=[self.y.min(), self.y.max(), self.x.min(), self.x.max()])
-            ax.set_xlabel('Y position (mm)')
-            ax.set_ylabel('X position (mm)')
-
-            ax.set_aspect('equal', adjustable='box') # set aspect ratio to 1:1 (no squishing of pixels)
-
-            # include source locations
-            # Separate x and y arrays for scatter:
-            if self.source_locations is not None:
-                for source_pos in self.source_locations:
-                    if source_pos[2] >= self.z[i] and source_pos[2] < self.z[i+1]:
-                        ax.scatter(source_pos[1], source_pos[0], c='red', s=10)
-
-            ax.set_title(f'Reconstruction slice {i} (z: {self.z[i]:.2f}-{self.z[i+1]:.2f} mm)')
-
-            plt.savefig(f'{self.folder_name}/reconstruction_slice_{i:03d}_{self.z[i]:.2f}-{self.z[i+1]:.2f}.png', dpi=500, bbox_inches='tight')
-            plt.close(fig)
-
-    def reconstruct(self, display_volume=True):
+    def reconstruct(self):
         """
         Complete reconstruction pipeline.
 
@@ -1116,7 +1102,3 @@ class FDKReconstructor:
         print(f"\nReconstructed μ range: [{float(vol.min()):.6f}, "
               f"{float(vol.max()):.6f}] mm⁻¹ (uncalibrated; HU calibration "
               f"happens once, at save time)")
-
-        if display_volume == True:
-            self.display_volume()
-            print("Reconstruction plots created.")

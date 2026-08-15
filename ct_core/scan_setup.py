@@ -5,20 +5,23 @@ Extracts common data-loading, geometry setup, and post-processing logic
 used by both FDK and iterative reconstruction pipelines.
 """
 
+import json
 import os
 import re
-import sys
 import time
+from datetime import date
 from pathlib import Path
 
 import cv2
 import numpy as np
 import xmltodict
 
+from .errors import ScanDataError
 from .vff_io import VFFDataset, write_vff
 from .calibration import load_calibration_fields
 from .hu_calibration import (
     TISSUE_HU_DEFAULT,
+    calibration_scalars,
     find_attenuation_anchors,
     fixed_anchors,
     format_calibration,
@@ -27,29 +30,45 @@ from .hu_calibration import (
 
 def auto_detect_scan_folder(data_folder: str) -> str:
     """
-    Auto-detect the original scan folder from a results folder path.
+    Auto-detect the original scan folder (the one holding bright/dark fields).
 
-    Naming convention:
-        Results: data/results/Scan_XXXX_<suffix>/
-        Scans:   data/scans/Scan_XXXX/
+    Two cases, in order:
+
+    1. ``data_folder`` IS a scan folder — it has bright.vff and dark.vff next
+       to the projections. This is the ordinary case for any scan taken off
+       the scanner, and it needs no naming convention at all.
+    2. ``data_folder`` is a DERIVED folder (infilled projections, a
+       tile-blending experiment, a re-export) that carries no calibration
+       frames. Then the scan name is read from the folder name and looked up
+       under a sibling ``scans/`` directory:
+
+           Results: data/results/Scan_XXXX_<suffix>/
+           Scans:   data/scans/Scan_XXXX/
 
     Args:
-        data_folder: Path to results folder (e.g., 'data/results/Scan_1681_with_pred')
+        data_folder: Path to the projection folder.
 
     Returns:
-        Path to scan folder (e.g., 'data/scans/Scan_1681')
+        Path to the scan folder holding bright.vff/dark.vff.
 
     Raises:
-        ValueError: If scan name cannot be extracted from folder name
+        ScanDataError: If the folder has no calibration frames AND no scan
+            name can be extracted from its name.
     """
+    # Case 1: the projections sit with their own calibration frames.
+    if (os.path.exists(os.path.join(data_folder, 'bright.vff'))
+            and os.path.exists(os.path.join(data_folder, 'dark.vff'))):
+        return data_folder
+
     folder_name = os.path.basename(data_folder.rstrip('/'))
     match = re.search(r'(Scan_\d+)', folder_name)
 
     if not match:
-        raise ValueError(
-            f"Could not extract scan name from '{folder_name}'. "
-            f"Expected format: 'Scan_XXXX_<suffix>'. "
-            f"Please specify --scan-folder explicitly."
+        raise ScanDataError(
+            f"'{folder_name}' holds no bright.vff/dark.vff, and no scan name "
+            f"could be extracted from it to find them elsewhere (expected "
+            f"'Scan_XXXX' somewhere in the name). Please specify "
+            f"--scan-folder explicitly."
         )
 
     scan_name = match.group(1)  # e.g., "Scan_1681"
@@ -100,8 +119,7 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
     xml_file = os.path.join(data_folder, 'scan.xml')
 
     if not os.path.exists(xml_file):
-        print(f"Error: scan.xml not found at {xml_file}")
-        sys.exit(1)
+        raise ScanDataError(f"scan.xml not found at {xml_file}")
 
     # Load bright/dark fields
     print(f"Scan folder: {scan_folder}")
@@ -110,9 +128,9 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
         print(f"Loaded bright field: shape {bright_field.shape}, mean {bright_field.mean():.0f}")
         print(f"Loaded dark field: shape {dark_field.shape}, mean {dark_field.mean():.0f}")
     except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("HU calibration requires bright.vff and dark.vff in the scan folder.")
-        sys.exit(1)
+        raise ScanDataError(
+            f"{e}. Flat-field correction needs bright.vff and dark.vff in the "
+            f"scan folder; pass --scan-folder if they live elsewhere.") from e
 
     # Auto-detect projection pattern if not specified
     if projection_pattern is None:
@@ -132,8 +150,8 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
         proj_paths = [p for p in proj_paths if p.name.startswith('proj-') or sub_scan in str(p)]
     n_files = len(proj_paths)
     if n_files == 0:
-        print(f"Error: No projections matching '{projection_pattern}' in {data_folder}")
-        sys.exit(1)
+        raise ScanDataError(
+            f"no projections matching '{projection_pattern}' in {data_folder}")
 
     # Determine total angle
     if total_angle == 'determined':
@@ -141,9 +159,9 @@ def load_scan_data(data_folder, scan_folder, projection_pattern, total_angle,
             increment_angle = float(header['Series']['SeriesParams']['IncrementAngle'])
             xml_view_count = int(header['Series']['SeriesParams']['ViewCount'])
         except (KeyError, TypeError) as e:
-            print(f"Error: Could not read IncrementAngle/ViewCount from scan.xml: {e}")
-            print("Please specify --total-angle explicitly.")
-            sys.exit(1)
+            raise ScanDataError(
+                f"could not read IncrementAngle/ViewCount from scan.xml "
+                f"({e}). Pass --total-angle explicitly.") from e
 
         total_angle_deg = increment_angle * n_files
         print(f"  Determined from scan.xml: IncrementAngle = {increment_angle:.6f} deg, "
@@ -247,6 +265,79 @@ def parse_crop_boundary(scan_folder, xml_header):
     return roi
 
 
+def _xml_field(xml_header, name: str) -> float:
+    """One numeric ``Series`` field of scan.xml, or a message that says which.
+
+    The geometry is read straight out of the scanner's own header, so a
+    missing or unparseable field is a data problem, not a bug — name the field
+    instead of surfacing a bare KeyError from three frames down.
+    """
+    try:
+        return float(xml_header['Series'][name])
+    except (KeyError, TypeError):
+        raise KeyError(
+            f"scan.xml has no Series/{name} field. This package reads the "
+            f"acquisition geometry from the GE eXplore CT 120 header; a scan "
+            f"from another scanner needs its geometry supplied another way."
+        ) from None
+    except ValueError:
+        raise ValueError(
+            f"scan.xml Series/{name} is not a number: "
+            f"{xml_header['Series'][name]!r}"
+        ) from None
+
+
+def reconstructible_fov(xml_header, n_b: int, n_a: int,
+                        cor_mode: str = 'center') -> dict:
+    """The field this SCANNER can measure, in mm at the isocentre.
+
+    A default field of view should be a fact about the machine, not about the
+    animal that happened to be in it. This is the machine fact: the detector
+    subtends a fan and a cone, and everything outside them is unmeasured, so
+    a voxel there can only be filled in by the reconstruction's own
+    assumptions. Conversely a grid smaller than this discards measured data.
+
+    Both extents are taken to the NEARER detector edge (``min`` of the two
+    sides, not ``max``): a point is only fully sampled if it stays inside the
+    fan at every view, so the narrower side is what bounds the honest field.
+    With the default centre-of-rotation policy the two sides are equal
+    anyway; the distinction only bites under ``--cor-mode xml``.
+
+    The z figure is the cone height AT THE ROTATION AXIS. Rays reach higher at
+    the far side of the field (they are closer to the detector there), but
+    that extra height is only covered from some angles, so taking it as the
+    default would put partially-sampled voxels in every reconstruction.
+
+    Returns a dict with ``fov_xy`` / ``fov_z`` (full extents, mm) and the
+    quantities they came from, so a driver can print WHY.
+    """
+    R_s = _xml_field(xml_header, 'ObjectPosition')
+    SDD = _xml_field(xml_header, 'DetectorPosition')     # source -> detector
+    pitch = _xml_field(xml_header, 'DetectorSpacing')
+
+    if cor_mode == 'xml':
+        ca = _xml_field(xml_header, 'CentreOfRotation')
+        cb = _xml_field(xml_header, 'CentralSlice')
+    else:
+        ca, cb = (n_a - 1) / 2.0, (n_b - 1) / 2.0
+
+    # detector mm -> isocentre mm (the inverse of the magnification).
+    # The +0.5 takes the OUTER EDGE of the outermost pixel, not its centre: a
+    # pixel is pitch wide, so a ray landing anywhere inside it is measured.
+    # Using the centre would quietly shave half a pixel off each side.
+    to_iso = R_s / SDD
+    half_a = (min(ca, n_a - 1 - ca) + 0.5) * pitch * to_iso
+    half_b = (min(cb, n_b - 1 - cb) + 0.5) * pitch * to_iso
+
+    return {
+        'fov_xy': float(2.0 * half_a),
+        'fov_z': float(2.0 * half_b),
+        'magnification': float(SDD / R_s),
+        'detector_mm': (float(n_a * pitch), float(n_b * pitch)),
+        'cor_mode': cor_mode,
+    }
+
+
 def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None,
                    verbose=True):
     """
@@ -267,8 +358,9 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None
         geometry dict with keys: R_d, R_s, da, db, vol_shape, vol_origin,
         dx, dz, central_pixel_a, central_pixel_b
     """
-    source_to_isocenter = float(xml_header['Series']['ObjectPosition'])
-    detector_to_isocenter = float(xml_header['Series']['DetectorPosition']) - source_to_isocenter
+    source_to_isocenter = _xml_field(xml_header, 'ObjectPosition')
+    detector_to_isocenter = (_xml_field(xml_header, 'DetectorPosition')
+                             - source_to_isocenter)
 
     if roi_bounds is not None:
         # ROI-based reconstruction: volume sized and positioned from ROI bounds
@@ -291,14 +383,15 @@ def build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z, roi_bounds=None
     geometry = {
         'R_d': detector_to_isocenter,
         'R_s': source_to_isocenter,
-        'da': float(xml_header['Series']['DetectorSpacing']),
-        'db': float(xml_header['Series']['DetectorSpacing']),
+        # Square detector pixels: this scanner reports a single DetectorSpacing.
+        'da': _xml_field(xml_header, 'DetectorSpacing'),
+        'db': _xml_field(xml_header, 'DetectorSpacing'),
         'vol_shape': vol_shape,
         'vol_origin': vol_origin,
         'dx': voxel_xy,
         'dz': voxel_z,
-        'central_pixel_a': float(xml_header['Series']['CentreOfRotation']),
-        'central_pixel_b': float(xml_header['Series']['CentralSlice']),
+        'central_pixel_a': _xml_field(xml_header, 'CentreOfRotation'),
+        'central_pixel_b': _xml_field(xml_header, 'CentralSlice'),
         # Sub-box of vol_shape to write out, or None for the whole grid. Set
         # by the drivers that separate the RECONSTRUCTION domain (which must
         # cover every attenuating thing the rays cross — see ct_core.support)
@@ -358,7 +451,8 @@ def postprocess_and_save(volume_mu, geometry, output_path,
                          bilateral_sigma_spatial=1.5, bilateral_sigma_range=50.0,
                          voxel_xy=0.075,
                          hu_calibration='auto', mu_water=None,
-                         tissue_hu=None, save_mu=False, anchors=None):
+                         tissue_hu=None, save_mu=False, anchors=None,
+                         metadata=None):
     """Calibrate a reconstructed volume to HU, optionally filter it, write VFF.
 
     ``volume_mu`` is linear attenuation (mm^-1) straight out of a backend:
@@ -408,6 +502,9 @@ def postprocess_and_save(volume_mu, geometry, output_path,
             file and was therefore byte-identical to it.
         anchors: a pre-fitted HUAnchors to apply instead of fitting. Use it to
             put several volumes on one common scale.
+        metadata: extra entries for the ``<output>.json`` sidecar (algorithm,
+            scan basename, ...). See write_sidecar for what is always written
+            and for the privacy rule on what may be added.
 
     Returns:
         (path to the written VFF, the HUAnchors that were applied, the
@@ -488,8 +585,13 @@ def postprocess_and_save(volume_mu, geometry, output_path,
     # because the old code had already converted and clipped before this
     # point, the "_uncalibrated.vff" it produced was byte-identical to the
     # calibrated one whenever calibration was skipped — which was the default.
+    # --output is a base path, but people naturally type one ending in .vff
+    # (and then get "name.vff.vff" / "name.vff_mu.npy"). Take either.
+    base = (output_path[:-4] if output_path.lower().endswith('.vff')
+            else output_path)
+
     if save_mu:
-        mu_path = output_path + '_mu.npy'
+        mu_path = base + '_mu.npy'
         np.save(mu_path, vol_np)
         print(f"Uncalibrated attenuation (float32 mu, mm^-1) saved to: {mu_path}")
 
@@ -498,9 +600,61 @@ def postprocess_and_save(volume_mu, geometry, output_path,
     # the air floor) and clips to the full int16 range with a warning, rather
     # than wrapping. Pre-casting here with .astype(np.int16), as this used to,
     # bypassed both protections.
-    cal_path = output_path + ('_bilateral.vff' if bilateral_filter else '.vff')
+    cal_path = base + ('_bilateral.vff' if bilateral_filter else '.vff')
     vol_vff = vol_calibrated.transpose(2, 1, 0)[:, ::-1, :]
     write_vff(cal_path, vff_meta, vol_vff)
     print(f"Calibrated VFF saved to: {cal_path}")
 
+    write_sidecar(cal_path, geometry, anchors, shape=vol_calibrated.shape,
+                  bilateral_filter=bilateral_filter, metadata=metadata)
+
     return cal_path, anchors, vol_calibrated
+
+
+def write_sidecar(vff_path, geometry, anchors, *, shape=None,
+                  bilateral_filter=False, metadata=None):
+    """Write the ``<volume>.json`` companion describing a saved volume.
+
+    A GE ncaa header carries one scalar voxel size and an ``origin`` in the
+    scanner's own absolute frame, so it cannot express what this package needs
+    to read a volume back: an anisotropic grid, the isocentre-centred position
+    of an ROI reconstruction, or the HU map that was applied. Without that,
+    every downstream tool has to be TOLD the geometry by hand
+    (``run_volume_report --voxel-xy ... --origin ...``), and a volume found on
+    disk months later is unidentifiable.
+
+    Deliberately no absolute paths, no host names, no scan paths — only the
+    scan BASENAME — so the file is safe to ship next to a volume.
+
+    Only ``dx``/``dz`` are required of ``geometry``: the shape is taken from
+    the array being written (``shape``), and a geometry with no ``vol_origin``
+    is treated as centred on the isocentre, which is what a full-FOV
+    reconstruction is.
+    """
+    Nx, Ny, Nz = (int(v) for v in
+                  (shape if shape is not None else geometry['vol_shape']))
+    ox, oy, oz = (float(v) for v in geometry.get('vol_origin', (0.0, 0.0, 0.0)))
+    record = {
+        'vff': os.path.basename(vff_path),
+        'created': date.today().isoformat(),
+        'units': 'HU',
+        'voxel_size_mm': {'xy': float(geometry['dx']),
+                          'z': float(geometry['dz'])},
+        # Reconstruction (x, y, z) order — what load_reconstructed_volume
+        # returns, NOT the (z, y, x) order of the VFF payload.
+        'volume_shape': [Nx, Ny, Nz],
+        'vol_origin_mm': [ox, oy, oz],
+        'bilateral_filter': bool(bilateral_filter),
+        'hu_calibration': {k.split('/', 1)[-1]: v
+                           for k, v in calibration_scalars(anchors).items()},
+    }
+    if getattr(anchors, 'warnings', None):
+        record['hu_calibration']['warnings'] = list(anchors.warnings)
+    if metadata:
+        record.update(metadata)
+
+    path = os.path.splitext(vff_path)[0] + '.json'
+    with open(path, 'w') as f:
+        json.dump(record, f, indent=2)
+    print(f"Volume metadata saved to: {path}")
+    return path
