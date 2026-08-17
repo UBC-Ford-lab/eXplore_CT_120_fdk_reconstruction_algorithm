@@ -43,13 +43,6 @@ from matplotlib.figure import Figure
 # SSIM / PSNR (canonical home — muNeRF's inr_pipeline.metrics re-exports)
 # --------------------------------------------------------------------------
 
-def _gaussian_window(window_size: int, sigma: float, dtype, device) -> torch.Tensor:
-    """1-D normalized Gaussian, shape (window_size,)."""
-    coords = torch.arange(window_size, dtype=dtype, device=device) - (window_size - 1) / 2.0
-    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
-    return g / g.sum()
-
-
 def ssim_2d(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -82,30 +75,16 @@ def ssim_2d(
             return torch.tensor(1.0 if torch.equal(pred, target) else 0.0,
                                 dtype=pred.dtype, device=pred.device)
 
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
+    # The window, the stabiliser constants and the variance arithmetic are
+    # `ct_core.ssim`'s — the same code the learned backends' structural LOSS
+    # runs, so a metric and a loss on the same pair can never disagree about
+    # what SSIM means. Only the envelope below (mask, map-vs-scalar) is local.
+    from .ssim import ssim_components, to_bchw
 
-    win_1d = _gaussian_window(window_size, sigma, pred.dtype, pred.device)
-    win_2d = (win_1d.unsqueeze(0) * win_1d.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
-
-    p = pred.unsqueeze(0).unsqueeze(0)
-    t = target.unsqueeze(0).unsqueeze(0)
-    # 'valid' padding: output shrinks by window_size-1 per axis; SSIM is
-    # averaged over the inner region only (skimage gaussian_weights=True).
-    mu_p = F.conv2d(p, win_2d)
-    mu_t = F.conv2d(t, win_2d)
-    mu_p2 = mu_p * mu_p
-    mu_t2 = mu_t * mu_t
-    mu_pt = mu_p * mu_t
-
-    sigma_p2 = F.conv2d(p * p, win_2d) - mu_p2
-    sigma_t2 = F.conv2d(t * t, win_2d) - mu_t2
-    sigma_pt = F.conv2d(p * t, win_2d) - mu_pt
-
-    num = (2.0 * mu_pt + C1) * (2.0 * sigma_pt + C2)
-    den = (mu_p2 + mu_t2 + C1) * (sigma_p2 + sigma_t2 + C2)
-    ssim_map = num / den
-
+    p = to_bchw(pred)
+    t = to_bchw(target)
+    ssim_map, _ = ssim_components(p, t, data_range=data_range,
+                                  window_size=window_size, sigma=sigma)
     if return_map:
         return ssim_map.squeeze(0).squeeze(0)  # (H', W')
 

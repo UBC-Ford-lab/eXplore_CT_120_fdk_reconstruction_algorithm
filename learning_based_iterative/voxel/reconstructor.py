@@ -41,7 +41,9 @@ import torch
 from ...ct_core.data_budget import RANDOM, data_budget, measurement_count
 from ...ct_core.preprocessing import preprocess_sinogram
 from ..scene import Scene, model_domain_from_geometry
-from ..ray_sampler import rays_from_indices, sample_random_rays
+from ..ray_sampler import (rays_from_indices, sample_projection_patch,
+                           sample_random_rays, sample_random_rows)
+from ..losses import DEFAULT_DATA_TERM, build_data_term
 from ..renderer import render_compile_mode, render_rays, set_render_compile
 from .model import VoxelGrid
 
@@ -72,6 +74,12 @@ class VoxelReconstructor:
                  diag_downsample: int = 2,
                  figure_every_evals: int = 4,
                  log_every: int = 500,
+                 loss: str = DEFAULT_DATA_TERM,
+                 loss_options: dict | None = None,
+                 emulate_sart: bool = False,
+                 optimizer: str | None = None,
+                 sart_outside_weight: float = 0.25,
+                 sart_coverage_rays: int = 1_000_000,
                  log_fn=None, diag_fn=None):
         self.projections = projections
         self.angles = np.asarray(angles)
@@ -109,6 +117,42 @@ class VoxelReconstructor:
         # every Nth eval — scalars stream at every eval regardless.
         self.figure_every_evals = max(1, int(figure_every_evals))
         self.log_every = int(log_every)
+        # Data term, by name, from learning_based_iterative.losses. MSE is the
+        # default because it is the objective classical SIRT descends, which is
+        # what makes this backend a like-for-like comparison against it; any
+        # other choice is an explicit departure and is printed at startup.
+        self.loss = str(loss).strip().lower()
+        self.loss_options = dict(loss_options or {})
+        # --emulate-sart: the classical update, as far as this backend can go.
+        # It is a PRESET, not a loss: R is the `sart` data term, C is a gradient
+        # preconditioner through the renderer's grad_scale_fn, and the optimiser
+        # becomes plain SGD because Adam's own per-parameter adaptive scaling
+        # would compete with C for the same job. The dense voxel grid, the
+        # non-negativity projection after each step, and the near-air init are
+        # already the classical recipe.
+        self.emulate_sart = bool(emulate_sart)
+        self.sart_outside_weight = float(sart_outside_weight)
+        self.sart_coverage_rays = int(sart_coverage_rays)
+        # `optimizer=None` means "whatever suits the mode", which is how an
+        # EXPLICIT choice stays distinguishable from the default. A caller that
+        # passes 'adam' alongside emulate_sart gets Adam and a warning, not a
+        # silent override — the point of the preset is to be legible, and
+        # quietly ignoring an argument is the opposite of that.
+        if optimizer is None:
+            self.optimizer_name = "sgd" if self.emulate_sart else "adam"
+        else:
+            self.optimizer_name = str(optimizer).strip().lower()
+        if self.emulate_sart:
+            self.loss = "sart"
+            if self.optimizer_name == "adam":
+                print("  NOTE: --emulate-sart with Adam. Adam's second-moment "
+                      "normalisation is itself a preconditioner and competes "
+                      "with C, so this is not the classical update. Drop "
+                      "--optimizer to get SGD.")
+        if self.optimizer_name not in ("adam", "sgd"):
+            raise ValueError(
+                f"optimizer must be 'adam' or 'sgd', got "
+                f"{self.optimizer_name!r}")
         # Optional live-metric sink: Callable[[dict, int], None] — called as
         # log_fn(metrics, step). Keeps the backend free of any wandb import;
         # the driver passes ReconLogger.log.
@@ -160,6 +204,95 @@ class VoxelReconstructor:
 
     # ------------------------------------------------------------------- run
 
+    def _build_loss(self, scene, gen, device):
+        """(loss_fn, sample_batch, description) for ``self.loss``.
+
+        The data term and the sampler are resolved together because the term
+        dictates the shape of a batch:
+
+          * per-ray terms (mse, weighted, huber) take any rays;
+          * ramp-filtered terms (filtered, wiener) need COMPLETE detector rows —
+            the filter is a convolution along the row, so a scattered subset of
+            rays has no row to filter;
+          * structural terms (ssim, msssim) need a contiguous 2-D PATCH, since
+            SSIM is defined over a local window in both axes.
+
+        `loss_options` is forwarded to the registry, which ignores keys that do
+        not apply to the selected term.
+        """
+        opts = dict(self.loss_options)
+        n_b, n_a = scene.sinogram.shape[1], scene.sinogram.shape[2]
+
+        if self.loss == "sart":
+            from ..sart import ray_support_lengths, roi_bounds
+            rmin, rmax, radius, centre = roi_bounds(scene)
+            spp = self._auto_samples_per_ray(scene.model_domain) \
+                if self.samples_per_ray is None else int(self.samples_per_ray)
+            # The loss reads this dict; the sampler refreshes it. L_i is a
+            # property of the batch's rays, so it has to be recomputed per step.
+            chord_state: dict = {}
+            opts["chord_state"] = chord_state
+            opts.setdefault("sart_clamp_lo", 0.25)
+            opts.setdefault("sart_clamp_hi", 4.0)
+
+            def sample_batch(*, exclude_angle=None):
+                o, d, tgt = sample_random_rays(
+                    scene, self.rays_per_batch, generator=gen, device=device,
+                    exclude_angle=exclude_angle)
+                chord_state["chord"] = ray_support_lengths(
+                    o, d, scene, spp, roi_min=rmin, roi_max=rmax,
+                    roi_radius=radius, roi_center_xy=centre,
+                    outside_weight=self.sart_outside_weight)
+                return o, d, tgt
+            desc = (f"{self.rays_per_batch} random rays per step, row-weighted "
+                    f"by 1/L over the object ROI (r={radius:.1f} mm, "
+                    f"outside_weight={self.sart_outside_weight})")
+
+        elif self.loss in ("filtered", "wiener"):
+            n_rows = max(1, self.rays_per_batch // n_a)
+            if "ramp_kernel" not in opts and "wiener_kernel" not in opts:
+                from ..losses import _build_ramp_kernel
+                key = "wiener_kernel" if self.loss == "wiener" else "ramp_kernel"
+                opts[key] = _build_ramp_kernel(n_a, torch.float32, device)
+                if self.loss == "wiener":
+                    print("    no measured SNR gate supplied — falling back to "
+                          "a plain ramp, i.e. equivalent to 'filtered'")
+
+            def sample_batch(*, exclude_angle=None):
+                return sample_random_rows(scene, n_rows, generator=gen,
+                                          device=device,
+                                          exclude_angle=exclude_angle)
+            desc = f"{n_rows} complete detector rows per step ({n_a} cols)"
+
+        elif self.loss in ("ssim", "msssim"):
+            side = int(opts.pop("patch_size", 64))
+            n_patches = int(opts.pop("num_patches",
+                                     max(1, self.rays_per_batch // (side * side))))
+            side = min(side, n_b, n_a)
+            if "data_range" not in opts:
+                # SSIM's stabilisers need a dynamic range. Taken from the
+                # measured sinogram so it is a constant of the scan rather than
+                # of whichever patch was drawn.
+                sino = scene.sinogram
+                opts["data_range"] = float(sino.max() - sino.min())
+
+            def sample_batch(*, exclude_angle=None):
+                return sample_projection_patch(scene, side, side,
+                                               generator=gen, device=device,
+                                               exclude_angle=exclude_angle,
+                                               num_patches=n_patches)
+            desc = (f"{n_patches} x {side}x{side} projection patches per step, "
+                    f"data_range={opts['data_range']:.3f}")
+
+        else:
+            def sample_batch(*, exclude_angle=None):
+                return sample_random_rays(scene, self.rays_per_batch,
+                                          generator=gen, device=device,
+                                          exclude_angle=exclude_angle)
+            desc = f"{self.rays_per_batch} random rays per step"
+
+        return build_data_term(self.loss, **opts), sample_batch, desc
+
     def reconstruct(self) -> np.ndarray:
         Nx, Ny, Nz = (int(v) for v in self.geometry["vol_shape"])
         n_params = Nx * Ny * Nz
@@ -183,7 +316,14 @@ class VoxelReconstructor:
 
         # Grid shape == export volume shape: (Dz, Hy, Wx) tiling the FOV AABB.
         model = VoxelGrid((Nz, Ny, Nx), init_density=self.init_density).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        if self.optimizer_name == "sgd":
+            # Plain steepest descent, which is what the classical update is.
+            # Adam's second-moment normalisation is itself a per-parameter
+            # preconditioner, so running it alongside C would give the volume two
+            # competing ones and the result would not be the classical method.
+            optimizer = torch.optim.SGD(model.parameters(), lr=self.lr)
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
         gen = torch.Generator(device=device).manual_seed(self.seed)
 
         # ---- evaluation projection -----------------------------------------
@@ -291,6 +431,50 @@ class VoxelReconstructor:
                       f"differ from eager in the last bits — compare only "
                       f"against other --compile {mode} runs.")
 
+        # ---- data term and the sampler it requires ------------------------
+        # The loss dictates the SHAPE of a batch, so the two are resolved
+        # together. Sampling flat rays and then asking for SSIM would silently
+        # score a 1-D strip as if it were an image, and a ramp filter applied
+        # to a random scatter of rays is not a ramp filter at all.
+        loss_fn, sample_batch, batch_desc = self._build_loss(scene, gen, device)
+
+        # C = 1/coverage, applied to the BACKWARD pass only (the forward value is
+        # untouched), which is what makes it a preconditioner rather than a term
+        # in the objective. Geometry-only, so it is built once. Held neutral
+        # outside the object ROI: the outer annulus is the least-determined part
+        # of the volume and boosting its steps is the opposite of what C is for.
+        grad_scale_fn = None
+        if self.emulate_sart:
+            from ..sart import CoveragePreconditioner, build_coverage_grid, roi_bounds
+            rmin, rmax, _radius, _centre = roi_bounds(scene)
+            t_cov = time.time()
+            cov, g_min, g_max = build_coverage_grid(
+                scene, grid_res=64, n_rays=self.sart_coverage_rays,
+                aabb_min=rmin, aabb_max=rmax, device=device)
+            grad_scale_fn = CoveragePreconditioner(
+                scene, cov, g_min, g_max, outside_value=1.0, device=device)
+            span = (grad_scale_fn.stats["C_max"]
+                    / max(grad_scale_fn.stats["C_min"], 1e-12))
+            print(f"  C preconditioner: coverage grid 64^3 over the ROI in "
+                  f"{time.time() - t_cov:.1f} s, C in "
+                  f"[{grad_scale_fn.stats['C_min']:.2f}, "
+                  f"{grad_scale_fn.stats['C_max']:.2f}] (span {span:.1f}x)")
+            if span < 1.2:
+                print("    NOTE: C is nearly flat — coverage barely varies over "
+                      "the ROI, so the preconditioner is close to a no-op here.")
+        if self.emulate_sart:
+            print(f"\n  --emulate-sart: R (row weighting) + C (coverage "
+                  f"preconditioner) + SGD, on the dense voxel grid with the "
+                  f"non-negativity projection.")
+            print(f"    NOT strict SIRT: batches are random subsets rather than "
+                  f"every ray per update, which is the SART/ordered-subset "
+                  f"family. The batching is kept on purpose.")
+        print(f"\n  Data term: {self.loss} — {batch_desc}")
+        print(f"  Optimizer: {self.optimizer_name.upper()} (lr {self.lr:g})")
+        if self.loss != "mse" and not self.emulate_sart:
+            print(f"    (default is mse, the objective classical SIRT "
+                  f"descends; this run departs from it)")
+
         best_mse, best_it, bad_evals = float("inf"), 0, 0
         t0 = time.time()
         stop_reason = "max iterations"
@@ -299,12 +483,14 @@ class VoxelReconstructor:
             for group in optimizer.param_groups:
                 group["lr"] = lr_at(it)
 
-            origins, directions, target = sample_random_rays(
-                scene, self.rays_per_batch, generator=gen, device=device,
+            origins, directions, target = sample_batch(
                 exclude_angle=holdout if self.withhold_eval else None)
             pred = render_rays(origins, directions, model, scene,
-                               num_samples=spp, stratified=True, generator=gen)
-            loss = torch.mean((pred - target) ** 2)
+                               num_samples=spp, stratified=True, generator=gen,
+                               grad_scale_fn=grad_scale_fn)
+            # `target` carries the batch's shape (rays, rows or a patch); the
+            # renderer returns a flat prediction, so restore it before scoring.
+            loss = loss_fn(pred.reshape(target.shape), target)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()

@@ -25,6 +25,8 @@ import time
 
 import numpy as np
 
+from .learning_based_iterative.losses import (DATA_TERMS, DEFAULT_DATA_TERM,
+                                              describe_data_terms)
 from .learning_based_iterative.voxel.reconstructor import VoxelReconstructor
 from .learning_based_iterative.detector_warp import resolve_detector_warp
 from .ct_core.pipeline import (
@@ -46,6 +48,46 @@ from .ct_core.utils import query_gpu_memory
 SUPPORTED_LEARNED_ALGORITHMS = ("voxel",)
 
 
+def _resolve_lr(args):
+    """The learning rate, defaulted per OPTIMIZER rather than globally.
+
+    Adam and SGD differ by ~4-5 orders of magnitude here: Adam divides by the
+    gradient's own running scale, so 1e-4 is a step in units of the parameter,
+    while plain SGD steps by the raw gradient. 1.0 is the classical update's
+    implicit step size, not a tuned value.
+    """
+    if args.lr is not None:
+        return float(args.lr)
+    optimizer = args.optimizer
+    if optimizer is None:
+        optimizer = "sgd" if args.emulate_sart else "adam"
+    return 1.0 if optimizer == "sgd" else 1e-4
+
+
+def _parse_loss_options(pairs):
+    """``KEY=VALUE`` strings -> a dict, with numbers parsed as numbers.
+
+    The registry's options are typed (patch counts are ints, weights are
+    floats), and a string where a float belongs fails deep inside a loss rather
+    than at the CLI. Anything that is not a number is passed through verbatim.
+    """
+    out = {}
+    for item in pairs:
+        if "=" not in item:
+            raise SystemExit(f"--loss-option expects KEY=VALUE, got {item!r}")
+        key, _, raw = item.partition("=")
+        key, raw = key.strip(), raw.strip()
+        for cast in (int, float):
+            try:
+                out[key] = cast(raw)
+                break
+            except ValueError:
+                continue
+        else:
+            out[key] = raw
+    return out
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Learning-based iterative reconstruction "
@@ -56,6 +98,15 @@ Examples:
   python -m reconstruction.run_learned_recon data/scans/Scan_1510
   python -m reconstruction.run_learned_recon data/scans/Scan_1510 --iterations 40000
   python -m reconstruction.run_learned_recon data/scans/Scan_1510 --downsample 3 --no-crossval
+  python -m reconstruction.run_learned_recon data/scans/Scan_1510 --loss msssim
+  python -m reconstruction.run_learned_recon data/scans/Scan_1510 --loss huber
+
+Data terms (--loss):
+""" + describe_data_terms() + """
+
+The sampler follows the loss: per-ray terms draw random rays, the ramp-filtered
+terms draw complete detector rows, and the structural terms draw 2-D patches
+(--loss-option patch_size=N, num_patches=N).
         """
     )
     add_common_args(parser)
@@ -65,6 +116,42 @@ Examples:
                         choices=SUPPORTED_LEARNED_ALGORITHMS,
                         help='Representation to optimize (default: voxel). '
                              'Future: nerf, hashgrid, gaussian_splatting.')
+    parser.add_argument('--loss', default=DEFAULT_DATA_TERM,
+                        choices=sorted(DATA_TERMS),
+                        help='Data term (default: %(default)s). MSE is the '
+                             'objective classical SIRT descends, which is what '
+                             'makes the default run a like-for-like comparison '
+                             'against it. See the list below.')
+    parser.add_argument('--emulate-sart', action='store_true',
+                        help='Emulate the classical simultaneous update as far '
+                             'as this backend goes: --loss sart (row weighting '
+                             'R = 1/L_i over the object ROI), the coverage '
+                             'preconditioner C on the backward pass, and plain '
+                             'SGD instead of Adam (Adam would be a second, '
+                             'competing preconditioner). The dense voxel grid, '
+                             'the non-negativity projection and the near-air '
+                             'init are already the classical recipe. NOT strict '
+                             'SIRT: batches stay random subsets, which is the '
+                             'SART/ordered-subset family.')
+    parser.add_argument('--optimizer', default=None, choices=('adam', 'sgd'),
+                        help='Optimizer. Default: adam, or sgd under '
+                             '--emulate-sart. Setting it explicitly is always '
+                             'respected — pairing adam with --emulate-sart '
+                             'warns rather than being overridden, since Adam is '
+                             'itself a preconditioner competing with C.')
+    parser.add_argument('--sart-outside-weight', type=float, default=0.25,
+                        metavar='W',
+                        help='With --emulate-sart, the rate at which path '
+                             'OUTSIDE the object ROI counts toward L_i '
+                             '(default: %(default)s). Must be > 0: the bed and '
+                             'holder attenuate, so those rays carry signal and '
+                             'zero would drop them from the loss entirely.')
+    parser.add_argument('--loss-option', action='append', default=[],
+                        metavar='KEY=VALUE',
+                        help='Extra option for the data term, repeatable: e.g. '
+                             '--loss-option patch_size=96 '
+                             '--loss-option ssim_weight=0.5. Options that do '
+                             'not apply to the selected term are ignored.')
     parser.add_argument('--iterations', type=int, default=20000,
                         help='Optimizer steps (default: 20000). On Scan_1510 '
                              'the holdout optimum sat near 16k; crossval stops '
@@ -78,10 +165,16 @@ Examples:
                              'integer for run-to-run reproducibility across '
                              'different GPUs, since batch size changes the '
                              'optimization dynamics.')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Adam learning rate on the voxel values '
-                             '(default: 1e-4 — ~0.5%% of mu_water per step). '
-                             'First knob to sweep if training is slow/unstable.')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='Learning rate on the voxel values. Default depends '
+                             'on the optimizer, because the two are not on the '
+                             'same scale at all: 1e-4 for Adam (~0.5%% of '
+                             'mu_water per step, since Adam normalises the '
+                             'gradient to ~unit magnitude) and 1.0 for SGD '
+                             '(the classical update\'s implicit step is 1.0 with '
+                             'the C A^T R structure). Sharing one default would '
+                             'make an SGD run take steps ~1e-4 of the intended '
+                             'size and appear to do nothing.')
     parser.add_argument('--lr-warmup-iters', type=int, default=500,
                         help='Linear LR warmup steps before cosine decay '
                              '(default: 500)')
@@ -260,13 +353,18 @@ def main():
         geometry=ctx.geometry,
         iterations=args.iterations,
         rays_per_batch=args.rays_per_batch,
-        lr=args.lr,
         samples_per_ray=args.samples_per_ray,
         lr_warmup_iters=args.lr_warmup_iters,
         init_density=args.init_density,
         gpu_index=args.gpu_index,
         seed=args.seed,
         compile_mode=args.compile_mode,
+        lr=_resolve_lr(args),
+        loss=args.loss,
+        loss_options=_parse_loss_options(args.loss_option),
+        emulate_sart=args.emulate_sart,
+        optimizer=args.optimizer,
+        sart_outside_weight=args.sart_outside_weight,
         bright_field=ctx.bright_field,
         dark_field=ctx.dark_field,
         ring_correction=args.ring_correction,
