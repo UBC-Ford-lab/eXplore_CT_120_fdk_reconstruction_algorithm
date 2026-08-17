@@ -25,6 +25,7 @@ from .hu_calibration import (
     find_attenuation_anchors,
     fixed_anchors,
     format_calibration,
+    resolve_anchors,
 )
 
 
@@ -520,28 +521,8 @@ def postprocess_and_save(volume_mu, geometry, output_path,
     print("=" * 60)
 
     if anchors is None:
-        if hu_calibration == 'fixed':
-            if mu_water is None:
-                raise ValueError(
-                    "hu_calibration='fixed' needs an explicit mu_water")
-            # tissue_hu deliberately does NOT apply here: this mode's second
-            # anchor is water at 0 HU by definition, not a measured tissue
-            # peak. Say so rather than ignoring the flag in silence.
-            if tissue_hu is not None:
-                print(f"  NOTE: --tissue-hu {float(tissue_hu):.0f} ignored — "
-                      f"it places the measured bulk-tissue peak, and "
-                      f"hu_calibration='fixed' anchors WATER (0 HU) via "
-                      f"mu_water instead.")
-            anchors = fixed_anchors(float(mu_water))
-        elif hu_calibration == 'auto':
-            anchors = find_attenuation_anchors(
-                vol_np,
-                tissue_hu=(TISSUE_HU_DEFAULT if tissue_hu is None
-                           else float(tissue_hu)))
-        else:
-            raise ValueError(
-                f"unknown hu_calibration mode {hu_calibration!r} "
-                f"(expected 'auto' or 'fixed')")
+        anchors = resolve_anchors(vol_np, hu_calibration, mu_water=mu_water,
+                                  tissue_hu=tissue_hu, verbose=True)
 
     print(format_calibration(anchors))
     vol_calibrated = anchors.apply(vol_np)

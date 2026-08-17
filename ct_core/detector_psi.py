@@ -6,6 +6,15 @@ in ct_core precisely so all three reconstruct on the SAME measured geometry
 instead of three different assumed ones. Before 2026-08-11 all three assumed a
 perfectly square detector (psi = 0) and a centred COR.
 
+``resolve_detector_psi`` owns the whole POLICY, not just the estimator:
+config-mode parsing, the scan-keyed cache, its two invalidation rules
+(downsample mismatch; a superseded conjugate-era record upgraded whenever a GPU
+is present), half-scan consistency as the PRIMARY estimator with the
+conjugate-ray joint fit as the fallback, the fail-safe bounds, and the write
+back to the shared JSON. It lives here rather than in each caller because
+muNeRF kept its own copy of exactly this policy until 2026-08-15, and the two
+had already begun to diverge.
+
 See the module-level notes below for the method, the cone-beam caveat and the
 fail-safe bounds.
 """
@@ -406,9 +415,39 @@ def _record(geometry, rec, source):
         return
     geometry["det_psi_source"] = source
     for k in ("psi_deg", "psi_deg_lo", "psi_deg_hi", "cpa0", "geom_centre",
-              "fit_resid_rms_cols", "n_bands", "slope_col_per_row"):
+              "fit_resid_rms_cols", "n_bands", "slope_col_per_row",
+              # halfncc-only diagnostics: the curve's prominence is how a flat
+              # (untrustworthy) scoring curve shows up in a run's record, and
+              # cpa0_offset_px is the column CoR that is measured and then
+              # deliberately NOT applied.
+              "prominence", "method", "cpa0_offset_px"):
         if k in rec:
             geometry[f"det_psi_{k}"] = rec[k]
+
+
+def rejection_reasons(res) -> list:
+    """Why this conjugate fit must NOT become the geometry — empty if it may.
+
+    This runs unattended before a multi-hour reconstruction, so a bad fit has
+    to be caught here rather than discovered in the reconstruction. Both guards
+    are calibrated on Scan_1510: a good fit there has residual ~0.25-0.29
+    columns, while feeding it a warp known to be transferred from another epoch
+    blows the residual out to 0.62-2.06 and swings psi past -1.1 deg.
+
+    Exposed as a function because muNeRF applies the SAME guards to the same
+    estimator from its own entry point (it measures on an already-preprocessed
+    sinogram, so it cannot go through ``ct_core.pipeline``). Two copies of a
+    fail-safe is two chances to relax one of them by accident.
+    """
+    bad = []
+    if not np.isfinite(res["psi_deg"]) or abs(res["psi_deg"]) > MAX_PSI_DEG:
+        bad.append(f"|psi| > {MAX_PSI_DEG} deg (got {res['psi_deg']:+.3f}) — a "
+                   f"detector is not mounted that crooked; the fit is unreliable")
+    if res.get("joint_depth", 0.0) < MIN_JOINT_DEPTH:
+        bad.append(f"joint-cost depth {res.get('joint_depth', 0.0):.2f} < "
+                   f"{MIN_JOINT_DEPTH} — the (cpa0, psi) surface is flat, so the "
+                   f"data does not determine them however stable the argmin looks")
+    return bad
 
 
 def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
@@ -445,12 +484,13 @@ def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
     # ---- auto ----
     from .vff_io import detector_serial_from_scan
     if calib_dir is None:
-        import paths as _p
-        calib_dir = Path(_p.DATA_DIR) / _CAL_DIRNAME
+        from .paths import calibration_dir
+        calib_dir = calibration_dir()
     calib_dir = Path(calib_dir)
     serial = detector_serial_from_scan(scan_folder) if scan_folder else None
     cache = _cache_path(calib_dir, serial, scan_folder) if serial else None
 
+    rec = None
     if cache is not None and cache.exists():
         rec = json.loads(cache.read_text())
         # cpa0 is an index into the DOWNSAMPLED detector, so a cache written at
@@ -459,26 +499,38 @@ def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
         # 3500-column grid it would be ~1166 columns off. Re-measure instead of
         # converting: at a finer ds the fit is also better conditioned.
         _cached_ds = rec.get("downsample")
-        if _cached_ds is not None and int(_cached_ds) != int(downsample):
+        if _cached_ds is None:
+            if verbose:
+                print(f"  Detector psi: cache {cache.name} predates the "
+                      f"downsample tag — re-measuring to be safe")
+            rec = None
+        elif int(_cached_ds) != int(downsample):
             if verbose:
                 print(f"  Detector psi: cache {cache.name} was measured at "
                       f"downsample={_cached_ds}, this run is {downsample} — "
                       f"cpa0 is in detector-index units, so re-measuring")
             rec = None
-        elif _cached_ds is None:
+        elif (rec.get("method", "conjugate") != "halfncc"
+              and torch.cuda.is_available()):
+            # A conjugate-method cache must not shadow the better estimator
+            # forever: the conjugate value is biased ~0.2 deg low (exact
+            # conjugates exist only in the central plane), and applying it
+            # split muNeRF run zsu85kc6's slice-688 tube into two overlapped
+            # half-discs. Upgrade in place whenever a GPU is available.
             if verbose:
-                print(f"  Detector psi: cache {cache.name} predates the "
-                      f"downsample tag — re-measuring to be safe")
+                print(f"  Detector psi: cache {cache.name} was measured by "
+                      f"the superseded conjugate method — upgrading to "
+                      f"half-scan consistency")
             rec = None
-    else:
-        rec = None
+
     if rec is not None:
         if verbose:
-            print(f"  Detector psi: {rec['psi_deg']:+.4f} deg from cache "
-                  f"{cache.name} (measured {rec.get('measured_on', '?')})")
-        _record(geometry, rec, source="cache")
+            print(f"  Detector psi: {float(rec['psi_deg']):+.4f} deg from cache "
+                  f"{cache.name} (method {rec.get('method', 'conjugate')}, "
+                  f"measured {rec.get('measured_on', '?')})")
+        _record(geometry, rec,
+                source=f"cache-{rec.get('method', 'conjugate')}")
         return float(rec["psi_deg"])
-
 
     if sinogram is None or angles is None:
         if verbose:
@@ -486,8 +538,42 @@ def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
                   "(geometry-only path) — using 0.0")
         return 0.0
 
+    # ---- PRIMARY: half-scan redundancy consistency (2026-08-12) ------------
+    # The conjugate fit below is BIASED LOW (~-0.49 measured vs ~-0.7
+    # recon-true on Scan_1510) and is structurally blind on symmetric objects.
+    # The half-NCC estimator scores the agreement of the two half-scan FBP
+    # reconstructions — validated against the visual FBP-tube verdict, and it
+    # measured the symmetric Scan_1988 phantom (+0.19 deg, sharp peak) where
+    # conjugates reject. Costs ~1-2 min once per scan, then cached. Conjugates
+    # remain the fallback (no GPU, too few angles, flat curve).
+    if torch.cuda.is_available():
+        try:
+            from .geometry_selfcal import estimate_psi_halfncc
+            if verbose:
+                print("  Detector psi: auto — half-scan consistency "
+                      "(primary) ...")
+            res = estimate_psi_halfncc(sinogram, angles, geometry,
+                                       downsample=downsample, verbose=verbose)
+        except Exception as e:
+            print(f"  Detector psi: half-scan estimate unavailable "
+                  f"({type(e).__name__}: {e}) — falling back to conjugates")
+            res = None
+        if res is not None:
+            _record(geometry, res, source="halfncc")
+            if cache is not None:
+                from .geometry_selfcal import write_calibration_json
+                write_calibration_json(cache, res, downsample=int(downsample),
+                                       detector_serial=serial)
+                if verbose:
+                    print(f"                cached to {cache}")
+            return float(res["psi_deg"])
+    elif verbose:
+        print("  Detector psi: no CUDA device — half-scan estimator skipped, "
+              "using conjugate rays")
+
+    # ---- FALLBACK: conjugate-ray joint fit ---------------------------------
     if verbose:
-        print("  Detector psi: auto — measuring from conjugate rays "
+        print(f"  Detector psi: measuring from conjugate rays "
               f"(warp {'ON' if warp is not None else 'OFF'}) ...")
     try:
         res = estimate_psi_joint(sinogram, angles, geometry, warp=warp,
@@ -501,19 +587,7 @@ def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
               f"cpa0 {res['cpa0']:.3f} (geom centre {res['geom_centre']:.2f}), "
               f"fit resid {res['fit_resid_rms_cols']:.3f} col")
 
-    # FAIL SAFE. This runs unattended before a multi-hour reconstruction, so a
-    # bad fit must NOT silently become the geometry. Both guards are calibrated
-    # on Scan_1510: a good fit there has residual ~0.25-0.29 columns, while
-    # feeding it a warp known to be transferred from another epoch blows the
-    # residual out to 0.62-2.06 and swings psi past -1.1 deg.
-    bad = []
-    if not np.isfinite(res["psi_deg"]) or abs(res["psi_deg"]) > MAX_PSI_DEG:
-        bad.append(f"|psi| > {MAX_PSI_DEG} deg (got {res['psi_deg']:+.3f}) — a "
-                   f"detector is not mounted that crooked; the fit is unreliable")
-    if res.get("joint_depth", 0.0) < MIN_JOINT_DEPTH:
-        bad.append(f"joint-cost depth {res.get('joint_depth', 0.0):.2f} < "
-                   f"{MIN_JOINT_DEPTH} — the (cpa0, psi) surface is flat, so the "
-                   f"data does not determine them however stable the argmin looks")
+    bad = rejection_reasons(res)          # the shared fail-safe
     if bad:
         print("  Detector psi: REJECTED, falling back to 0.0")
         for b in bad:
@@ -522,16 +596,11 @@ def resolve_detector_psi(geom_cfg, geometry, *, sinogram=None, angles=None,
 
     _record(geometry, res, source="measured")
     if cache is not None:
-        import datetime
+        from .geometry_selfcal import write_calibration_json
         rec = dict(res)
-        rec["downsample"] = int(downsample)
-        # raw-detector index too, so the number is interpretable independently
-        # of the downsample it happened to be measured at
-        rec["cpa0_raw"] = float(res["cpa0"]) * int(downsample) + (int(downsample) - 1) / 2.0
-        rec["detector_serial"] = serial
-        rec["measured_on"] = datetime.date.today().isoformat()
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(rec, indent=2))
+        rec.setdefault("method", "conjugate")
+        write_calibration_json(cache, rec, downsample=int(downsample),
+                               detector_serial=serial)
         if verbose:
             print(f"                cached to {cache}")
     return float(res["psi_deg"])

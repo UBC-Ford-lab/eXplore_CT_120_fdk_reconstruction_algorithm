@@ -446,6 +446,43 @@ def find_attenuation_anchors(
     )
 
 
+def resolve_anchors(values, mode: str = "auto", *,
+                    mu_water: Optional[float] = None,
+                    tissue_hu: Optional[float] = None,
+                    verbose: bool = False) -> HUAnchors:
+    """Mode string -> fitted anchors. The ONE place the choice is made.
+
+    ``mode='auto'`` fits both anchors from this volume's own histogram;
+    ``'fixed'`` pins the gain to ``mu_water`` and air to zero attenuation,
+    reproducing the classical one-point map through the same code path.
+
+    Every consumer goes through here — the drivers via
+    ``scan_setup.postprocess_and_save``, muNeRF via ``inr_pipeline.infer.to_hu``
+    — so a volume calibrated by one lands on exactly the scale the other would
+    have produced. Both used to dispatch on their own mode names, which is how
+    muNeRF came to anchor bulk tissue at 0 HU while the drivers used +120.
+    """
+    if mode == "fixed":
+        if mu_water is None:
+            raise ValueError("hu_calibration='fixed' needs an explicit mu_water")
+        # tissue_hu deliberately does NOT apply here: this mode's second anchor
+        # is water at 0 HU by definition, not a measured tissue peak. Say so
+        # rather than ignoring the flag in silence.
+        if tissue_hu is not None and verbose:
+            print(f"  NOTE: tissue_hu {float(tissue_hu):.0f} ignored — it "
+                  f"places the measured bulk-tissue peak, and "
+                  f"hu_calibration='fixed' anchors WATER (0 HU) via mu_water "
+                  f"instead.")
+        return fixed_anchors(float(mu_water))
+    if mode == "auto":
+        return find_attenuation_anchors(
+            values,
+            tissue_hu=(TISSUE_HU_DEFAULT if tissue_hu is None
+                       else float(tissue_hu)))
+    raise ValueError(f"unknown hu_calibration mode {mode!r} "
+                     f"(expected 'auto' or 'fixed')")
+
+
 def fixed_anchors(mu_water: float, mu_air: float = 0.0, *,
                   air_hu: float = AIR_HU_DEFAULT,
                   water_hu: float = WATER_HU) -> HUAnchors:

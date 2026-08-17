@@ -541,7 +541,8 @@ def resolve_fov(args, xml_header, projections, *, bright_field=None,
 
 
 def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
-                     cor_mode: str = 'center', verbose: bool = True) -> dict:
+                     cor_mode: str = 'center', verbose: bool = True,
+                     downsample: int = 1) -> dict:
     """Detector centre-of-rotation policy, applied to every backend's
     geometry.
 
@@ -553,6 +554,15 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
     the vendor reconstruction at the midplane AND at z=+22 mm, while
     psi + XML COR re-splits the off-midplane tube. The XML values stay
     available under ``central_pixel_*_xml`` (and via cor_mode='xml').
+
+    ``n_b``/``n_a`` are the RAW detector dimensions, matching the raw indices
+    ``build_geometry`` returns. ``downsample`` > 1 additionally converts all
+    four indices to pooled units: output pixel j is the mean of raw
+    [j*f, j*f+f-1], centroid j*f+(f-1)/2, so ``idx' = (idx-(f-1)/2)/f``. Doing
+    the conversion HERE rather than in each caller is what keeps muNeRF (which
+    pools its sinogram before building rays) and the drivers (which pool the
+    projections) on one arithmetic — pairing a raw index with a pooled pitch is
+    ~1176 columns of error at f=3.
     """
     geometry['central_pixel_a_xml'] = geometry['central_pixel_a']
     geometry['central_pixel_b_xml'] = geometry['central_pixel_b']
@@ -569,6 +579,12 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
                   f"restores the legacy behaviour).")
     elif verbose:
         print("\n  Centre of rotation: scan.xml values (--cor-mode xml).")
+
+    f = max(1, int(downsample))
+    if f > 1:
+        for key in ('central_pixel_a', 'central_pixel_b',
+                    'central_pixel_a_xml', 'central_pixel_b_xml'):
+            geometry[key] = (geometry[key] - (f - 1) / 2.0) / f
     return geometry
 
 
@@ -628,14 +644,15 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         verbose=not use_domain,
     )
 
-    apply_cor_policy(geometry, projections.shape[1], projections.shape[2],
-                     cor_mode=getattr(args, 'cor_mode', 'center'))
-
-    # Optional detector downsampling (average pooling), applied consistently:
-    # detector pixel pitch scales UP by the factor, and the central-pixel
-    # indices convert as raw -> pooled: c' = (c - (f-1)/2) / f (the pooled
-    # pixel centre sits at the mean of its f raw-pixel centres).
+    # CoR policy + the raw -> pooled index conversion, in one call, so muNeRF
+    # (which pools its own sinogram) runs literally the same arithmetic.
     factor = int(getattr(args, 'downsample', 1) or 1)
+    apply_cor_policy(geometry, projections.shape[1], projections.shape[2],
+                     cor_mode=getattr(args, 'cor_mode', 'center'),
+                     downsample=factor)
+
+    # Optional detector downsampling (average pooling): the pixel pitch scales
+    # UP by the factor. The central-pixel indices were already converted above.
     if factor > 1:
         print(f"\nDownsampling projections by factor {factor}...")
         original_shape = projections.shape
@@ -647,9 +664,6 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
             dark_field = downsample_projections(dark_field, factor)
         geometry['da'] *= factor
         geometry['db'] *= factor
-        for key in ('central_pixel_a', 'central_pixel_b',
-                    'central_pixel_a_xml', 'central_pixel_b_xml'):
-            geometry[key] = (geometry[key] - (factor - 1) / 2.0) / factor
 
     # ---- reconstruction domain (fitting backends only) --------------------
     # Deliberately AFTER downsampling and the COR policy: the measurement
