@@ -131,6 +131,21 @@ class HUAnchors:
         values = np.asarray(values)
         return (values * self.scale + self.offset).astype(dtype)
 
+    def invert(self, hu, dtype=np.float32) -> np.ndarray:
+        """HU back to input units — the exact algebraic inverse of ``apply``.
+
+        Needed whenever an already-calibrated volume has to re-enter the
+        forward model: a stored HU reconstruction is forward-projected in mu,
+        so ``fdk_pretrain``, ``fdk_residual``, the alignment search and the
+        finished-volume projection diagnostic all have to undo the HU map
+        first. Each of them used to inline ``mu_water * (1 + HU/1000)``, which
+        is only the inverse of the ONE-POINT map — five copies of a formula
+        that silently disagrees with a two-anchor calibration. Going through
+        the anchors means the round trip closes whichever mode produced them.
+        """
+        hu = np.asarray(hu)
+        return ((hu - self.offset) / self.scale).astype(dtype)
+
 
 # --------------------------------------------------------------------------
 # Anchor search

@@ -398,10 +398,10 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
     (N_b, N_a). Returns (pred, target) numpy arrays at `downsample` stride.
     """
     from ..learning_based_iterative.scene import Scene, model_domain_from_geometry
-    from ..learning_based_iterative.ray_sampler import rays_from_indices
-    from ..learning_based_iterative.renderer import render_rays
+    from ..learning_based_iterative.projection import render_projection
     from ..learning_based_iterative.voxel.model import VoxelGrid
     from .calibration import MU_WATER_80KV
+    from .hu_calibration import fixed_anchors
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -415,7 +415,7 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
         # every backend returns mu. Converting HU back to mu needs a scale,
         # and with no BHC to switch on there is only the one legacy constant.
         mu_w = MU_WATER_80KV if mu_water is None else float(mu_water)
-        vol = mu_w * (1.0 + vol / 1000.0)
+        vol = fixed_anchors(mu_w).invert(vol)
     vol = np.clip(vol, 0.0, None)
 
     Nx, Ny, Nz = vol.shape
@@ -444,29 +444,12 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
               f"and columns [{a_min}, {a_max}) of {n_a} — rays outside exit "
               f"the reconstruction domain and cannot be predicted from the "
               f"volume.")
-    b_keep = torch.arange(b_min, b_max, downsample)
-    a_keep = torch.arange(a_min, a_max, downsample)
-    bb, aa = torch.meshgrid(b_keep, a_keep, indexing="ij")
-    b_flat, a_flat = bb.reshape(-1), aa.reshape(-1)
-    angle_flat = torch.zeros_like(b_flat)
-
-    origins, directions, target_flat = rays_from_indices(
-        scene, angle_flat, b_flat, a_flat)
-    origins = origins.to(device)
-    directions = directions.to(device)
-
-    n_rays = origins.shape[0]
-    pred_flat = torch.empty(n_rays, dtype=torch.float32)
-    with torch.no_grad():
-        for i in range(0, n_rays, chunk_size):
-            j = min(i + chunk_size, n_rays)
-            pred_flat[i:j] = render_rays(
-                origins[i:j], directions[i:j], model, scene,
-                num_samples=samples_per_ray, stratified=False).cpu()
-
-    shape = (b_keep.numel(), a_keep.numel())
-    return (pred_flat.reshape(shape).numpy(),
-            target_flat.reshape(shape).cpu().numpy())
+    # The scene holds this one angle only, so the angle index is 0.
+    pred, target = render_projection(
+        model, scene, 0, samples_per_ray, device,
+        downsample=downsample, b_range=(b_min, b_max), a_range=(a_min, a_max),
+        chunk_size=chunk_size)
+    return pred.cpu().numpy(), target.cpu().numpy()
 
 
 # --------------------------------------------------------------------------
