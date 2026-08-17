@@ -17,6 +17,10 @@ try:
 except ImportError:
     astra = None
 
+from ...ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
+                                   LCurve, StoppingRules, metrics_dict,
+                                   plot_convergence, resolve_holdout_index,
+                                   solution_norm)
 from ...ct_core.preprocessing import preprocess_sinogram
 from ...ct_core.utils import query_gpu_memory
 
@@ -137,7 +141,12 @@ class ASTRAReconstructor:
                  soft_clip_sharpness=200.0, upper_clamp=True,
                  upper_clamp_value=1.05,
                  ring_correction=False, ring_median_width=51,
-                 air_normalization=True):
+                 air_normalization=True,
+                 crossval=True, holdout_index=None,
+                 eval_every=10, patience=3,
+                 stop_metric='ssim', l_curve=False, l_curve_norm='l2',
+                 stop_on=('holdout',),
+                 log_fn=None):
         """
         Args:
             projections: Raw projections, shape (N_angles, N_b, N_a)
@@ -192,10 +201,37 @@ class ASTRAReconstructor:
         self.air_normalization = air_normalization
         self.ring_median_width = ring_median_width
 
+        # Stopping rules (ct_core.early_stop). ASTRA had none: every requested
+        # iteration ran in one call, so the iteration count was the whole
+        # regularisation and it was picked by hand.
+        self.crossval = bool(crossval)
+        self.holdout_index = holdout_index
+        self.eval_every = int(eval_every)
+        self.patience = int(patience)
+        if stop_metric not in STOP_METRICS:
+            raise ValueError(f"stop_metric must be one of {list(STOP_METRICS)}, "
+                             f"got {stop_metric!r}")
+        self.stop_metric = stop_metric
+        self.l_curve = bool(l_curve)
+        self.l_curve_norm = str(l_curve_norm)
+        self.stop_on = tuple(stop_on)
+        self.log_fn = log_fn
+        self.best_iter = None
+        self.crossval_metrics = None
+        self._lcurve = None
+
         self.reconstructed_volume = None
 
         # Detector dimensions
         self.N_angles, self.N_b, self.N_a = self.projections.shape
+
+        if self.crossval and self.algorithm not in self.RESUMABLE \
+                and self.algorithm != 'FDK_CUDA':
+            print(f"  NOTE: {self.algorithm} rebuilds its internal state on each "
+                  f"astra.algorithm.run() call, so it cannot be checkpointed "
+                  f"without changing the iteration sequence. Running all "
+                  f"{self.iterations} iterations in one call, with no stopping "
+                  f"rule.")
 
     def _preprocess(self, chunk_angles=20):
         """
@@ -300,6 +336,134 @@ class ASTRAReconstructor:
                 f"(--voxel-xy, --voxel-z), or use --downsample."
             )
 
+    # ---------------------------------------------------------------- stopping
+
+    #: Algorithms whose internal state SURVIVES a partial `astra.algorithm.run`,
+    #: which is what makes a checkpointed loop possible at all. CGLS is excluded
+    #: deliberately: it rebuilds its Krylov state on each `run()` call, so
+    #: chunking it does not continue the same iteration sequence — it restarts
+    #: it, and the "iteration 30" of a chunked run is not the iteration 30 of a
+    #: single call. Better to refuse the combination than to silently reconstruct
+    #: something else.
+    RESUMABLE = ('SIRT3D_CUDA', 'SART3D_CUDA')
+
+    def _stopping_enabled(self) -> bool:
+        return (self.crossval and self.algorithm in self.RESUMABLE
+                and self.N_angles > 1)
+
+    def _run_with_stopping(self, alg_id, vol_id, proj_geom, vol_geom, sino_astra):
+        """Iterate in chunks, scoring at each checkpoint, and return the volume
+        the stopping rules chose.
+
+        ASTRA had NO stopping rule before this: it ran every requested iteration
+        in a single `run()` call. For a semi-convergent method that means the
+        iteration count was the only regularisation and it was chosen by hand.
+        """
+        idx = resolve_holdout_index(self.holdout_index, self.N_angles)
+        holdout = sino_astra[:, idx, :].copy()          # (N_b, N_a)
+        holdout_deg = float(np.rad2deg(self.angles[idx]))
+        scorer = HoldoutScorer(holdout, label=f"projection {idx}")
+        stopper = EarlyStopper(patience=self.patience, metric=self.stop_metric)
+        lcurve = (LCurve(patience=self.patience, norm=self.l_curve_norm,
+                         residual_kind="full sinogram") if self.l_curve else None)
+        rules = StoppingRules(stopper=stopper, lcurve=lcurve, stop_on=self.stop_on)
+        self._lcurve = lcurve
+
+        print(f"\nRunning {self.algorithm} (up to {self.iterations} iterations, "
+              f"checkpoint every {self.eval_every})")
+        print(f"  Evaluating against projection {idx} ({holdout_deg:.1f}°), which "
+              f"STAYS in the reconstruction — ASTRA's algorithms take the whole "
+              f"sinogram, so a withheld angle would need a second geometry.")
+        print(f"  Stopping on {' + '.join(self.stop_on)}: {self.stop_metric} "
+              f"(patience {self.patience})"
+              + (f", L-curve corner ({self.l_curve_norm} norm, exact residual)"
+                 if lcurve is not None else ""))
+        print(f"\n  {'Iter':>6}   {'PSNR (dB)':>10}   {'SSIM':>10}   "
+              f"{'Holdout MSE':>14}   {'':>4}")
+
+        best_vol, best_iter, lcurve_vols = None, 0, {}
+        i_done = 0
+        while i_done < self.iterations:
+            chunk = min(self.eval_every, self.iterations - i_done)
+            astra.algorithm.run(alg_id, chunk)
+            i_done += chunk
+            vol = astra.data3d.get(vol_id)
+
+            # Forward-project the current volume once; slice out the held-out
+            # angle from it and use the whole thing for the residual, so the two
+            # criteria cost one projection between them rather than one each.
+            pid, pred_full = astra.create_sino3d_gpu(vol, proj_geom, vol_geom)
+            try:
+                m = scorer.score(pred_full[:, idx, :])
+                improved = stopper.update(i_done, m, snapshot_fn=lambda: vol.copy())
+                if lcurve is not None:
+                    lcurve.add(i_done,
+                               float(np.linalg.norm(pred_full - sino_astra)),
+                               solution_norm(vol, self.l_curve_norm))
+            finally:
+                astra.data3d.delete(pid)
+                del pred_full
+
+            if improved:
+                best_vol, best_iter = stopper.best_state, i_done
+                marker = '*'
+            else:
+                marker = f'-{stopper.num_bad}'
+            if lcurve is not None and 'lcurve' in self.stop_on:
+                lcurve_vols[i_done] = vol.copy()
+                depth = max(LCurve.MIN_POINTS, lcurve.smooth) + self.patience + 1
+                for old in sorted(lcurve_vols)[:-depth]:
+                    del lcurve_vols[old]
+            if self.log_fn is not None:
+                self.log_fn({"diag/ssim": m["ssim"], "diag/psnr": m["psnr"],
+                             "diag/mse": m["mse"]}, i_done)
+
+            print(f"  {i_done:>6}   {m['psnr']:>10.4f}   {m['ssim']:>10.6f}   "
+                  f"{m['mse']:>14.8e}   {marker}")
+
+            if rules.should_stop():
+                print(f"\n  Early stopping: {rules.reason()}.")
+                break
+        else:
+            if stopper.best_iter is not None and stopper.best_iter < i_done:
+                print(f"\n  Note: peak {self.stop_metric}={stopper.best:.6g} was "
+                      f"at iter {stopper.best_iter}, not the final iteration. "
+                      f"Saving final iteration ({i_done}).")
+            best_vol, best_iter = vol, i_done
+            rules.fired = None
+
+        if rules.fired == 'lcurve':
+            keep = rules.best_iter()
+            if keep in lcurve_vols:
+                best_vol, best_iter = lcurve_vols[keep], keep
+            else:
+                print(f"  WARNING: the L-curve corner is at iter {keep} but that "
+                      f"volume was not retained — saving iter {i_done}.")
+                best_vol, best_iter = vol, i_done
+        lcurve_vols.clear()
+
+        self.best_iter = best_iter
+        self.crossval_metrics = metrics_dict(
+            stopper, lcurve, holdout_index=idx, holdout_deg=holdout_deg,
+            stop_iter=i_done, fired=rules.fired, delivered_iter=best_iter)
+        print(f"  Saving volume from iter {best_iter} "
+              f"(stopped by {rules.fired or 'iteration limit'})\n")
+        return best_vol
+
+    def plot_crossval(self, save_prefix):
+        """The shared convergence figure — same one every other backend draws."""
+        if self.crossval_metrics is None:
+            return
+        m = self.crossval_metrics
+        history = {"iters": m["iters"], "ssim": m["ssim"],
+                   "psnr": m["psnr"], "mse": m["mse"]}
+        return plot_convergence(
+            history, m.get("best_iter"), m.get("stop_iter"), self.eval_every,
+            save_prefix,
+            title=f"{self.algorithm} — evaluation projection "
+                  f"{m.get('holdout_index')}",
+            lcurve=self._lcurve)
+
     def reconstruct(self):
         """
         Full reconstruction pipeline.
@@ -336,6 +500,10 @@ class ASTRAReconstructor:
         # Step 4: Reorder sinogram
         print("Reordering sinogram to ASTRA convention (N_b, N_angles, N_a)...")
         sino_astra = reorder_sinogram_to_astra(sinogram)
+        # Kept in ASTRA order for the residual and the held-out score, but only
+        # when a stopping rule will actually read them — this is a full copy of
+        # the sinogram and there is no reason to hold it otherwise.
+        sinogram_for_resid = sino_astra.copy() if self._stopping_enabled() else None
         del sinogram
 
         # Step 5-7: Create ASTRA objects, run algorithm, cleanup
@@ -380,16 +548,16 @@ class ASTRAReconstructor:
             if self.algorithm == 'FDK_CUDA':
                 print("Running ASTRA FDK...")
                 astra.algorithm.run(alg_id)
+                vol_astra = astra.data3d.get(vol_id)
+            elif self._stopping_enabled():
+                vol_astra = self._run_with_stopping(
+                    alg_id, vol_id, proj_geom, vol_geom, sinogram_for_resid)
             else:
-                # For CGLS3D_CUDA: all iterations must be in a single run() call
-                # because it resets internal state on each call.
-                # For SIRT/SART: also fine as single call for simplicity.
                 print(f"Running {self.algorithm} ({self.iterations} iterations)...")
                 astra.algorithm.run(alg_id, self.iterations)
+                vol_astra = astra.data3d.get(vol_id)
 
-            # Retrieve result
             # ASTRA returns volume in (z, y, x) order
-            vol_astra = astra.data3d.get(vol_id)
             print(f"  ASTRA output shape: {vol_astra.shape} (z, y, x)")
             print(f"  ASTRA output range: [{vol_astra.min():.6f}, {vol_astra.max():.6f}]")
 

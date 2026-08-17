@@ -39,6 +39,9 @@ import numpy as np
 import torch
 
 from ...ct_core.data_budget import RANDOM, data_budget, measurement_count
+from ...ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
+                                   LCurve, StoppingRules, metrics_dict,
+                                   resolve_holdout_index, solution_norm)
 from ...ct_core.preprocessing import preprocess_sinogram
 from ..scene import Scene, model_domain_from_geometry
 from ..ray_sampler import (rays_from_indices, sample_projection_patch,
@@ -71,6 +74,11 @@ class VoxelReconstructor:
                  withhold_eval: bool = False,
                  eval_every: int = 250,
                  patience: int = 8,
+                 stop_metric: str = "mse",
+                 l_curve: bool = False,
+                 l_curve_norm: str = "l2",
+                 l_curve_snapshot_gib: float = 4.0,
+                 stop_on: tuple = ("holdout",),
                  diag_downsample: int = 2,
                  figure_every_evals: int = 4,
                  log_every: int = 500,
@@ -110,6 +118,24 @@ class VoxelReconstructor:
         self.withhold_eval = bool(withhold_eval)
         self.eval_every = int(eval_every)
         self.patience = int(patience)
+        # Which held-out metric decides the peak. They do not peak together:
+        # MSE is (a subset of) the objective and turns over last, SSIM is
+        # structural and turns over earliest. MSE is the default here because it
+        # is what this backend minimises, so stopping on it is stopping on the
+        # thing being optimised — but SSIM is the one to pick if the volume, not
+        # the projection fit, is what matters.
+        if stop_metric not in STOP_METRICS:
+            raise ValueError(f"stop_metric must be one of {list(STOP_METRICS)}, "
+                             f"got {stop_metric!r}")
+        self.stop_metric = str(stop_metric)
+        # The L-curve needs no held-out data, so it is the criterion that still
+        # applies when the eval projection stays in training (the default here).
+        self.l_curve = bool(l_curve)
+        self.l_curve_norm = str(l_curve_norm)
+        # Host-RAM budget for the iterate ring buffer that lets an L-curve
+        # stop RETURN the corner's volume rather than just name it.
+        self.l_curve_snapshot_gib = float(l_curve_snapshot_gib)
+        self.stop_on = tuple(stop_on)
         # Evaluation renders the FULL eval projection at this detector
         # stride (SSIM needs a coherent 2-D image, not random rays).
         self.diag_downsample = max(1, int(diag_downsample))
@@ -164,6 +190,12 @@ class VoxelReconstructor:
 
         self.reconstructed_volume = None
         self.crossval_history: list[dict] = []
+        # Filled in by reconstruct(): which rule ended the run, where it ended,
+        # and the full convergence record (ct_core.early_stop.metrics_dict).
+        self.stop_iter = 0
+        self.delivered_iter = 0
+        self.stopped_by = None
+        self.convergence: dict | None = None
         # Filled in by reconstruct(): how much data the run actually consumed.
         # data_visits is the cross-algorithm unit — one classical iterative
         # iteration (SIRT, OS-SART) is exactly 1.00 visits per measurement,
@@ -332,8 +364,7 @@ class VoxelReconstructor:
         # Withheld from training only when withhold_eval.
         holdout = None
         if self.crossval and scene.n_angles > 1:
-            holdout = (int(self.holdout_index) if self.holdout_index is not None
-                       else scene.n_angles // 2)
+            holdout = resolve_holdout_index(self.holdout_index, scene.n_angles)
             n_b, n_a = scene.detector_shape
             ds = self.diag_downsample
             # Only the detector window whose rays stay inside the domain —
@@ -360,6 +391,10 @@ class VoxelReconstructor:
                   f"rows [{b0}, {b1}) of {n_b} and columns [{a0}, {a1}) of "
                   f"{n_a}, eval every {self.eval_every}, patience "
                   f"{self.patience}")
+            # The window is already applied to the rays, so the scorer gets the
+            # cropped target directly and needs no further window.
+            scorer = HoldoutScorer(h_target.cpu().numpy(),
+                                   label=f"projection {holdout}")
 
             def _render_eval() -> torch.Tensor:
                 pred = torch.empty(h_o.shape[0], device=device)
@@ -475,7 +510,52 @@ class VoxelReconstructor:
             print(f"    (default is mse, the objective classical SIRT "
                   f"descends; this run departs from it)")
 
-        best_mse, best_it, bad_evals = float("inf"), 0, 0
+        # ---- stopping rules --------------------------------------------------
+        # The shared implementation, so this backend, TIGRE, ASTRA and muNeRF all
+        # stop on the same definitions. Notably the best-on-holdout STATE is now
+        # captured: this loop used to detect the turnover and then return the
+        # final grid anyway, i.e. the volume from after the peak.
+        stopper = lcurve = rules = None
+        if holdout is not None:
+            stopper = EarlyStopper(patience=self.patience,
+                                   metric=self.stop_metric)
+            if self.l_curve:
+                # A FIXED subset of rays, so this is a deterministic functional
+                # of the volume and its curve is smooth — but it is not the
+                # residual over the whole sinogram, which is why the kind is
+                # recorded and plotted.
+                kind = "holdout projection" if self.withhold_eval else "eval projection"
+                lcurve = LCurve(patience=self.patience, norm=self.l_curve_norm,
+                                residual_kind=kind)
+            rules = StoppingRules(stopper=stopper, lcurve=lcurve,
+                                  stop_on=self.stop_on)
+            print(f"  Stopping on {' + '.join(self.stop_on)}: held-out "
+                  f"{self.stop_metric} (patience {self.patience})"
+                  + (f", L-curve corner ({self.l_curve_norm} norm)"
+                     if lcurve is not None else ""))
+
+        # How many past iterates to keep so the L-curve's corner can be
+        # RETURNED and not merely reported. The worst-case lag is the whole
+        # warm-up the rule waits through (`max(MIN_POINTS, smooth) + patience`
+        # checkpoints), which for a large grid is more host RAM than is
+        # reasonable — so the depth is capped by a budget and the shortfall is
+        # announced if it ever bites.
+        lcurve_depth = 0
+        if lcurve is not None and "lcurve" in self.stop_on:
+            want = max(LCurve.MIN_POINTS, lcurve.smooth) + self.patience + 1
+            grid_bytes = n_params * 4
+            afford = max(1, int(self.l_curve_snapshot_gib * 2**30) // max(1, grid_bytes))
+            lcurve_depth = min(want, afford)
+            print(f"  L-curve: keeping the last {lcurve_depth} iterates on the "
+                  f"host ({lcurve_depth * grid_bytes / 2**30:.2f} GiB) so the "
+                  f"corner's volume can be returned"
+                  + ("" if lcurve_depth >= want else
+                     f" — WANTED {want}; a corner further back than "
+                     f"{lcurve_depth} checkpoints will be reported but not "
+                     f"restored (raise l_curve_snapshot_gib)"))
+
+        best_it = 0
+        lcurve_snapshots: dict = {}
         t0 = time.time()
         stop_reason = "max iterations"
 
@@ -515,34 +595,53 @@ class VoxelReconstructor:
 
             if holdout is not None and (it + 1) % self.eval_every == 0:
                 h_pred = _render_eval()
-                h_mse = float(torch.mean((h_pred - h_target) ** 2))
                 n_evals = len(self.crossval_history) + 1
                 pred_np = h_pred.cpu().numpy()
                 target_np = h_target.cpu().numpy()
+                # One scorer, one SSIM identity, one fixed data range — so a
+                # curve compared across iterations is comparing the model and
+                # not a moving normalisation.
+                m = scorer.score(pred_np)
                 if self.diag_fn is not None:
-                    m = self.diag_fn(
-                        pred_np, target_np, it + 1,
-                        figures=(n_evals % self.figure_every_evals == 0))
-                else:
-                    from ...ct_core.projection_diag import evaluate_projection
-                    m = evaluate_projection(pred_np, target_np)
-                    if self.log_fn is not None:
-                        self.log_fn({"diag/ssim": m["ssim"],
-                                     "diag/psnr": m["psnr"],
-                                     "diag/mse": m["mse"]}, it + 1)
+                    self.diag_fn(pred_np, target_np, it + 1,
+                                 figures=(n_evals % self.figure_every_evals == 0))
+                elif self.log_fn is not None:
+                    self.log_fn({"diag/ssim": m["ssim"], "diag/psnr": m["psnr"],
+                                 "diag/mse": m["mse"]}, it + 1)
                 self.crossval_history.append(
-                    {"iter": it + 1, "mse": h_mse,
+                    {"iter": it + 1, "mse": m["mse"],
                      "ssim": m["ssim"], "psnr": m["psnr"]})
-                if h_mse < best_mse * (1.0 - 1e-4):
-                    best_mse, best_it, bad_evals = h_mse, it + 1, 0
-                else:
-                    bad_evals += 1
-                    if bad_evals >= self.patience:
-                        stop_reason = (f"eval-projection MSE plateau "
-                                       f"({self.patience} evals without "
-                                       f"improvement; best {best_mse:.3e} "
-                                       f"at iter {best_it})")
-                        break
+
+                # Keep the BEST grid, not the last one. Copying 100+ M voxels is
+                # only paid on an improvement, which is what snapshot_fn is for.
+                stopper.update(it + 1, m,
+                               snapshot_fn=lambda: model.mu.detach().clone())
+                best_it = stopper.best_iter or best_it
+                if lcurve is not None:
+                    mu_cpu = model.mu.detach().cpu()
+                    lcurve.add(it + 1, float(np.sqrt(m["mse"])),
+                               solution_norm(mu_cpu.numpy(), self.l_curve_norm))
+                    if "lcurve" in self.stop_on and lcurve_depth > 0:
+                        # The corner is only identifiable in RETROSPECT, so
+                        # "stop at the corner" can only mean "keep the corner's
+                        # volume" if that iterate is still in hand. Held on the
+                        # CPU — these are touched once, at the end, and would
+                        # otherwise be a large GPU allocation. Depth is bounded
+                        # by a RAM budget, and if the corner falls outside it the
+                        # run says so rather than silently returning the wrong
+                        # iterate.
+                        lcurve_snapshots[it + 1] = mu_cpu.clone()
+                        for old in sorted(lcurve_snapshots)[:-lcurve_depth]:
+                            del lcurve_snapshots[old]
+                    if self.log_fn is not None:
+                        c_it, _ = lcurve.corner()
+                        self.log_fn({"lcurve/residual": lcurve.residual[-1],
+                                     "lcurve/solution": lcurve.solution[-1],
+                                     **({"lcurve/corner_iter": c_it}
+                                        if c_it is not None else {})}, it + 1)
+                if rules.should_stop():
+                    stop_reason = rules.reason()
+                    break
 
         elapsed = time.time() - t0
         self.iterations_run = int(it + 1)
@@ -557,9 +656,18 @@ class VoxelReconstructor:
               f"{self.n_measurements / 1e6:.1f} M measurements; "
               f"{100 * self.data_coverage:.1f}% seen at least once)")
         if holdout is not None and self.crossval_history:
-            print(f"  Eval-projection MSE: "
-                  f"{self.crossval_history[-1]['mse']:.3e} "
-                  f"(best {best_mse:.3e} at iter {best_it})")
+            last = self.crossval_history[-1]
+            print(f"  Eval projection: {self.stop_metric} "
+                  f"{last[self.stop_metric]:.6g} at the end, best "
+                  f"{stopper.best:.6g} at iter {stopper.best_iter}")
+            if lcurve is not None:
+                c_it, _ = lcurve.corner()
+                print(f"  L-curve corner: {c_it if c_it is not None else 'none yet'}"
+                      + ("" if c_it is None or stopper.best_iter is None
+                         or c_it == stopper.best_iter
+                         else f" — DISAGREES with the held-out peak "
+                              f"({stopper.best_iter}); both are in the "
+                              f"convergence figure"))
             # Guarantee final diagnostic figures even when the last eval
             # wasn't a figure checkpoint.
             if (self.diag_fn is not None
@@ -567,6 +675,38 @@ class VoxelReconstructor:
                 h_pred = _render_eval()
                 self.diag_fn(h_pred.cpu().numpy(), h_target.cpu().numpy(),
                              it + 1, figures=True, scalars=False)
+
+        # ---- restore the best iterate ---------------------------------------
+        # The run stopped BECAUSE the metric turned over, so the current grid is
+        # from after the peak by construction. Restoring is the whole point of
+        # having watched. Only skipped when the loop ran to its iteration limit,
+        # where the user asked for every iteration and gets the last one.
+        self.stop_iter = int(it + 1)
+        self.stopped_by = None if rules is None else rules.fired
+        # Which iteration the RETURNED grid is from. Reported as `best_iter` so
+        # the data budget credits the delivered volume, not the run.
+        self.delivered_iter = self.stop_iter
+        if rules is not None and self.stopped_by is not None:
+            keep = rules.best_iter()
+            state = (stopper.best_state if self.stopped_by == "holdout"
+                     else lcurve_snapshots.get(keep))
+            if keep is not None and keep != self.stop_iter and state is not None:
+                print(f"  Restoring the iterate from iteration {keep} "
+                      f"(stopped at {self.stop_iter}, by {self.stopped_by})")
+                with torch.no_grad():
+                    model.mu.copy_(state.to(model.mu.device))
+                self.delivered_iter = int(keep)
+            elif keep is not None and keep != self.stop_iter:
+                print(f"  WARNING: wanted the iterate from iteration {keep} but "
+                      f"no snapshot was kept — returning iteration "
+                      f"{self.stop_iter}.")
+        lcurve_snapshots.clear()
+        self.convergence = metrics_dict(
+            stopper, lcurve, holdout_index=holdout,
+            holdout_deg=(float(np.rad2deg(self.angles[holdout]))
+                         if holdout is not None else None),
+            stop_iter=self.stop_iter, fired=self.stopped_by,
+            delivered_iter=self.delivered_iter)
 
         # ---- export: the parameter grid IS the volume ----------------------
         # mu[0, 0] is (Dz, Hy, Wx) with indices increasing along +z/+y/+x;

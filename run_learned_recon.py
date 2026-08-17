@@ -44,6 +44,7 @@ from .ct_core.errors import ConfigError, cli_main
 from .ct_core.preflight import auto_rays_per_batch
 from .ct_core.projection_diag import measure_noise_ceiling
 from .ct_core.utils import query_gpu_memory
+from .ct_core.early_stop import STOP_METRICS
 
 SUPPORTED_LEARNED_ALGORITHMS = ("voxel",)
 
@@ -221,6 +222,46 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
     parser.add_argument('--patience', type=int, default=8, metavar='P',
                         help='Stop after P holdout evals without improvement '
                              '(default: 8 = 2000 iters at eval-every=250)')
+    parser.add_argument(
+        '--stop-metric',
+        choices=STOP_METRICS,
+        default='mse',
+        help='Which held-out metric decides the peak. They do not peak '
+             'together: mse is the objective and turns over last, ssim is '
+             'structural and turns over earliest, psnr sits between. Default: '
+             'ssim.'
+    )
+    parser.add_argument(
+        '--l-curve',
+        action='store_true',
+        default=False,
+        help='Also record the L-curve: the residual norm against the solution '
+             'norm, in log-log, per checkpoint. Its corner is where further '
+             'residual reduction starts buying disproportionate solution '
+             'growth, i.e. where noise amplification takes over. Costs one '
+             'extra forward projection per checkpoint and needs NO held-out '
+             'data, so it is the criterion that still applies when an angle '
+             'cannot be spared.'
+    )
+    parser.add_argument(
+        '--l-curve-norm',
+        choices=('l2', 'gradient'),
+        default='l2',
+        help="Solution norm for the L-curve: 'l2' (classical) or 'gradient' "
+             "(the seminorm ||grad x||, more sensitive to the high-frequency "
+             "noise that semi-convergence amplifies). Default: l2."
+    )
+    parser.add_argument(
+        '--stop-on',
+        nargs='+',
+        choices=('holdout', 'lcurve'),
+        default=['holdout'],
+        metavar='RULE',
+        help="Which rule(s) may END the run: 'holdout' (default) and/or "
+             "'lcurve'. Whichever fires first wins. A rule that is recorded "
+             "but not listed here is diagnostic only — the curve is still "
+             "logged and plotted."
+    )
 
     return parser.parse_args()
 
@@ -376,6 +417,10 @@ def main():
         withhold_eval=args.withhold_eval,
         eval_every=args.eval_every,
         patience=args.patience,
+        stop_metric=args.stop_metric,
+        l_curve=args.l_curve,
+        l_curve_norm=args.l_curve_norm,
+        stop_on=tuple(args.stop_on),
         log_fn=logger.log,
         # diag/* scalars every eval + SSIM-heatmap / power-spectrum figures
         # on a coarser cadence (figure_every_evals), all through the logger.

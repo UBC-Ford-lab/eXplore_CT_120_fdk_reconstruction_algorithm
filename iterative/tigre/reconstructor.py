@@ -13,7 +13,6 @@ Requires: tigre (optional dependency, built from source)
 """
 
 import copy
-import json
 import time
 from pathlib import Path
 
@@ -27,11 +26,10 @@ try:
 except ImportError:
     tigre = None
 
-try:
-    from skimage.metrics import structural_similarity as _ssim_fn
-except ImportError:
-    _ssim_fn = None
-
+from ...ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
+                                   LCurve, StoppingRules, metrics_dict,
+                                   plot_convergence, resolve_holdout_index,
+                                   solution_norm, write_metrics)
 from ...ct_core.preprocessing import preprocess_sinogram
 from ...ct_core.utils import query_gpu_memory
 
@@ -267,6 +265,8 @@ class TIGREReconstructor:
                  crossval=True, holdout_index=None,
                  withhold_eval=False,
                  eval_every=10, patience=3,
+                 stop_metric='ssim', l_curve=False, l_curve_norm='l2',
+                 stop_on=('holdout',),
                  tv_lambda=0.0, tv_iters=50,
                  pwls=False,
                  checkpoint_dir=None, checkpoint_z_range=None,
@@ -444,11 +444,24 @@ class TIGREReconstructor:
         self.holdout_index = holdout_index
         self.eval_every = eval_every
         self.patience = patience
+        # Which held-out metric peaks. SSIM is the default here — the historical
+        # choice for this backend, and the structural one, which turns over
+        # earliest of the three.
+        if stop_metric not in STOP_METRICS:
+            raise ValueError(f"stop_metric must be one of {list(STOP_METRICS)}, "
+                             f"got {stop_metric!r}")
+        self.stop_metric = stop_metric
+        self.l_curve = bool(l_curve)
+        self.l_curve_norm = str(l_curve_norm)
+        self.stop_on = tuple(stop_on)
         self.tv_lambda = tv_lambda
         self.tv_iters = tv_iters
         self.pwls = pwls
         self.best_iter = None       # set during reconstruct() when crossval is on
         self.crossval_metrics = None  # dict of lists; set after reconstruct()
+        # The L-curve recorded during reconstruct(), kept so plot_crossval can
+        # draw its panel afterwards.
+        self._lcurve = None
 
         # Per-checkpoint volume export (see checkpoint_dir docstring above)
         if checkpoint_dir is not None and checkpoint_z_range is None:
@@ -696,13 +709,7 @@ class TIGREReconstructor:
         # from the input only when withhold_eval (true held-out validation).
         holdout_proj = None
         if self.crossval:
-            if _ssim_fn is None:
-                raise ImportError(
-                    "scikit-image is required for cross-validation. "
-                    "Install with: pip install scikit-image"
-                )
-            N_train = sinogram.shape[0]
-            idx = self.holdout_index if self.holdout_index is not None else N_train // 2
+            idx = resolve_holdout_index(self.holdout_index, sinogram.shape[0])
             holdout_proj = sinogram[idx].copy()       # (N_b, N_a) TIGRE convention
             holdout_angle = tigre_angles[idx:idx + 1]
             holdout_deg = float(np.rad2deg(self.angles[idx]))
@@ -814,22 +821,39 @@ class TIGREReconstructor:
                     print(f"  TV @ iter {i_done}: "
                           f"[{vol_tigre.min():.6f}, {vol_tigre.max():.6f}]")
         else:
-            # Cross-validation: chunked loop with early stopping on SSIM.
+            # Cross-validation: chunked loop, stopping rules from ct_core.
             print(f"\n  {'Iter':>6}   {'PSNR (dB)':>10}   {'SSIM':>10}   "
                   f"{'Holdout MSE':>14}   {'':>4}")
-            data_range = float(holdout_proj.max() - holdout_proj.min())
-            if data_range < 1e-9:
-                data_range = 1.0
+            # The scorer owns the data range and the SSIM identity. Both used to
+            # be local here: the range was recomputed from the held-out
+            # projection (fine) but SSIM came from skimage's DEFAULT 7x7 UNIFORM
+            # window, while the diag/ssim this same loop logged to W&B came from
+            # ct_core's 11x11 Gaussian on the domain-covered crop. The number
+            # that decided when to stop was therefore not the number you could
+            # see, and neither was comparable with any other backend's.
+            scorer = HoldoutScorer(holdout_proj, label=f"projection {idx}")
+            stopper = EarlyStopper(patience=self.patience, metric=self.stop_metric)
+            lcurve = None
+            if self.l_curve:
+                # A volume backend can afford the EXACT residual over the whole
+                # sinogram — one forward projection per checkpoint — so this
+                # L-curve is the real thing, not a subset proxy.
+                lcurve = LCurve(patience=self.patience, norm=self.l_curve_norm,
+                                residual_kind="full sinogram")
+            rules = StoppingRules(stopper=stopper, lcurve=lcurve,
+                                  stop_on=self.stop_on)
+            self._lcurve = lcurve
+            print(f"  Stopping on {' + '.join(self.stop_on)}: held-out "
+                  f"{self.stop_metric} (patience {self.patience})"
+                  + (f", L-curve corner ({self.l_curve_norm} norm, exact residual)"
+                     if lcurve is not None else ""))
 
             vol_tigre = None
             best_vol = None
-            best_ssim = -1.0
-            best_psnr = 0.0
             best_iter = 0
-            patience_count = 0
+            lcurve_vols: dict = {}
             chunk_kwargs = {**kwargs, 'verbose': False}
             i_done = 0
-            cv_iters, cv_ssim, cv_psnr, cv_mse = [], [], [], []
 
             while i_done < self.iterations:
                 chunk = min(self.eval_every, self.iterations - i_done)
@@ -867,15 +891,9 @@ class TIGREReconstructor:
                           f"max={pred.max():.4f} "
                           f"mean={pred.mean():.4f}")
 
-                mse = float(np.mean((pred - holdout_proj) ** 2))
-                psnr = (10.0 * np.log10(data_range ** 2 / mse)
-                        if mse > 0 else float('inf'))
-                ssim = float(_ssim_fn(holdout_proj, pred, data_range=data_range))
+                m = scorer.score(pred)
+                mse, psnr, ssim = m["mse"], m["psnr"], m["ssim"]
 
-                cv_iters.append(i_done)
-                cv_ssim.append(ssim)
-                cv_psnr.append(psnr)
-                cv_mse.append(mse)
                 if self.diag_fn is not None:
                     # Columns back to the FDK detector convention, then cut to
                     # the detector window covered by the reconstruction domain
@@ -897,16 +915,35 @@ class TIGREReconstructor:
                     self.log_fn({"diag/ssim": ssim, "diag/psnr": psnr,
                                  "diag/mse": mse}, i_done)
 
-                if ssim > best_ssim:
-                    best_ssim = ssim
-                    best_psnr = psnr
+                improved = stopper.update(i_done, m,
+                                          snapshot_fn=lambda: vol_tigre.copy())
+                if improved:
+                    best_vol = stopper.best_state
                     best_iter = i_done
-                    best_vol = vol_tigre.copy()
-                    patience_count = 0
                     marker = '★'
                 else:
-                    patience_count += 1
-                    marker = f'-{patience_count}'
+                    marker = f'-{stopper.num_bad}'
+
+                if lcurve is not None:
+                    # Exact data residual: forward-project the current volume at
+                    # EVERY angle actually used. One Ax, which is the same cost
+                    # as one iteration of the algorithm itself.
+                    full_pred = tigre.Ax(vol_tigre, geo, tigre_angles, 'interpolated')
+                    resid = float(np.linalg.norm(full_pred - sinogram))
+                    del full_pred
+                    lcurve.add(i_done, resid, solution_norm(vol_tigre, self.l_curve_norm))
+                    if 'lcurve' in self.stop_on:
+                        lcurve_vols[i_done] = vol_tigre.copy()
+                        keep_depth = (max(LCurve.MIN_POINTS, lcurve.smooth)
+                                      + self.patience + 1)
+                        for old in sorted(lcurve_vols)[:-keep_depth]:
+                            del lcurve_vols[old]
+                    if self.log_fn is not None:
+                        c_it, _ = lcurve.corner()
+                        self.log_fn({"lcurve/residual": resid,
+                                     "lcurve/solution": lcurve.solution[-1],
+                                     **({"lcurve/corner_iter": c_it}
+                                        if c_it is not None else {})}, i_done)
 
                 print(f"  {i_done:>6}   {psnr:>10.4f}   {ssim:>10.6f}   "
                       f"{mse:>14.8e}   {marker}")
@@ -914,41 +951,49 @@ class TIGREReconstructor:
                 if self.checkpoint_dir is not None:
                     self._save_checkpoint(vol_tigre, i_done, Nx_orig, Ny_orig, Nz_orig)
 
-                if patience_count >= self.patience:
-                    print(f"\n  Early stopping: SSIM peaked at iter {best_iter} "
-                          f"(SSIM={best_ssim:.6f}). "
-                          f"No improvement for {self.patience} checkpoints.")
+                if rules.should_stop():
+                    print(f"\n  Early stopping: {rules.reason()}.")
                     break
 
             else:
-                # Loop completed without early stopping — save the final iteration,
-                # not best_vol. The user ran all iterations intentionally.
-                if best_iter < i_done:
-                    print(f"\n  Note: peak SSIM={best_ssim:.6f} was at iter {best_iter}, "
-                          f"not the final iteration. Saving final iteration ({i_done}).")
-                best_vol = vol_tigre  # keep final iteration as the saved result
+                # Loop completed without a rule firing — save the final
+                # iteration, not the peak. The user ran all iterations
+                # intentionally, so honour that and just say what was left on
+                # the table.
+                if stopper.best_iter is not None and stopper.best_iter < i_done:
+                    print(f"\n  Note: peak {self.stop_metric}={stopper.best:.6g} "
+                          f"was at iter {stopper.best_iter}, not the final "
+                          f"iteration. Saving final iteration ({i_done}).")
+                best_vol = vol_tigre
                 best_iter = i_done
+                rules.fired = None
+
+            # Which iterate to keep. The held-out rule knows its own peak; the
+            # L-curve's answer is its corner, which is why the recent volumes
+            # were kept.
+            if rules.fired == 'lcurve':
+                keep = rules.best_iter()
+                if keep in lcurve_vols:
+                    best_vol, best_iter = lcurve_vols[keep], keep
+                else:
+                    print(f"  WARNING: the L-curve corner is at iter {keep} but "
+                          f"that volume was not retained — saving iter {i_done}.")
+                    best_vol, best_iter = vol_tigre, i_done
+            lcurve_vols.clear()
 
             vol_tigre = best_vol
             self.best_iter = best_iter
-            self.crossval_metrics = {
-                'iters': cv_iters,
-                'ssim': cv_ssim,
-                'psnr': cv_psnr,
-                'mse': cv_mse,
-                'best_iter': best_iter,
-                'best_ssim': best_ssim,
-                'best_psnr': best_psnr,
-                'stop_iter': i_done,
-                'holdout_index': idx,
-                'holdout_deg': holdout_deg,
-            }
+            self.crossval_metrics = metrics_dict(
+                stopper, lcurve, holdout_index=idx, holdout_deg=holdout_deg,
+                stop_iter=i_done, fired=rules.fired,
+                delivered_iter=best_iter)
             print(f"  Saving volume from iter {best_iter} "
-                  f"(SSIM={best_ssim:.6f}, PSNR={best_psnr:.4f} dB)\n")
+                  f"(stopped by {rules.fired or 'iteration limit'})\n")
 
             if self.checkpoint_dir is not None:
-                metrics_path = Path(self.checkpoint_dir) / "crossval_metrics.json"
-                metrics_path.write_text(json.dumps(self.crossval_metrics, indent=2))
+                metrics_path = write_metrics(
+                    Path(self.checkpoint_dir) / "crossval_metrics.json",
+                    self.crossval_metrics)
                 print(f"  Saved {metrics_path}")
 
         t_recon = time.time() - t_start
@@ -974,169 +1019,25 @@ class TIGREReconstructor:
         # lands on one scale fitted from the finished volume.
         print("\nReconstruction complete.")
         return self.reconstructed_volume
-
     def plot_crossval(self, save_prefix):
-        """
-        Save a publication-quality convergence figure to
-        {save_prefix}_convergence.pdf and .png.
+        """Save the convergence figure to {save_prefix}_convergence.{png,pdf}.
+
+        The figure is `ct_core.early_stop.plot_convergence` — the same one the
+        learned backends and muNeRF produce, so two runs of different backends
+        are read off identically shaped plots. This method used to be 165 lines
+        of its own matplotlib, which is how it came to plot a differently-defined
+        SSIM from the one every other backend reported.
 
         Must be called after reconstruct() when crossval=True.
         """
         if self.crossval_metrics is None:
             return
-
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import matplotlib.ticker as mticker
-        except ImportError:
-            print("  matplotlib not available — skipping convergence figure.")
-            return
-
         m = self.crossval_metrics
-        iters     = np.asarray(m['iters'])
-        cv_ssim   = np.asarray(m['ssim'])
-        cv_psnr   = np.asarray(m['psnr'])
-        cv_mse    = np.asarray(m['mse'])
-        best_iter = m['best_iter']
-        stop_iter = m['stop_iter']
-
-        # Guard against non-finite metrics (e.g. a divergent algorithm run,
-        # as MLEM can do on ill-conditioned data): matplotlib's set_ylim
-        # raises on NaN/Inf, and Inf samples in the plotted line blow up
-        # autoscale even on panels without an explicit ylim. Replace
-        # non-finite samples with NaN (matplotlib draws a gap there) and
-        # compute axis limits from the finite subset only, so a partial
-        # divergence still produces a readable figure instead of losing the
-        # whole run to an unhandled exception during metric plotting.
-        all_finite = np.isfinite(cv_ssim) & np.isfinite(cv_psnr) & np.isfinite(cv_mse)
-        if not all_finite.all():
-            first_bad_iter = int(iters[~all_finite][0])
-            print(f"  WARNING: {int((~all_finite).sum())} non-finite crossval "
-                  f"metric value(s) detected (first at iter {first_bad_iter}) "
-                  f"— the run likely diverged numerically. Plotting finite "
-                  f"values only; treat any 'best' iteration at/after this "
-                  f"point with suspicion (SSIM/PSNR are unreliable once the "
-                  f"reconstruction has overflowed).")
-        cv_ssim_plot = np.where(np.isfinite(cv_ssim), cv_ssim, np.nan)
-        cv_psnr_plot = np.where(np.isfinite(cv_psnr), cv_psnr, np.nan)
-        cv_mse_plot = np.where(np.isfinite(cv_mse) & (cv_mse > 0), cv_mse, np.nan)
-
-        def _safe_ylim(arr, pad_frac=0.12, pad_min=0.01):
-            finite = arr[np.isfinite(arr)]
-            if finite.size == 0:
-                return None
-            lo, hi = float(finite.min()), float(finite.max())
-            pad = (hi - lo) * pad_frac or pad_min
-            return lo - pad, hi + pad
-
-        # ── Publication style ────────────────────────────────────────────────
-        rc = {
-            'font.family':        'sans-serif',
-            'font.size':          9,
-            'axes.labelsize':     9,
-            'axes.titlesize':     9,
-            'xtick.labelsize':    8,
-            'ytick.labelsize':    8,
-            'legend.fontsize':    8,
-            'legend.framealpha':  0.85,
-            'axes.linewidth':     0.75,
-            'xtick.major.width':  0.75,
-            'ytick.major.width':  0.75,
-            'xtick.minor.width':  0.5,
-            'ytick.minor.width':  0.5,
-            'xtick.direction':    'out',
-            'ytick.direction':    'out',
-            'lines.linewidth':    1.5,
-            'patch.linewidth':    0.75,
-            'pdf.fonttype':       42,   # embed TrueType, not Type 3
-            'ps.fonttype':        42,
-        }
-
-        blue  = '#2166ac'
-        red   = '#d6604d'
-        green = '#1a9641'
-        grey  = '#555555'
-
-        with plt.rc_context(rc):
-            fig, axes = plt.subplots(3, 1, figsize=(3.5, 6.0), sharex=True)
-
-            # Shade patience region (between best and stop) on all panels
-            if stop_iter > best_iter:
-                for ax in axes:
-                    ax.axvspan(best_iter, stop_iter, color='#ffcccc',
-                               alpha=0.45, zorder=0, linewidth=0)
-
-            # Vertical line at peak
-            for ax in axes:
-                ax.axvline(best_iter, color=grey, linestyle='--',
-                           linewidth=0.9, zorder=2)
-
-            # ── Panel 1: SSIM ────────────────────────────────────────────────
-            ax = axes[0]
-            ax.plot(iters, cv_ssim_plot, color=blue, linewidth=1.5, zorder=3)
-            best_idx  = int(np.where(iters == best_iter)[0][0])
-            if np.isfinite(cv_ssim[best_idx]):
-                ax.scatter([best_iter], [cv_ssim[best_idx]], color=blue,
-                           s=60, zorder=4, marker='*', linewidths=0)
-            ax.set_ylabel('SSIM')
-            ylim = _safe_ylim(cv_ssim)
-            if ylim is not None:
-                ax.set_ylim(*ylim)
-            ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
-            ax.legend(
-                handles=[
-                    plt.Line2D([0], [0], color=grey, linestyle='--',
-                               linewidth=0.9, label=f'Peak iter {best_iter}'),
-                    plt.Line2D([0], [0], color='#ffcccc', linewidth=6,
-                               solid_capstyle='butt',
-                               label=f'Patience window'),
-                ],
-                loc='lower right', handlelength=1.2,
-            )
-
-            # ── Panel 2: PSNR ────────────────────────────────────────────────
-            ax = axes[1]
-            ax.plot(iters, cv_psnr_plot, color=red, linewidth=1.5, zorder=3)
-            if np.isfinite(cv_psnr[best_idx]):
-                ax.scatter([best_iter], [cv_psnr[best_idx]], color=red,
-                           s=60, zorder=4, marker='*', linewidths=0)
-            ax.set_ylabel('PSNR (dB)')
-            ylim = _safe_ylim(cv_psnr, pad_frac=0.12, pad_min=0.1)
-            if ylim is not None:
-                ax.set_ylim(*ylim)
-            ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
-
-            # ── Panel 3: Holdout MSE (log scale) ─────────────────────────────
-            ax = axes[2]
-            ax.semilogy(iters, cv_mse_plot, color=green, linewidth=1.5, zorder=3)
-            if np.isfinite(cv_mse_plot[best_idx]):
-                ax.scatter([best_iter], [cv_mse_plot[best_idx]], color=green,
-                           s=60, zorder=4, marker='*', linewidths=0)
-            ax.set_ylabel('Holdout MSE')
-            ax.set_xlabel('Iteration')
-            ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation())
-            ax.grid(True, which='minor', color='#e0e0e0',
-                    linewidth=0.4, zorder=0)
-
-            # ── Shared formatting ─────────────────────────────────────────────
-            for ax in axes:
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-                ax.grid(True, which='major', color='#dddddd',
-                        linewidth=0.5, zorder=0)
-                ax.set_axisbelow(True)
-
-            # Tighten x-axis to data range
-            axes[0].set_xlim(iters[0] - self.eval_every * 0.5,
-                             iters[-1] + self.eval_every * 0.5)
-
-            plt.tight_layout(pad=0.6, h_pad=0.4)
-
-            for ext in ('pdf', 'png'):
-                path = f"{save_prefix}_convergence.{ext}"
-                fig.savefig(path, dpi=300, bbox_inches='tight')
-                print(f"  Saved convergence figure: {path}")
-
-            plt.close(fig)
+        history = {"iters": m["iters"], "ssim": m["ssim"],
+                   "psnr": m["psnr"], "mse": m["mse"]}
+        return plot_convergence(
+            history, m.get("best_iter"), m.get("stop_iter"),
+            self.eval_every, save_prefix,
+            title=f"{self.algorithm.upper()} — held-out projection "
+                  f"{m.get('holdout_index')}",
+            lcurve=self._lcurve)

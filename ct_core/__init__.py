@@ -82,6 +82,22 @@ try:
 except ImportError:
     pass
 
+# Stopping rules, shared by every iterative and learning-based backend.
+from . import early_stop
+from .early_stop import (
+    STOP_METRICS,
+    EarlyStopper,
+    HoldoutScorer,
+    LCurve,
+    PlateauLRReducer,
+    StoppingRules,
+    metrics_dict,
+    plot_convergence,
+    resolve_holdout_index,
+    solution_norm,
+    write_metrics,
+)
+
 __all__ = [
     # Errors (raised by the library; drivers turn them into exit codes)
     'errors',
@@ -135,4 +151,17 @@ __all__ = [
     # Geometry self-calibration
     'geometry_selfcal',
     'estimate_psi_halfncc',
+    # Stopping rules
+    'early_stop',
+    'STOP_METRICS',
+    'EarlyStopper',
+    'HoldoutScorer',
+    'LCurve',
+    'PlateauLRReducer',
+    'StoppingRules',
+    'metrics_dict',
+    'plot_convergence',
+    'resolve_holdout_index',
+    'solution_norm',
+    'write_metrics',
 ]

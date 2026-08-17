@@ -25,6 +25,7 @@ import numpy as np
 from .iterative.astra import ASTRAReconstructor, SUPPORTED_ALGORITHMS as ASTRA_ALGORITHMS
 from .iterative.tigre import TIGREReconstructor, SUPPORTED_TIGRE_ALGORITHMS
 from .ct_core.data_budget import classical_budget, measurement_count
+from .ct_core.early_stop import STOP_METRICS
 from .ct_core.errors import ConfigError, cli_main
 from .ct_core.pipeline import (
     ReconLogger,
@@ -141,6 +142,46 @@ Examples:
              'consecutive eval checkpoints (default: 3, i.e. 30 iters at '
              'eval-every=10). Use a large value to disable early stopping '
              'while keeping metric logging.'
+    )
+    parser.add_argument(
+        '--stop-metric',
+        choices=STOP_METRICS,
+        default='ssim',
+        help='Which held-out metric decides the peak. They do not peak '
+             'together: mse is the objective and turns over last, ssim is '
+             'structural and turns over earliest, psnr sits between. Default: '
+             'ssim.'
+    )
+    parser.add_argument(
+        '--l-curve',
+        action='store_true',
+        default=False,
+        help='Also record the L-curve: the residual norm against the solution '
+             'norm, in log-log, per checkpoint. Its corner is where further '
+             'residual reduction starts buying disproportionate solution '
+             'growth, i.e. where noise amplification takes over. Costs one '
+             'extra forward projection per checkpoint and needs NO held-out '
+             'data, so it is the criterion that still applies when an angle '
+             'cannot be spared.'
+    )
+    parser.add_argument(
+        '--l-curve-norm',
+        choices=('l2', 'gradient'),
+        default='l2',
+        help="Solution norm for the L-curve: 'l2' (classical) or 'gradient' "
+             "(the seminorm ||grad x||, more sensitive to the high-frequency "
+             "noise that semi-convergence amplifies). Default: l2."
+    )
+    parser.add_argument(
+        '--stop-on',
+        nargs='+',
+        choices=('holdout', 'lcurve'),
+        default=['holdout'],
+        metavar='RULE',
+        help="Which rule(s) may END the run: 'holdout' (default) and/or "
+             "'lcurve'. Whichever fires first wins. A rule that is recorded "
+             "but not listed here is diagnostic only — the curve is still "
+             "logged and plotted."
     )
     parser.add_argument(
         '--checkpoint-dir',
@@ -362,10 +403,6 @@ def main():
 
     # Initialize reconstructor based on backend
     if args.backend == 'astra':
-        if not args.no_crossval:
-            print("NOTE: ASTRA runs all iterations inside one opaque toolbox "
-                  "call — projection diagnostics are computed once, on the "
-                  "final volume.")
         if ext_psi is not None:
             # applied inside geometry_to_astra_vectors (rotated u/v axes)
             ctx.geometry['det_psi_rad'] = float(np.radians(ext_psi))
@@ -391,6 +428,15 @@ def main():
             air_normalization=args.air_normalization,
             soft_clip_sharpness=args.soft_clip_sharpness,
             ring_median_width=args.ring_median_width,
+            crossval=not args.no_crossval,
+            holdout_index=args.holdout_index,
+            eval_every=args.eval_every,
+            patience=args.patience,
+            stop_metric=args.stop_metric,
+            l_curve=args.l_curve,
+            l_curve_norm=args.l_curve_norm,
+            stop_on=tuple(args.stop_on),
+            log_fn=logger.log,
         )
     elif args.backend == 'tigre':
         reconstructor = TIGREReconstructor(
@@ -416,6 +462,10 @@ def main():
             withhold_eval=args.withhold_eval,
             eval_every=args.eval_every,
             patience=args.patience,
+            stop_metric=args.stop_metric,
+            l_curve=args.l_curve,
+            l_curve_norm=args.l_curve_norm,
+            stop_on=tuple(args.stop_on),
             tv_lambda=args.tv_lambda,
             tv_iters=args.tv_iters,
             pwls=args.pwls,
