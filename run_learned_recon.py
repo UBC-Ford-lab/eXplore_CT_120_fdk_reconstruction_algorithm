@@ -8,7 +8,6 @@ solves, with autograd replacing the hand-derived update rule).
 
 Algorithms (each in its own subfolder of ``learning_based_iterative/``):
   - voxel: dense voxel grid — SIRT's representation trained with Adam + MSE.
-           The recipe validated in muNeRF (configs/scan_1510_VOXEL_mse.yaml).
 
 All algorithm-independent stages (scan loading, geometry build, detector
 downsampling, detector-psi calibration, HU calibration + VFF export) live in

@@ -350,7 +350,7 @@ Attenuating support measured from the projections:
 ```
 
 which independently reproduces the `extent_xy: 88.0 / half_extent_z: 29.0`
-pinned by hand in muNeRF's `configs/scan_1510_h100_base.yaml`.
+pinned by hand in muNeRF's per-scan config.
 
 Overrides: `--model-domain off` reverts to the old behaviour (grid = `--roi`
 /`--fov`), and `--model-domain 88 29` pins it in muNeRF's config units

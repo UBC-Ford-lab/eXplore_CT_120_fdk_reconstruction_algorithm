@@ -2,10 +2,9 @@
 
 Reconstruction as optimization: the volume is a `VoxelGrid` (one free
 parameter per voxel — SIRT's representation) fitted to the measured line
-integrals by Adam through the differentiable renderer. This is the recipe
-validated in muNeRF's ``configs/scan_1510_VOXEL_mse.yaml`` (run 9bn7j2ua),
-ported to the ct_core backend contract so it is a drop-in peer of the FDK /
-ASTRA / TIGRE backends:
+integrals by Adam through the differentiable renderer. It follows the
+ct_core backend contract, so it is a drop-in peer of the FDK / ASTRA / TIGRE
+backends:
 
   consume  raw-count projections (N_angles, N_b, N_a) + angles (radians, FDK
            convention) + ct_core ``build_geometry`` dict
