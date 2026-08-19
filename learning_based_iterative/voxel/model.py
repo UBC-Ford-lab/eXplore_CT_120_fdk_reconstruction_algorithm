@@ -73,11 +73,19 @@ def _tile(hx: float, hy: float, hz: float, voxel_mm) -> tuple[int, int, int]:
         else [float(x) for x in voxel_mm]
     if min(v) <= 0:
         raise ValueError(f"model.voxel.size_mm must be > 0, got {voxel_mm!r}")
-    # ceil so the grid always COVERS the AABB (a short grid would silently
-    # clip the domain the renderer integrates over).
-    nx = max(1, math.ceil(2.0 * hx / v[0]))
-    ny = max(1, math.ceil(2.0 * hy / v[1]))
-    nz = max(1, math.ceil(2.0 * hz / v[2]))
+    # `round`, the same rule `ct_core.scan_setup.build_geometry` uses to turn
+    # bounds into a grid — so a voxel grid tiling the measured domain IS the
+    # reconstruction grid the drivers build, and the export is then a SLICE of
+    # the parameters rather than an interpolation of them. One voxel of
+    # disagreement here (ceil, until 2026-08-19) is enough to put every export
+    # voxel between two parameters.
+    #
+    # Nothing is clipped by rounding down. `VoxelGrid` samples with
+    # align_corners=False, so N voxels TILE the AABB for any N — N sets the
+    # resolution, never the extent. (The old comment here claimed otherwise.)
+    nx = max(1, round(2.0 * hx / v[0]))
+    ny = max(1, round(2.0 * hy / v[1]))
+    nz = max(1, round(2.0 * hz / v[2]))
     return (nz, ny, nx)
 
 

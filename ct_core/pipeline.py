@@ -139,10 +139,17 @@ def add_common_args(parser):
         '--roi',
         nargs='+',
         default=None,
-        help='ROI-based reconstruction. Use "auto" to load from '
-             'SubVolumeCoordinates.xml in the scan folder, or specify 6 values: '
+        metavar='auto|full|BOUNDS',
+        help='Region to deliver. DEFAULT: "auto" — the scanner\'s own ROI from '
+             'Volumes/SubVolumeCoordinates.xml, which is the volume the vendor '
+             'reconstructed, so a run is comparable to it without being asked. '
+             '"full" delivers the whole grid instead. Or give 6 values: '
              'x_min x_max y_min y_max z_min z_max (mm, isocenter-centered). '
-             'When active, --fov-xy and --fov-z are ignored.'
+             'When active, --fov-xy and --fov-z are ignored. On the backends '
+             'that FIT the projections this only crops the OUTPUT (the grid '
+             'comes from --model-domain); on FDK it IS the grid. A scan with '
+             'no SubVolumeCoordinates.xml falls back to the FOV, silently when '
+             'auto was the default and loudly when you asked for it.'
     )
     parser.add_argument(
         '--downsample',
@@ -361,33 +368,42 @@ def _parse_roi_bounds(args, scan_folder, xml_header, required=True):
     fatal where --roi defines the reconstruction grid itself (FDK), since
     silently reconstructing the whole FOV instead is a 6.6x surprise.
     """
-    if args.roi is None:
+    # `--roi` defaults to the scanner's own ROI: that is the volume the vendor
+    # reconstructed and the one every comparison is made against, so delivering
+    # it should not need a flag. `--roi full` is the opt-out.
+    explicit = args.roi is not None
+    spec = args.roi if explicit else ['auto']
+
+    if spec == ['full']:
         return None
-    if args.roi == ['auto']:
+    if spec == ['auto']:
         roi_bounds = parse_crop_boundary(scan_folder, xml_header)
         if roi_bounds is None:
             where = os.path.join(scan_folder, 'Volumes', 'SubVolumeCoordinates.xml')
-            if not required:
-                print(f"\n  --roi auto: no SubVolumeCoordinates.xml at {where}"
-                      f"\n  falling back to saving the full reconstruction volume.")
+            # Falling back is only a SURPRISE when the ROI was asked for. As the
+            # default it is just the old behaviour, so a scan that never had a
+            # scanner ROI (a phantom, say) still runs without a flag.
+            if not required or not explicit:
+                print(f"\n  ROI: no SubVolumeCoordinates.xml at {where} — "
+                      f"falling back to the full FOV volume.")
                 return None
             raise ScanDataError(
                 f"--roi auto: SubVolumeCoordinates.xml not found or invalid "
                 f"(looked in {where}). For this backend the ROI defines the "
                 f"reconstruction grid, so falling back to the full FOV would "
                 f"silently reconstruct a much larger volume; pass explicit "
-                f"--roi bounds or drop --roi.")
+                f"--roi bounds or --roi full.")
         return roi_bounds
-    if len(args.roi) == 6:
-        vals = [float(v) for v in args.roi]
+    if len(spec) == 6:
+        vals = [float(v) for v in spec]
         return {
             'x_min': vals[0], 'x_max': vals[1],
             'y_min': vals[2], 'y_max': vals[3],
             'z_min': vals[4], 'z_max': vals[5],
         }
     raise ConfigError(
-        f"--roi takes 'auto' or exactly 6 values "
-        f"(x_min x_max y_min y_max z_min z_max), got {len(args.roi)}")
+        f"--roi takes 'auto', 'full', or exactly 6 values "
+        f"(x_min x_max y_min y_max z_min z_max), got {len(spec)}")
 
 
 def add_model_domain_args(parser):
@@ -708,8 +724,24 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     # reads detector channels, so it needs the da/db/central_pixel_* that the
     # reconstruction will actually use.
     if use_domain:
+        # MEASURED ON THE LINE INTEGRALS THE MODEL WILL FIT, not on raw counts.
+        # The support is read off an air NOISE FLOOR, and air normalization and
+        # ring correction both move that floor — measuring before them put the
+        # domain a voxel out (radius 40.630 vs 40.705 mm on Scan_1510), which
+        # shifts the grid lattice and so the delivered voxels. muNeRF has always
+        # measured on its preprocessed sinogram; this is that, for the drivers.
+        # Cost is one extra pass, freed immediately (the reconstructor still
+        # owns the preprocessing of the array it trains on).
+        from .preprocessing import preprocess_sinogram
+        line_integrals = preprocess_sinogram(
+            projections, bright_field, dark_field,
+            ring_correction=getattr(args, 'ring_correction', True),
+            air_normalization=getattr(args, 'air_normalization', True),
+            soft_clip_sharpness=getattr(args, 'soft_clip_sharpness', 200.0),
+            ring_median_width=getattr(args, 'ring_median_width', 51))
         domain_bounds, support = resolve_model_domain(
-            args, projections, geometry, bright_field, dark_field)
+            args, line_integrals, geometry, None, None)
+        del line_integrals
         if domain_bounds is not None:
             domain_geom = build_geometry(
                 scan_data['xml_header'],
@@ -726,7 +758,7 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         geometry['export_roi'] = roi_bounds
         if roi_bounds is None:
             print("  export: full reconstruction domain "
-                  "(pass --roi auto to save only the scan's ROI)")
+                  "(no scanner ROI available, or --roi full)")
 
     return ScanContext(
         data_folder=data_folder,

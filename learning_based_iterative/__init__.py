@@ -32,6 +32,8 @@ from .scene import (
     model_domain_from_geometry,
     model_domain_from_spec,
     normalize_to_unit_cube,
+    resolve_export_grid,
+    resolve_export_roi,
 )
 from .ray_sampler import (
     rays_for_projection,
@@ -78,4 +80,5 @@ __all__ = [
     "resolve_amp_dtype", "unwrap_model",
     "LearnedReconstructor",
     "VoxelGrid", "voxel_grid_shape", "VoxelReconstructor",
+    "resolve_export_grid", "resolve_export_roi",
 ]

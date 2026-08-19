@@ -260,6 +260,47 @@ def crop_bounds_to_indices(bounds: dict, geometry: dict):
             span(bounds["z_min"], bounds["z_max"], Nz, oz, dz))
 
 
+def export_grid_geometry(geometry: dict, verbose: bool = False) -> dict:
+    """The geometry of `geometry['export_roi']` as a sub-grid — no array needed.
+
+    The lattice arithmetic of the export crop, separated from the cropping, so
+    that a caller which can EVALUATE its volume at arbitrary points (a learned
+    representation) can render the exported voxels directly instead of
+    materialising the whole reconstruction domain and throwing most of it away.
+    The two must agree voxel for voxel, which is why they share this function
+    rather than each deriving a grid from the ROI bounds: a grid built from the
+    bounds alone is centred on the ROI, while the crop lands on the DOMAIN
+    lattice, and the two are a sub-voxel shift apart.
+
+    `export_roi` is cleared on the way out, exactly as `crop_to_export_roi`
+    clears it: the crop is consumed, so a later call is a no-op.
+    """
+    bounds = geometry.get("export_roi")
+    if not bounds:
+        return geometry
+
+    (i0, i1), (j0, j1), (k0, k1) = crop_bounds_to_indices(bounds, geometry)
+    Nx, Ny, Nz = (int(v) for v in geometry["vol_shape"])
+    ox, oy, oz = (float(v) for v in geometry["vol_origin"])
+    dx, dz = float(geometry["dx"]), float(geometry["dz"])
+
+    out = dict(geometry)
+    out["export_roi"] = None
+    out["vol_shape"] = (i1 - i0, j1 - j0, k1 - k0)
+    out["vol_origin"] = (
+        (ox - Nx * dx / 2.0) + (i0 + (i1 - i0) / 2.0) * dx,
+        (oy - Ny * dx / 2.0) + (j0 + (j1 - j0) / 2.0) * dx,
+        (oz - Nz * dz / 2.0) + (k0 + (k1 - k0) / 2.0) * dz,
+    )
+    if verbose:
+        print(f"\nExport crop: {Nx} x {Ny} x {Nz} -> "
+              f"{out['vol_shape'][0]} x {out['vol_shape'][1]} x "
+              f"{out['vol_shape'][2]}"
+              f"  ({np.prod(out['vol_shape']) / max(1, Nx * Ny * Nz) * 100:.1f}% "
+              f"of the reconstruction domain)")
+    return out
+
+
 def crop_to_export_roi(volume, geometry: dict):
     """Crop an (Nx, Ny, Nz) volume to `geometry['export_roi']`.
 
@@ -274,22 +315,4 @@ def crop_to_export_roi(volume, geometry: dict):
 
     (i0, i1), (j0, j1), (k0, k1) = crop_bounds_to_indices(bounds, geometry)
     vol = np.ascontiguousarray(volume[i0:i1, j0:j1, k0:k1])
-
-    Nx, Ny, Nz = (int(v) for v in geometry["vol_shape"])
-    ox, oy, oz = (float(v) for v in geometry["vol_origin"])
-    dx, dz = float(geometry["dx"]), float(geometry["dz"])
-    out = dict(geometry)
-    # Idempotent: the crop is consumed, so a second call is a no-op. Drivers
-    # crop early (to log what they ship) and save_outputs crops again.
-    out["export_roi"] = None
-    out["vol_shape"] = (i1 - i0, j1 - j0, k1 - k0)
-    out["vol_origin"] = (
-        (ox - Nx * dx / 2.0) + (i0 + (i1 - i0) / 2.0) * dx,
-        (oy - Ny * dx / 2.0) + (j0 + (j1 - j0) / 2.0) * dx,
-        (oz - Nz * dz / 2.0) + (k0 + (k1 - k0) / 2.0) * dz,
-    )
-    print(f"\nExport crop: {Nx} x {Ny} x {Nz} -> "
-          f"{out['vol_shape'][0]} x {out['vol_shape'][1]} x {out['vol_shape'][2]}"
-          f"  ({np.prod(out['vol_shape']) / max(1, Nx * Ny * Nz) * 100:.1f}% of "
-          f"the reconstruction domain)")
-    return vol, out
+    return vol, export_grid_geometry(geometry, verbose=True)

@@ -244,6 +244,79 @@ def model_domain_from_geometry(geometry: dict, *, shape: str = "cylinder",
                        radius_xy=radius, center_xy=(ox, oy), ray_clip=ray_clip)
 
 
+def resolve_export_roi(scan_folder, xml_header, geom_cfg,
+                       verbose: bool = True) -> dict:
+    """What to DELIVER, in isocentre-centred mm — never what to reconstruct.
+
+    The same default and the same source as the drivers' `--roi auto`: the
+    scanner's own ROI from ``Volumes/SubVolumeCoordinates.xml`` when it
+    published one, otherwise the ``fov_xy`` / ``fov_z`` box. `use_scanner_roi`
+    is the config's opt-out, matching `--roi full`.
+    """
+    from pathlib import Path as _Path
+
+    from ..ct_core.scan_setup import parse_crop_boundary
+
+    if bool(geom_cfg.get("use_scanner_roi", True)):
+        crop_xml = _Path(scan_folder) / "Volumes" / "SubVolumeCoordinates.xml"
+        if crop_xml.exists():
+            bounds = parse_crop_boundary(str(scan_folder), xml_header)
+            if bounds is not None:
+                return bounds
+        elif verbose:
+            print(f"  use_scanner_roi=true but {crop_xml} not found — "
+                  f"falling back to fov_xy/fov_z.")
+    hx, hz = float(geom_cfg["fov_xy"]) / 2.0, float(geom_cfg["fov_z"]) / 2.0
+    return {"x_min": -hx, "x_max": hx, "y_min": -hx, "y_max": hx,
+            "z_min": -hz, "z_max": hz}
+
+
+def resolve_export_grid(geometry: dict, xml_header, geom_cfg,
+                        domain_bounds: dict, export_roi: dict,
+                        verbose: bool = True) -> dict:
+    """Reconstruction grid from the measured domain, then the delivered sub-grid.
+
+    Two steps, both the drivers':
+
+      1. the RECONSTRUCTION GRID is the measured domain at the export pitch —
+         `prepare_scan` rebuilds ``vol_shape`` / ``vol_origin`` this way, and a
+         grid derived from anything else is a different lattice;
+      2. the DELIVERED grid is what `crop_to_export_roi` would carve out of it,
+         computed here by `export_grid_geometry` without allocating the domain.
+
+    Step 2 is why a caller that can evaluate its volume at arbitrary points —
+    any learned representation — does not pay for the domain it never ships:
+    it renders the cropped grid directly. The lattice is still the driver's, so
+    the voxels are the same voxels. Deriving the grid from the ROI bounds
+    instead centres it on the ROI and lands a sub-voxel shift off that lattice,
+    which is what muNeRF did until 2026-08-19.
+    """
+    from ..ct_core.scan_setup import build_geometry
+    from ..ct_core.support import export_grid_geometry
+
+    domain_geom = build_geometry(
+        xml_header, geom_cfg["fov_xy"], geom_cfg["fov_z"],
+        geom_cfg["voxel_xy"], geom_cfg["voxel_z"],
+        roi_bounds=domain_bounds, verbose=False)
+    out = dict(geometry)
+    out["vol_shape"] = domain_geom["vol_shape"]
+    out["vol_origin"] = domain_geom["vol_origin"]
+    out["model_domain"] = domain_bounds
+    out["export_roi"] = export_roi
+    if verbose:
+        Nx, Ny, Nz = out["vol_shape"]
+        print(f"  Reconstruction grid: {Nx} x {Ny} x {Nz} = "
+              f"{Nx * Ny * Nz / 1e6:.1f} M voxels (the measured domain)")
+    out = export_grid_geometry(out, verbose=verbose)
+    if verbose:
+        Nx, Ny, Nz = out["vol_shape"]
+        ox, oy, oz = out["vol_origin"]
+        print(f"  Export grid: {Nx} x {Ny} x {Nz} at origin "
+              f"({ox:.3f}, {oy:.3f}, {oz:.3f}) mm, "
+              f"{out['dx']:.4f} / {out['dz']:.4f} mm voxels")
+    return out
+
+
 def build_scene(sinogram, angles, xml_header, *, scan_name, scan_folder,
                 raw_detector_shape, geom_cfg, model_domain_cfg=None,
                 downsample: int = 1, cor_mode: str = "center",
@@ -281,25 +354,25 @@ def build_scene(sinogram, angles, xml_header, *, scan_name, scan_folder,
 
     from ..ct_core.detector_psi import resolve_detector_psi
     from ..ct_core.pipeline import build_scan_geometry
-    from ..ct_core.scan_setup import parse_crop_boundary
     from .detector_warp import resolve_detector_warp
 
-    roi_bounds = None
-    if use_scanner_roi:
-        from pathlib import Path as _Path
-        crop_xml = _Path(scan_folder) / "Volumes" / "SubVolumeCoordinates.xml"
-        if crop_xml.exists():
-            roi_bounds = parse_crop_boundary(str(scan_folder), xml_header)
-        elif verbose:
-            print(f"  use_scanner_roi=true but {crop_xml} not found — "
-                  f"falling back to fov_xy/fov_z.")
+    # What to DELIVER. `use_scanner_roi: false` is the config's `--roi full`.
+    export_roi = resolve_export_roi(
+        scan_folder, xml_header,
+        dict(geom_cfg, use_scanner_roi=use_scanner_roi), verbose=verbose)
 
+    # PROVISIONAL grid. It exists only to carry the detector parameters into
+    # the support measurement and is replaced below by the measured domain —
+    # the same two-step `ct_core.pipeline.prepare_scan` runs, so a learned run
+    # started from a config and one started from the CLI build one grid, not
+    # two. (The support measurement reads da/db/central_pixel_* only, never
+    # vol_shape, so the provisional extent cannot influence it.)
     geometry = build_scan_geometry(
         xml_header, raw_detector_shape=raw_detector_shape,
         fov_xy=geom_cfg["fov_xy"], fov_z=geom_cfg["fov_z"],
         voxel_xy=geom_cfg["voxel_xy"], voxel_z=geom_cfg["voxel_z"],
-        roi_bounds=roi_bounds, cor_mode=cor_mode, downsample=downsample,
-        verbose=verbose)
+        roi_bounds=None, cor_mode=cor_mode, downsample=downsample,
+        verbose=False)
 
     ds = int(downsample)
     geometry["detector_warp"] = resolve_detector_warp(
@@ -345,6 +418,14 @@ def build_scene(sinogram, angles, xml_header, *, scan_name, scan_folder,
             "z_min": lo[2], "z_max": hi[2]}
         if model_domain_cfg is not None:
             model_domain_cfg["resolved_bounds"] = md_cfg["resolved_bounds"]
+
+    _lo, _hi = domain.aabb_min.tolist(), domain.aabb_max.tolist()
+    geometry = resolve_export_grid(
+        geometry, xml_header, geom_cfg,
+        domain_bounds={"x_min": _lo[0], "x_max": _hi[0],
+                       "y_min": _lo[1], "y_max": _hi[1],
+                       "z_min": _lo[2], "z_max": _hi[2]},
+        export_roi=export_roi, verbose=verbose)
 
     return Scene(sinogram=_torch.as_tensor(sinogram),
                  angles=_torch.as_tensor(angles),
