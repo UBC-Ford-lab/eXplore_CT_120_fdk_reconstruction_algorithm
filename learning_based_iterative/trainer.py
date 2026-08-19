@@ -91,10 +91,7 @@ from .scene import Scene, model_domain_from_geometry
 from .training import (autocast_ctx, build_optimizer, clip_grad_norm,
                        lr_multiplier, maybe_compile_model, project_nonneg,
                        resolve_amp_dtype, unwrap_model)
-
-#: Voxels evaluated per chunk by the default `export_volume`. Sized so a chunk
-#: of query coordinates stays well under a GiB at fp32 (3 floats in, 1-2 out).
-EXPORT_CHUNK = 1 << 22
+from .volume import EXPORT_CHUNK, render_volume  # noqa: F401 (EXPORT_CHUNK re-exported)
 
 
 class LearnedReconstructor:
@@ -404,51 +401,16 @@ class LearnedReconstructor:
     def export_volume(self, model, domain, device) -> np.ndarray:
         """Volume (Nx, Ny, Nz) of mu in mm^-1 over the EXPORT grid.
 
-        DEFAULT: evaluate the model at every export voxel centre, in chunks.
-        Correct for any representation, including one whose own grid is a
-        different pitch or a larger domain — which is the usual case once the
-        domain hook is in use. A backend whose parameters ARE the export grid
-        should override this and return them directly: resampling a grid onto
-        itself is a needless trilinear pass.
-
-        Multi-channel models are summed over channels, which is the
-        (a1 + a2) -> mu(e_ref) convention the polychromatic renderer uses.
+        DEFAULT: evaluate the model at every export voxel centre, in chunks —
+        ``volume.render_volume``, the same call any diagnostic or export path
+        makes, so a shipped volume and a mid-training render of it cannot
+        disagree. A backend whose parameters ARE the export grid should
+        override this and return them directly: resampling a grid onto itself
+        is a needless trilinear pass.
         """
         if self._export_fn is not None:
             return self._export_fn(model, self.geometry, domain, device)
-
-        geo = self.geometry
-        Nx, Ny, Nz = (int(v) for v in geo["vol_shape"])
-        ox, oy, oz = (float(v) for v in geo["vol_origin"])
-        dx, dz = float(geo["dx"]), float(geo["dz"])
-        xs = (torch.arange(Nx, dtype=torch.float32) - (Nx - 1) / 2.0) * dx + ox
-        ys = (torch.arange(Ny, dtype=torch.float32) - (Ny - 1) / 2.0) * dx + oy
-        zs = (torch.arange(Nz, dtype=torch.float32) - (Nz - 1) / 2.0) * dz + oz
-
-        out = torch.empty((Nx, Ny, Nz), dtype=torch.float32)
-        # Slab in z so one chunk is a whole number of xy planes — contiguous in
-        # the output and cheap to index.
-        per_plane = Nx * Ny
-        n_planes = max(1, min(Nz, EXPORT_CHUNK // max(1, per_plane)))
-        gx, gy = torch.meshgrid(xs, ys, indexing="ij")
-        was_training = unwrap_model(model).training
-        unwrap_model(model).eval()
-        with torch.no_grad():
-            for z0 in range(0, Nz, n_planes):
-                z1 = min(z0 + n_planes, Nz)
-                zc = zs[z0:z1]
-                pts = torch.stack([
-                    gx[..., None].expand(-1, -1, z1 - z0),
-                    gy[..., None].expand(-1, -1, z1 - z0),
-                    zc.view(1, 1, -1).expand(Nx, Ny, -1),
-                ], dim=-1).reshape(-1, 3).to(device)
-                vals = model(domain.normalize(pts))
-                if vals.ndim == 2 and vals.shape[-1] > 1:
-                    vals = vals.sum(dim=-1)
-                out[:, :, z0:z1] = vals.reshape(Nx, Ny, z1 - z0).float().cpu()
-        if was_training:
-            unwrap_model(model).train()
-        return np.ascontiguousarray(out.numpy(), dtype=np.float32)
+        return render_volume(model, self.geometry, domain, device=device)
 
     # ------------------------------------------------------------------ setup
 
