@@ -171,10 +171,34 @@ learning_based_iterative/   reconstruction as optimization (autograd)
   ├─ ray_sampler.py             muNeRF's inr_pipeline imports these from here
   ├─ renderer.py                rather than duplicating them)
   ├─ detector_warp.py           per-pixel detector distortion → ray geometry
+  ├─ training.py                precision / per-group LRs / model compile /
+  │                             grad clipping (CANONICAL — muNeRF's train.py
+  │                             translates its config into these, and keeps
+  │                             no copy of any of them)
+  ├─ trainer.py                 LearnedReconstructor — THE LOOP, independent
+  │                             of the representation
   └─ voxel/                     dense voxel grid (SIRT's representation)
       ├─ model.py                   VoxelGrid + grid-shape rules
-      └─ reconstructor.py           Adam + MSE trainer (backend contract)
+      └─ reconstructor.py           the loop's three hooks, answered (96 lines)
 ```
+
+A learning-based backend is only the three answers the loop cannot guess:
+
+| hook | default | override when |
+|---|---|---|
+| `build_model(domain, device)` | none — the loop refuses to guess | always |
+| `build_domain()` | integration domain **==** export FOV | rays cross matter outside the FOV (a scan bed, a holder, the specimen beyond the ROI in z) — that attenuation has to be in the model or it lands in the loss as a residual no volume can explain |
+| `export_volume(model, domain, device)` | evaluate the model at every export voxel centre | the parameters already ARE the export grid, where resampling can only lose sharpness |
+
+Supply each by subclassing (a permanent backend, like `voxel/`) or by passing
+`model_fn=` / `domain_fn=` / `export_fn=` to the constructor (an injected
+experimental model, which is what muNeRF does).
+
+A caller may also own more than the representation — its data, its objective,
+its schedule, its diagnostics. Those are hooks too, so the loop never grows a
+branch per caller: `scene=`, `loss_fn=` + `sampler_fn=`, `stages=`,
+`extra_loss_fn=`, `on_iter=`, `on_eval=`, `lr_plateau=`. See
+`trainer.py`'s docstring for the signatures.
 
 Backend contract: consume `ScanContext.projections` (raw counts,
 `(N_angles, N_b, N_a)`), `.angles` (radians, FDK convention), `.geometry`

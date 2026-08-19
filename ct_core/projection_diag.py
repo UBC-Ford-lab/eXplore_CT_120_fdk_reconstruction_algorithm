@@ -569,3 +569,80 @@ def power_spectrum_figure(pred, target, det_px_mm: float,
         "top", functions=(lambda x: x * det_px_mm, lambda x: x / det_px_mm))
     ax2.set_xlabel("cycles/pixel", fontsize=8)
     return fig
+
+
+#: SSIM's Gaussian window; a scored plane must be at least this on both axes.
+SSIM_WINDOW = 11
+
+
+def noise_ceiling_all_angles(sino_a, sino_b, *, stride: int = 1,
+                             window=None, verbose: bool = True) -> dict:
+    """The noise ceiling averaged over EVERY view, not just the eval angle.
+
+    ``measure_noise_ceiling`` scores one projection, which is enough to put a
+    line on a plot but is a single sample of a quantity that varies with view:
+    the ceiling depends on how much attenuation a given angle sees, so a lateral
+    view and an AP view do not share it. Averaging over all of them gives the
+    number a run should actually be compared against, and the spread says how
+    meaningful the comparison is.
+
+    Both arguments are PREPROCESSED sinograms (A, N_b, N_a) of the same scan
+    measured twice — in practice two acquisition phases. With b = s+n and
+    b' = s+n' independent, E[(b-b')^2] = 2*sigma^2, so the best mean-squared
+    error any model can honestly reach is ``0.5 * mean((b-b')^2)``; that is the
+    ``mse_floor`` returned here, in the sinogram's own units.
+
+    ``stride`` subsamples the detector the way a diagnostic render does, so the
+    ceiling is measured on the same grid the model is scored on — SSIM is not
+    invariant to resolution, and a ceiling computed at full resolution would
+    not be comparable to a downsampled diagnostic. ``window`` is an optional
+    ``(b0, b1, a0, a1)`` crop, for scoring only the detector region whose rays
+    stay inside the reconstruction domain.
+
+    Returns ``{ssim, ssim_std, psnr, psnr_std, mse_floor, n_angles}``.
+    """
+    import numpy as np
+    import torch
+
+    a = torch.as_tensor(np.asarray(sino_a))
+    b = torch.as_tensor(np.asarray(sino_b))
+    if a.shape != b.shape:
+        raise ValueError(f"the two sinograms differ in shape: "
+                         f"{tuple(a.shape)} vs {tuple(b.shape)}")
+    if window is not None:
+        b0, b1, a0, a1 = (int(v) for v in window)
+        a, b = a[:, b0:b1, a0:a1], b[:, b0:b1, a0:a1]
+    if stride > 1:
+        a, b = a[:, ::stride, ::stride], b[:, ::stride, ::stride]
+
+    # SSIM convolves an 11x11 window, so a plane smaller than that fails deep
+    # inside conv2d with an unhelpful message. Say which knob did it instead —
+    # an over-aggressive diagnostic stride is the usual cause.
+    if min(a.shape[1], a.shape[2]) < SSIM_WINDOW:
+        raise ValueError(
+            f"the scored plane is {a.shape[1]}x{a.shape[2]}, smaller than "
+            f"SSIM's {SSIM_WINDOW}x{SSIM_WINDOW} window — stride={stride} "
+            f"(and any window=) leaves too little detector to score.")
+
+    ssims, psnrs = [], []
+    for i in range(a.shape[0]):
+        pa, pb = a[i].float(), b[i].float()
+        dr = float(pa.max() - pa.min())
+        if dr <= 0:
+            continue                       # a blank view carries no ceiling
+        ssims.append(float(ssim_2d(pa, pb, data_range=dr)))
+        psnrs.append(float(psnr_2d(pa, pb, data_range=dr)))
+    if not ssims:
+        return {"ssim": None, "ssim_std": None, "psnr": None, "psnr_std": None,
+                "mse_floor": None, "n_angles": 0}
+
+    mse_floor = 0.5 * float(((a.float() - b.float()) ** 2).mean())
+    out = {"ssim": float(np.mean(ssims)), "ssim_std": float(np.std(ssims)),
+           "psnr": float(np.mean(psnrs)), "psnr_std": float(np.std(psnrs)),
+           "mse_floor": mse_floor, "n_angles": len(ssims)}
+    if verbose:
+        print(f"[noise-ceiling] {out['n_angles']} angles: "
+              f"ssim={out['ssim']:.4f}+-{out['ssim_std']:.4f}  "
+              f"psnr={out['psnr']:.2f}+-{out['psnr_std']:.2f} dB  "
+              f"mse floor={mse_floor:.6e}")
+    return out

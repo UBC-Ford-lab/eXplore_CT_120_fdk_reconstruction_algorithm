@@ -143,6 +143,86 @@ def normalize_to_unit_cube(xyz_mm: torch.Tensor, scene: Scene) -> torch.Tensor:
     return scene.model_domain.normalize(xyz_mm)
 
 
+#: What `model_domain_from_spec` accepts, besides an (extent_xy, half_z) pair.
+DOMAIN_SPECS = ("auto", "off")
+
+
+def model_domain_from_bounds(bounds: dict, *, shape: str = "cylinder",
+                             ray_clip: str = "domain") -> ModelDomain:
+    """A ModelDomain from ct_core's bounds dict (x_min/x_max/.../z_max, mm).
+
+    The one conversion between the submodule's bounds representation — which
+    is what ``build_geometry`` takes as ``roi_bounds`` and what
+    ``ct_core.support`` produces — and the renderer's domain object. Bounds may
+    be asymmetric in z (nothing forces symmetry there and the saving is real);
+    the cylinder axis is placed at the bounds' own xy centre.
+    """
+    if ray_clip not in ("domain", "aabb"):
+        raise ValueError(
+            f"ray_clip must be 'domain' or 'aabb', got {ray_clip!r}")
+    lo = [float(bounds["x_min"]), float(bounds["y_min"]), float(bounds["z_min"])]
+    hi = [float(bounds["x_max"]), float(bounds["y_max"]), float(bounds["z_max"])]
+    cx, cy = (lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0
+    radius = min(hi[0] - lo[0], hi[1] - lo[1]) / 2.0 if shape == "cylinder" else None
+    return ModelDomain(shape=shape,
+                       aabb_min=torch.tensor(lo, dtype=torch.float32),
+                       aabb_max=torch.tensor(hi, dtype=torch.float32),
+                       radius_xy=radius, center_xy=(cx, cy), ray_clip=ray_clip)
+
+
+def model_domain_from_spec(spec, *, geometry: dict, projections=None,
+                           bright_field=None, dark_field=None,
+                           shape: str = "cylinder", ray_clip: str = "domain",
+                           verbose: bool = True) -> ModelDomain:
+    """Resolve a domain the way every learned backend resolves it.
+
+    `spec` mirrors the drivers' ``--model-domain``:
+
+      * ``'auto'`` (recommended) — MEASURE the attenuating support from the
+        projections and clamp it to the detector fan and the cone reach. This
+        is a fact about what the rays crossed, so it sizes itself per scan and
+        needs no hand-computed extents.
+      * ``(extent_xy, half_z)`` — pin it, in muNeRF's config units.
+      * ``'off'`` — the export FOV, i.e. domain == saved volume. Correct ONLY
+        when nothing outside the FOV attenuates. Otherwise the missing
+        attenuation becomes a low-frequency cup across the whole
+        reconstruction (~96 HU of DC bias measured on Scan_1510) rather than a
+        boundary artifact — see ``ct_core.support``.
+
+    `projections` are raw counts when `bright_field`/`dark_field` are given, or
+    line integrals when they are not — so a caller holding an already
+    preprocessed sinogram passes it directly and omits the fields.
+    """
+    from ..ct_core.support import (explicit_domain_bounds,
+                                   measure_attenuating_support,
+                                   support_to_domain_bounds)
+    if isinstance(spec, (list, tuple)) and len(spec) == 2:
+        bounds = explicit_domain_bounds(float(spec[0]), float(spec[1]))
+        if verbose:
+            print(f"Model domain pinned: extent_xy {float(spec[0]):.1f} mm, "
+                  f"half_extent_z {float(spec[1]):.1f} mm")
+        return model_domain_from_bounds(bounds, shape=shape, ray_clip=ray_clip)
+
+    text = str(spec).strip().lower()
+    if text == "off":
+        return model_domain_from_geometry(geometry, shape=shape,
+                                         ray_clip=ray_clip)
+    if text != "auto":
+        raise ValueError(
+            f"model domain spec must be 'auto', 'off', or (extent_xy, half_z), "
+            f"got {spec!r}")
+    if projections is None:
+        raise ValueError(
+            "model domain 'auto' measures the support from the projections — "
+            "pass projections= (raw counts with bright/dark, or line "
+            "integrals without).")
+    support = measure_attenuating_support(
+        projections, geometry, bright_field=bright_field,
+        dark_field=dark_field, verbose=verbose)
+    return model_domain_from_bounds(support_to_domain_bounds(support),
+                                    shape=shape, ray_clip=ray_clip)
+
+
 def model_domain_from_geometry(geometry: dict, *, shape: str = "cylinder",
                                ray_clip: str = "domain") -> ModelDomain:
     """A ModelDomain covering exactly the export ROI of a ct_core geometry.
@@ -162,3 +242,111 @@ def model_domain_from_geometry(geometry: dict, *, shape: str = "cylinder",
     radius = min(hx, hy) if shape == "cylinder" else None
     return ModelDomain(shape=shape, aabb_min=aabb_min, aabb_max=aabb_max,
                        radius_xy=radius, center_xy=(ox, oy), ray_clip=ray_clip)
+
+
+def build_scene(sinogram, angles, xml_header, *, scan_name, scan_folder,
+                raw_detector_shape, geom_cfg, model_domain_cfg=None,
+                downsample: int = 1, cor_mode: str = "center",
+                use_scanner_roi: bool = True, calib_dir=None,
+                verbose: bool = True) -> Scene:
+    """A ready-to-render `Scene` from a preprocessed sinogram and the header.
+
+    The whole front end of a learning-based run, in the order the pieces
+    depend on each other, and all of it the submodule's:
+
+      1. the volume grid + centre-of-rotation policy + pitch rescale
+         (``ct_core.pipeline.build_scan_geometry``), optionally cropped to the
+         scanner's own ROI when it published one;
+      2. the per-pixel detector warp, keyed by detector serial
+         (``detector_warp.resolve_detector_warp``);
+      3. the in-plane detector rotation psi
+         (``ct_core.detector_psi.resolve_detector_psi``) — AFTER the warp,
+         because the estimator corrects for it, and after the pitch rescale,
+         because it works in pooled index units;
+      4. the integration domain (``model_domain_from_spec``), measured from
+         this same sinogram unless it is pinned.
+
+    Nothing here needs the raw projections, so a caller holding a cached
+    sinogram never re-reads the scan. `geom_cfg` is the same geometry-config
+    dict `resolve_detector_psi` and `resolve_detector_warp` already take.
+
+    Order matters twice, and both were bugs once: psi must be resolved after
+    da/db have been scaled by the binning factor, and the domain must be
+    resolved after psi, because the support measurement reads detector
+    channels through the geometry.
+    """
+    import math
+
+    import torch as _torch
+
+    from ..ct_core.detector_psi import resolve_detector_psi
+    from ..ct_core.pipeline import build_scan_geometry
+    from ..ct_core.scan_setup import parse_crop_boundary
+    from .detector_warp import resolve_detector_warp
+
+    roi_bounds = None
+    if use_scanner_roi:
+        from pathlib import Path as _Path
+        crop_xml = _Path(scan_folder) / "Volumes" / "SubVolumeCoordinates.xml"
+        if crop_xml.exists():
+            roi_bounds = parse_crop_boundary(str(scan_folder), xml_header)
+        elif verbose:
+            print(f"  use_scanner_roi=true but {crop_xml} not found — "
+                  f"falling back to fov_xy/fov_z.")
+
+    geometry = build_scan_geometry(
+        xml_header, raw_detector_shape=raw_detector_shape,
+        fov_xy=geom_cfg["fov_xy"], fov_z=geom_cfg["fov_z"],
+        voxel_xy=geom_cfg["voxel_xy"], voxel_z=geom_cfg["voxel_z"],
+        roi_bounds=roi_bounds, cor_mode=cor_mode, downsample=downsample,
+        verbose=verbose)
+
+    ds = int(downsample)
+    geometry["detector_warp"] = resolve_detector_warp(
+        geom_cfg, scan_folder, raw_detector_shape, downsample=ds)
+
+    psi_deg = resolve_detector_psi(
+        geom_cfg, geometry, sinogram=sinogram, angles=angles,
+        scan_folder=scan_folder, warp=geometry["detector_warp"], downsample=ds,
+        calib_dir=calib_dir, verbose=verbose)
+    geometry["det_psi_rad"] = math.radians(psi_deg)
+    # Always recorded, whatever the mode, so a geometry term this large can
+    # never again be silently wrong the way psi = 0 was for months.
+    geometry["det_psi_deg"] = float(psi_deg)
+    if psi_deg and verbose:
+        print(f"  Detector in-plane rotation: psi = {psi_deg:+.4f} deg")
+
+    md_cfg = dict(model_domain_cfg or {})
+    resolved = md_cfg.get("resolved_bounds")
+    shape = str(md_cfg.get("shape", "cylinder"))
+    ray_clip = str(md_cfg.get("ray_clip", "domain")).lower()
+    if resolved is not None:
+        domain = model_domain_from_bounds(resolved, shape=shape,
+                                          ray_clip=ray_clip)
+    else:
+        if bool(md_cfg.get("auto", True)):
+            spec = "auto"
+        else:
+            exy, hez = md_cfg.get("extent_xy"), md_cfg.get("half_extent_z")
+            spec = ((float(exy), float(hez))
+                    if exy is not None and hez is not None else "off")
+        domain = model_domain_from_spec(
+            spec, geometry=geometry,
+            projections=(sinogram.numpy() if hasattr(sinogram, "numpy")
+                         else sinogram),
+            shape=shape, ray_clip=ray_clip, verbose=verbose)
+        lo, hi = domain.aabb_min.tolist(), domain.aabb_max.tolist()
+        # A measured domain must be reproducible without the projections: an
+        # INR's coordinate normalisation IS its domain, so inference that
+        # resolved a different one would sample the wrong field. Stamped back
+        # into the caller's dict, it travels with the checkpoint's config.
+        md_cfg["resolved_bounds"] = {
+            "x_min": lo[0], "x_max": hi[0], "y_min": lo[1], "y_max": hi[1],
+            "z_min": lo[2], "z_max": hi[2]}
+        if model_domain_cfg is not None:
+            model_domain_cfg["resolved_bounds"] = md_cfg["resolved_bounds"]
+
+    return Scene(sinogram=_torch.as_tensor(sinogram),
+                 angles=_torch.as_tensor(angles),
+                 geometry=geometry, scan_name=scan_name,
+                 model_domain=domain)

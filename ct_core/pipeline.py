@@ -588,6 +588,45 @@ def apply_cor_policy(geometry: dict, n_b: int, n_a: int,
     return geometry
 
 
+def build_scan_geometry(xml_header, *, raw_detector_shape, fov_xy, fov_z,
+                        voxel_xy, voxel_z, roi_bounds=None,
+                        cor_mode: str = "center", downsample: int = 1,
+                        verbose: bool = True) -> dict:
+    """The geometry dict, from the scan header and the DETECTOR SHAPE alone.
+
+    Everything `prepare_scan` does to a geometry, minus anything that needs
+    the projection pixels — so a caller that already holds a preprocessed
+    sinogram (muNeRF, whose cache lets it skip loading entirely) gets exactly
+    the geometry the drivers get, without re-reading the scan.
+
+    Three steps that must stay together and in this order:
+
+    1. ``build_geometry`` — the volume grid, from the FOV or an explicit ROI.
+    2. ``apply_cor_policy`` on the RAW detector dimensions. The rotation axis
+       sits at the centre of the PHYSICAL panel, so the raw shape has to be
+       the untrimmed one: average pooling discards up to ``downsample - 1``
+       trailing rows, and deriving the centre from what survived puts the axis
+       at 382.0 pooled where the panel centre is 382.1667 — a sixth of a
+       pooled row of disagreement, appearing only at ds > 1.
+    3. the pixel pitch scales UP by the binning factor. The central-pixel
+       indices were already converted in step 2, which is why this comes
+       after and not before.
+    """
+    geometry = build_geometry(xml_header, fov_xy, fov_z, voxel_xy, voxel_z,
+                              roi_bounds=roi_bounds, verbose=verbose)
+    n_b, n_a = (int(v) for v in raw_detector_shape)
+    ds = max(1, int(downsample))
+    apply_cor_policy(geometry, n_b, n_a, cor_mode=cor_mode, downsample=ds)
+    if ds > 1:
+        geometry["da"] = float(geometry["da"]) * ds
+        geometry["db"] = float(geometry["db"]) * ds
+    # Carried on the geometry so every consumer (the detector warp, the psi
+    # estimators, the diagnostics) can convert between raw and pooled indices
+    # without being told the factor separately.
+    geometry["sinogram_downsample"] = ds
+    return geometry
+
+
 def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
     """Run the algorithm-independent front half of every reconstruction.
 
@@ -634,25 +673,26 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
         bright_field=bright_field, dark_field=dark_field,
         measure=(roi_bounds is None and not use_domain))
 
-    geometry = build_geometry(
+    factor = int(getattr(args, 'downsample', 1) or 1)
+    # Grid + CoR policy + the pitch rescale, in one shared call — so muNeRF,
+    # which holds a cached sinogram and never comes through here, runs
+    # literally the same arithmetic.
+    geometry = build_scan_geometry(
         scan_data['xml_header'],
-        fov_xy, fov_z, args.voxel_xy, args.voxel_z,
+        raw_detector_shape=(projections.shape[1], projections.shape[2]),
+        fov_xy=fov_xy, fov_z=fov_z,
+        voxel_xy=args.voxel_xy, voxel_z=args.voxel_z,
         roi_bounds=None if use_domain else roi_bounds,
+        cor_mode=getattr(args, 'cor_mode', 'center'),
+        downsample=factor,
         # Under a model domain this grid is provisional — it exists only to
         # carry the detector parameters into the support measurement, and is
         # replaced below. Printing it would advertise a volume nobody uses.
         verbose=not use_domain,
     )
 
-    # CoR policy + the raw -> pooled index conversion, in one call, so muNeRF
-    # (which pools its own sinogram) runs literally the same arithmetic.
-    factor = int(getattr(args, 'downsample', 1) or 1)
-    apply_cor_policy(geometry, projections.shape[1], projections.shape[2],
-                     cor_mode=getattr(args, 'cor_mode', 'center'),
-                     downsample=factor)
-
-    # Optional detector downsampling (average pooling): the pixel pitch scales
-    # UP by the factor. The central-pixel indices were already converted above.
+    # Optional detector downsampling (average pooling) of the PIXELS. The
+    # geometry side of it was handled above.
     if factor > 1:
         print(f"\nDownsampling projections by factor {factor}...")
         original_shape = projections.shape
@@ -662,8 +702,6 @@ def prepare_scan(args, fit_domain: bool = False) -> ScanContext:
             bright_field = downsample_projections(bright_field, factor)
         if dark_field is not None:
             dark_field = downsample_projections(dark_field, factor)
-        geometry['da'] *= factor
-        geometry['db'] *= factor
 
     # ---- reconstruction domain (fitting backends only) --------------------
     # Deliberately AFTER downsampling and the COR policy: the measurement

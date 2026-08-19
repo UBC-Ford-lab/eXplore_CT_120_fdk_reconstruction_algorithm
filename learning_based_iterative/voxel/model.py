@@ -22,17 +22,36 @@ def voxel_grid_shape(model_domain_cfg: dict, voxel_mm) -> tuple[int, int, int]:
     Derived from ``cfg['model_domain']`` ONLY — never from the runtime scene —
     so `build_model(cfg)` stays a pure function of the config and `infer.py`
     can reconstruct the identical shape for `load_state_dict` without loading
-    a sinogram. Mirrors `dataset._build_model_domain`'s manual branch; `auto`
-    is rejected because its extents come from the scan geometry.
+    a sinogram.
+
+    Three sources, in order:
+
+    * ``resolved_bounds`` — what a MEASURED domain (``auto``) wrote back once it
+      was resolved. This is the normal path: the domain is measured from the
+      projections when the scene loads, stamped into the config, and read here
+      and by inference, so all three agree by construction.
+    * ``half_extent`` or ``extent_xy`` + ``half_extent_z`` — a pinned domain.
+    * neither, with ``auto`` still set — an error, because the measurement has
+      not happened yet and a grid shape guessed from the export ROI would not
+      match the one training used.
 
     ``voxel_mm`` is a scalar or [vx, vy, vz] in mm.
     """
     cfg = model_domain_cfg or {}
-    if bool(cfg.get("auto", True)):
+    rb = cfg.get("resolved_bounds")
+    if rb is not None:
+        hx = (float(rb["x_max"]) - float(rb["x_min"])) / 2.0
+        hy = (float(rb["y_max"]) - float(rb["y_min"])) / 2.0
+        hz = (float(rb["z_max"]) - float(rb["z_min"])) / 2.0
+        return _tile(hx, hy, hz, voxel_mm)
+    if bool(cfg.get("auto", True)) and cfg.get("half_extent") is None \
+            and cfg.get("extent_xy") is None:
         raise ValueError(
-            "model.type: voxel requires model_domain.auto: false with explicit "
-            "extents — the grid shape must be derivable from the config alone "
-            "so inference can rebuild it without the scene.")
+            "model.type: voxel needs the domain to be known before the grid is "
+            "built. With model_domain.auto the domain is MEASURED when the "
+            "scene loads and written back as `resolved_bounds`; this call "
+            "happened first, or the config predates the measurement. Load the "
+            "scene before building the model, or pin extent_xy/half_extent_z.")
     he = cfg.get("half_extent")
     if he is not None:
         hx, hy, hz = (float(he[0]), float(he[1]), float(he[2]))
@@ -45,6 +64,11 @@ def voxel_grid_shape(model_domain_cfg: dict, voxel_mm) -> tuple[int, int, int]:
         hx = hy = float(exy) / 2.0
         hz = float(hez)
 
+    return _tile(hx, hy, hz, voxel_mm)
+
+
+def _tile(hx: float, hy: float, hz: float, voxel_mm) -> tuple[int, int, int]:
+    """(Dz, Hy, Wx) covering half-extents (hx, hy, hz) at pitch ``voxel_mm``."""
     v = [float(voxel_mm)] * 3 if not isinstance(voxel_mm, (list, tuple)) \
         else [float(x) for x in voxel_mm]
     if min(v) <= 0:
