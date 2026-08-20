@@ -117,7 +117,8 @@ def _wiener_factory(*, wiener_kernel=None, wiener_weight=1.0, **_):
 
 
 def _sart_factory(*, chord_state=None, sart_floor_frac=1e-3,
-                  sart_clamp_lo=0.25, sart_clamp_hi=4.0, **_):
+                  sart_clamp_lo=0.25, sart_clamp_hi=4.0,
+                  sart_reduction="mean", **_):
     """SART/SIRT row weighting: R = diag(1/L_i).
 
     Needs ``chord_state`` — a dict the sampler refreshes with this batch's row
@@ -125,6 +126,12 @@ def _sart_factory(*, chord_state=None, sart_floor_frac=1e-3,
     not of the loss, and it changes every step. The indirection keeps the
     registry's uniform ``(pred, target)`` contract instead of giving this one
     term a wider signature that every trainer would have to special-case.
+
+    ``sart_reduction`` selects the mean (default, MSE-scaled — a learning rate
+    transfers to and from ``mse``) or the sum (the classical misfit, whose
+    gradient is exactly ``-A^T R r``). ``--emulate-sart`` sets the sum, because
+    only then does the C preconditioner's absolute scale make ``lambda = 1``
+    one classical update.
 
     See ``learning_based_iterative.sart`` for what R is and for why L is measured
     over the object ROI rather than the full model domain.
@@ -144,7 +151,8 @@ def _sart_factory(*, chord_state=None, sart_floor_frac=1e-3,
                 "chord_state['chord'] before the loss is evaluated.")
         loss, _w = sart_weighted_mse(
             pred, target, chord, floor_frac=sart_floor_frac,
-            w_clamp_lo=sart_clamp_lo, w_clamp_hi=sart_clamp_hi)
+            w_clamp_lo=sart_clamp_lo, w_clamp_hi=sart_clamp_hi,
+            reduction=sart_reduction)
         return loss
     return _fn
 

@@ -136,12 +136,23 @@ Examples:
     parser.add_argument(
         '--patience',
         type=int,
-        default=3,
+        default=None,
         metavar='P',
-        help='Early stopping patience: stop if SSIM does not improve for P '
-             'consecutive eval checkpoints (default: 3, i.e. 30 iters at '
-             'eval-every=10). Use a large value to disable early stopping '
+        help='Early stopping patience: stop if the metric does not improve for '
+             'P consecutive eval checkpoints. Default: a quarter of this '
+             "run's evaluations (floor 8), so the rule means the same thing "
+             'at any --iterations / --eval-every instead of getting stricter '
+             'as runs get longer. Use a large value to disable early stopping '
              'while keeping metric logging.'
+    )
+    parser.add_argument(
+        '--min-stop-iter',
+        type=int,
+        default=None,
+        metavar='N',
+        help='No stopping rule may fire before iteration N (default: half the '
+             'scheduled iterations; pass 0 to disable). Stopping late costs '
+             'only wall-clock, since the best iterate is restored either way.'
     )
     parser.add_argument(
         '--stop-metric',
@@ -226,16 +237,33 @@ Examples:
     parser.add_argument(
         '--lmbda',
         type=float,
-        default=0.5,
-        help='Relaxation parameter (default: 0.5, TIGRE only). '
-             'Lower values give smoother convergence and fewer streak artifacts.'
+        default=1.0,
+        help='Relaxation parameter lambda (default: 1.0, TIGRE only) — the '
+             'step size in x <- x + lambda C A^T R (b - A x). SIRT converges '
+             'for any lambda in (0, 2) because the iteration matrix C A^T R A '
+             'has spectral radius <= 1, and 1.0 is the unrelaxed textbook '
+             'choice (also TIGRE\'s own default). Lower values give a smoother '
+             'trajectory and fewer early streaks in exchange for roughly '
+             'proportionally more iterations. Consider lambda < 1 for the '
+             'ORDERED-SUBSET methods (ossart, sart), whose per-block updates '
+             'are noisy enough to orbit the solution at full relaxation; '
+             'full-batch sirt has no such problem.'
     )
     parser.add_argument(
         '--lmbda-red',
         type=float,
-        default=0.97,
-        help='Relaxation reduction factor per iteration (default: 0.97, TIGRE only). '
-             'Lambda decays as lmbda * lmbda_red^iter, annealing toward zero.'
+        default=1.0,
+        help='Relaxation reduction factor per iteration (default: 1.0 = NO '
+             'decay, TIGRE only; also TIGRE\'s own default). Lambda decays as '
+             'lmbda * lmbda_red^iter. Beware what a geometric decay does to a '
+             'long run: at the old 0.97 default lambda is 0.05x its start by '
+             'iteration 100 and 0.002x by 200, so the total update budget is '
+             'sum(lambda_k) = lmbda/(1 - lmbda_red) and the iterate FREEZES '
+             'wherever it happens to be rather than at the solution — extra '
+             'iterations buy nothing. Semi-convergence is better handled by '
+             'the held-out stopping rule, which detects the peak and restores '
+             'that iterate, than by annealing the step so noise cannot be '
+             'reached.'
     )
     parser.add_argument(
         '--tv-lambda',
@@ -432,6 +460,7 @@ def main():
             holdout_index=args.holdout_index,
             eval_every=args.eval_every,
             patience=args.patience,
+            min_stop_iter=args.min_stop_iter,
             stop_metric=args.stop_metric,
             l_curve=args.l_curve,
             l_curve_norm=args.l_curve_norm,
@@ -462,6 +491,7 @@ def main():
             withhold_eval=args.withhold_eval,
             eval_every=args.eval_every,
             patience=args.patience,
+            min_stop_iter=args.min_stop_iter,
             stop_metric=args.stop_metric,
             l_curve=args.l_curve,
             l_curve_norm=args.l_curve_norm,

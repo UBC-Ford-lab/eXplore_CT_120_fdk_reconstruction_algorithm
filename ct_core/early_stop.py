@@ -49,6 +49,7 @@ alias to this module.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +59,81 @@ _MODE = {"ssim": "max", "psnr": "max", "mse": "min"}
 
 #: Criteria a caller may select for the held-out rule.
 STOP_METRICS = tuple(_MODE)
+
+# --------------------------------------------------------------------------
+# How long to wait before believing a plateau
+# --------------------------------------------------------------------------
+# Patience used to be an absolute number of EVALUATIONS, which is not a
+# well-defined amount of patience: 8 evals at eval_every=250 is 10% of a
+# 20000-iteration run and 100% of a 2000-iteration one, so the same default
+# meant different things in every config. Both numbers below are FRACTIONS OF
+# THE SCHEDULED RUN, which is the only definition that transfers.
+#
+# They are deliberately generous, because the two errors are not symmetric.
+# `EarlyStopper` captures the best state and the callers restore it, so
+# stopping LATE costs wall-clock and nothing else — the volume returned is the
+# same one. Stopping EARLY returns a premature reconstruction and hides
+# whatever the run would have done next. MEASURED case that set these: an
+# --emulate-sart run at lambda=1 plateaued from iteration 500 while its cosine
+# schedule still intended to reduce the step by three orders of magnitude; the
+# old default ended it at iteration 2500 of 20000 (12.5%), during the
+# high-step phase, so the annealing the schedule existed for never happened.
+
+#: Floor on patience in evaluations, so short runs behave as they always did.
+DEFAULT_PATIENCE_EVALS = 8
+
+#: A plateau must cover this fraction of the scheduled run to end it.
+PATIENCE_FRACTION = 0.25
+
+#: No rule may end a run before this fraction of the schedule has elapsed.
+#: At 0.5 a cosine schedule has annealed to half its peak step, so a plateau
+#: past this point is a property of the reconstruction rather than of a step
+#: size the schedule was still going to shrink.
+MIN_PROGRESS_FRACTION = 0.5
+
+
+def resolve_patience(total_iterations, eval_every, patience=None, *,
+                     closed_loop: bool = False,
+                     fraction: float = PATIENCE_FRACTION,
+                     floor: int = DEFAULT_PATIENCE_EVALS) -> int:
+    """Patience in EVALUATIONS, scaled to the length of the run.
+
+    ``patience`` explicitly set is always honoured — this only supplies the
+    default. Returns at least ``floor`` so short runs are unaffected.
+
+    ``closed_loop=True`` (a ``PlateauLRReducer`` is driving the LR) returns the
+    floor instead of the fraction, because waiting is then the REDUCER's job:
+    a plateau buys an LR cut, and only a plateau at the LR floor ends the run.
+    Scaling this patience up as well would just delay that final exit.
+    """
+    if patience is not None:
+        return int(patience)
+    if closed_loop:
+        return int(floor)
+    total = max(1, int(total_iterations))
+    every = max(1, int(eval_every))
+    n_evals = max(1, total // every)
+    return max(int(floor), int(math.ceil(fraction * n_evals)))
+
+
+def resolve_min_iter(total_iterations, min_iter=None, *,
+                     closed_loop: bool = False,
+                     fraction: float = MIN_PROGRESS_FRACTION) -> int:
+    """Iteration before which no stopping rule may fire.
+
+    ``min_iter`` explicitly set is honoured, including 0 to disable the guard.
+
+    ``closed_loop=True`` returns 0: this floor is a PROXY for "do not stop
+    while the step size is still large", and a ``PlateauLRReducer`` enforces
+    that exactly, by gating the stop on the LR actually being at its floor. The
+    proxy is only needed where there is no LR to close the loop on — the
+    classical backends.
+    """
+    if min_iter is not None:
+        return int(min_iter)
+    if closed_loop:
+        return 0
+    return int(fraction * max(0, int(total_iterations)))
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +256,17 @@ class EarlyStopper:
     """Peak-metric tracker with patience, best-state capture, and history."""
 
     def __init__(self, patience: int = 3, min_delta: float = 0.0,
-                 metric: str = "ssim"):
+                 metric: str = "ssim", min_iter: int = 0):
         if metric not in _MODE:
             raise ValueError(
                 f"early-stop metric must be one of {list(_MODE)}, got {metric!r}")
         self.patience = int(patience)
+        # Iterations before which `should_stop` stays False no matter how long
+        # the plateau. Best-state capture is UNAFFECTED — an early peak is
+        # still recorded and still restored, so this delays the exit, never the
+        # answer. See MIN_PROGRESS_FRACTION.
+        self.min_iter = int(min_iter)
+        self._last_iter = -1
         # NOTE `min_delta` is in the METRIC'S OWN UNITS, and those units differ by
         # orders of magnitude: SSIM lives in [0, 1], PSNR in tens of dB, MSE in
         # whatever the line integrals square to (~1e-3 here). A min_delta that is
@@ -249,6 +331,7 @@ class EarlyStopper:
         best state — so the cost of copying a volume is paid only when there is
         something better to keep.
         """
+        self._last_iter = int(iteration)
         self.history["iters"].append(int(iteration))
         for k in ("ssim", "psnr", "mse", "fdk_ssim", "fdk_psnr", "fdk_mse"):
             self.history[k].append(metrics.get(k))
@@ -268,6 +351,8 @@ class EarlyStopper:
 
     @property
     def should_stop(self) -> bool:
+        if self._last_iter < self.min_iter:
+            return False
         return self.num_bad >= self.patience
 
     def reason(self) -> str:

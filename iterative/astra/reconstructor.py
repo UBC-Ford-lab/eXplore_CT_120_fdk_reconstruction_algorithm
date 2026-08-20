@@ -20,6 +20,7 @@ except ImportError:
 from ...ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
                                    LCurve, StoppingRules, metrics_dict,
                                    plot_convergence, resolve_holdout_index,
+                                   resolve_min_iter, resolve_patience,
                                    solution_norm)
 from ...ct_core.preprocessing import preprocess_sinogram
 from ...ct_core.utils import query_gpu_memory
@@ -143,7 +144,7 @@ class ASTRAReconstructor:
                  ring_correction=False, ring_median_width=51,
                  air_normalization=True,
                  crossval=True, holdout_index=None,
-                 eval_every=10, patience=3,
+                 eval_every=10, patience=None, min_stop_iter=None,
                  stop_metric='ssim', l_curve=False, l_curve_norm='l2',
                  stop_on=('holdout',),
                  log_fn=None):
@@ -207,7 +208,10 @@ class ASTRAReconstructor:
         self.crossval = bool(crossval)
         self.holdout_index = holdout_index
         self.eval_every = int(eval_every)
-        self.patience = int(patience)
+        # None = derive from the schedule (ct_core.early_stop).
+        self.patience = None if patience is None else int(patience)
+        self.min_stop_iter = (None if min_stop_iter is None
+                              else int(min_stop_iter))
         if stop_metric not in STOP_METRICS:
             raise ValueError(f"stop_metric must be one of {list(STOP_METRICS)}, "
                              f"got {stop_metric!r}")
@@ -363,8 +367,12 @@ class ASTRAReconstructor:
         holdout = sino_astra[:, idx, :].copy()          # (N_b, N_a)
         holdout_deg = float(np.rad2deg(self.angles[idx]))
         scorer = HoldoutScorer(holdout, label=f"projection {idx}")
-        stopper = EarlyStopper(patience=self.patience, metric=self.stop_metric)
-        lcurve = (LCurve(patience=self.patience, norm=self.l_curve_norm,
+        _patience = resolve_patience(self.iterations, self.eval_every,
+                                     self.patience)
+        _min_iter = resolve_min_iter(self.iterations, self.min_stop_iter)
+        stopper = EarlyStopper(patience=_patience, metric=self.stop_metric,
+                               min_iter=_min_iter)
+        lcurve = (LCurve(patience=_patience, norm=self.l_curve_norm,
                          residual_kind="full sinogram") if self.l_curve else None)
         rules = StoppingRules(stopper=stopper, lcurve=lcurve, stop_on=self.stop_on)
         self._lcurve = lcurve
@@ -375,7 +383,7 @@ class ASTRAReconstructor:
               f"STAYS in the reconstruction — ASTRA's algorithms take the whole "
               f"sinogram, so a withheld angle would need a second geometry.")
         print(f"  Stopping on {' + '.join(self.stop_on)}: {self.stop_metric} "
-              f"(patience {self.patience})"
+              f"(patience {_patience}, no stop before {_min_iter})"
               + (f", L-curve corner ({self.l_curve_norm} norm, exact residual)"
                  if lcurve is not None else ""))
         print(f"\n  {'Iter':>6}   {'PSNR (dB)':>10}   {'SSIM':>10}   "
@@ -411,7 +419,7 @@ class ASTRAReconstructor:
                 marker = f'-{stopper.num_bad}'
             if lcurve is not None and 'lcurve' in self.stop_on:
                 lcurve_vols[i_done] = vol.copy()
-                depth = max(LCurve.MIN_POINTS, lcurve.smooth) + self.patience + 1
+                depth = max(LCurve.MIN_POINTS, lcurve.smooth) + _patience + 1
                 for old in sorted(lcurve_vols)[:-depth]:
                     del lcurve_vols[old]
             if self.log_fn is not None:

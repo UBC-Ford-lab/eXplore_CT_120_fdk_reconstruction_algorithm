@@ -88,6 +88,7 @@ from .ray_sampler import (rays_from_indices, sample_projection_patch,
                           sample_random_rays, sample_random_rows)
 from .renderer import render_compile_mode, render_rays, set_render_compile
 from .scene import Scene, model_domain_from_geometry
+from ..ct_core.early_stop import resolve_min_iter, resolve_patience
 from .training import (autocast_ctx, build_optimizer, clip_grad_norm,
                        lr_multiplier, maybe_compile_model, project_nonneg,
                        resolve_amp_dtype, unwrap_model)
@@ -122,7 +123,8 @@ class LearnedReconstructor:
                  holdout_index: int | None = None,
                  withhold_eval: bool = False,
                  eval_every: int = 250,
-                 patience: int = 8,
+                 patience: int | None = None,
+                 min_stop_iter: int | None = None,
                  stop_metric: str = "mse",
                  stop_min_delta: float = 0.0,
                  save_best: bool = True,
@@ -187,7 +189,10 @@ class LearnedReconstructor:
         # (diagnostic). True = the pre-2026-08-13 held-out behaviour.
         self.withhold_eval = bool(withhold_eval)
         self.eval_every = int(eval_every)
-        self.patience = int(patience)
+        # None = derive from the schedule (ct_core.early_stop).
+        self.patience = None if patience is None else int(patience)
+        self.min_stop_iter = (None if min_stop_iter is None
+                              else int(min_stop_iter))
         # Which held-out metric decides the peak. They do not peak together:
         # MSE is (a subset of) the objective and turns over last, SSIM is
         # structural and turns over earliest.
@@ -503,6 +508,14 @@ class LearnedReconstructor:
             opts["chord_state"] = chord_state
             opts.setdefault("sart_clamp_lo", 0.25)
             opts.setdefault("sart_clamp_hi", 4.0)
+            # --emulate-sart reproduces the classical update, which descends
+            # the SUMMED misfit; C then supplies the per-voxel column-sum
+            # normalisation. The two belong together — the sum without an
+            # absolute C overshoots by the column sum, the mean with one
+            # undershoots by the batch weight — so they are set from the same
+            # flag and never independently.
+            opts.setdefault("sart_reduction",
+                            "sum" if self.emulate_sart else "mean")
 
             def sample_batch(*, exclude_angle=None):
                 o, d, tgt = sample_random_rays(
@@ -777,19 +790,30 @@ class LearnedReconstructor:
             cov, g_min, g_max = build_coverage_grid(
                 scene, grid_res=64, n_rays=self.sart_coverage_rays,
                 aabb_min=rmin, aabb_max=rmax, device=device)
+            geom = scene.geometry
+            voxel_mm = (float(geom["dx"]), float(geom["dx"]),
+                        float(geom["dz"]))
             grad_scale_fn = CoveragePreconditioner(
-                scene, cov, g_min, g_max, outside_value=1.0, device=device)
+                scene, cov, g_min, g_max, outside_value=None, device=device,
+                absolute=True, rays_per_batch=self.rays_per_batch,
+                coverage_rays=self.sart_coverage_rays, voxel_mm=voxel_mm)
             span = (grad_scale_fn.stats["C_max"]
                     / max(grad_scale_fn.stats["C_min"], 1e-12))
             print(f"  C preconditioner: coverage grid 64^3 over the ROI in "
                   f"{time.time() - t_cov:.1f} s, C in "
-                  f"[{grad_scale_fn.stats['C_min']:.2f}, "
-                  f"{grad_scale_fn.stats['C_max']:.2f}] (span {span:.1f}x)")
+                  f"[{grad_scale_fn.stats['C_min']:.3g}, "
+                  f"{grad_scale_fn.stats['C_max']:.3g}] 1/mm "
+                  f"(median {grad_scale_fn.stats['C_median']:.3g}, "
+                  f"span {span:.1f}x)")
+            print(f"    C is ABSOLUTE (1 / sum_i A_ij over the batch's rays), "
+                  f"so --lr IS the classical relaxation lambda: lr=1.0 is one "
+                  f"OS-SART update per step.")
             if span < 1.2:
                 print("    NOTE: C is nearly flat — coverage barely varies over "
                       "the ROI, so the preconditioner is close to a no-op here.")
             print(f"\n  --emulate-sart: R (row weighting) + C (coverage "
-                  f"preconditioner) + SGD, with the non-negativity projection.")
+                  f"preconditioner, absolute) + SGD on the SUMMED misfit, "
+                  f"with the non-negativity projection.")
             print(f"    NOT strict SIRT: batches are random subsets rather than "
                   f"every ray per update, which is the SART/ordered-subset "
                   f"family. The batching is kept on purpose.")
@@ -807,17 +831,45 @@ class LearnedReconstructor:
         # captured: this loop used to detect the turnover and then return the
         # final grid anyway, i.e. the volume from after the peak.
         stopper = lcurve = rules = None
+        # The reducer is DRIVEN by the held-out improvement flag. With no
+        # held-out evaluation there is no signal, so it would pin the LR at its
+        # post-warmup base for the whole run — strictly worse than the cosine
+        # it displaced. Hand the LR back rather than silently doing that.
+        if holdout is None and self.lr_plateau is not None:
+            print("  lr_plateau: ignored — it is driven by the held-out "
+                  "evaluation, and this run has none (--no-crossval). The "
+                  "open-loop cosine keeps LR control.")
+            self.lr_plateau = None
         if holdout is not None:
+            # patience/min_iter default to fractions of THIS run's schedule
+            # (see ct_core.early_stop), so the rule means the same thing at any
+            # --iterations / --eval-every rather than silently becoming
+            # stricter as runs get longer.
+            _closed = self.lr_plateau is not None
+            _patience = resolve_patience(self.iterations, self.eval_every,
+                                         self.patience, closed_loop=_closed)
+            _min_iter = resolve_min_iter(self.iterations, self.min_stop_iter,
+                                         closed_loop=_closed)
             stopper = self._early_stopper or EarlyStopper(
-                patience=self.patience, min_delta=self.stop_min_delta,
-                metric=self.stop_metric)
+                patience=_patience, min_delta=self.stop_min_delta,
+                metric=self.stop_metric, min_iter=_min_iter)
+            if self.patience is None or self.min_stop_iter is None:
+                if _closed:
+                    print(f"  Stopping guard: patience {_patience} evals "
+                          f"({_patience * self.eval_every} iters); no iteration "
+                          f"floor needed — the stop is gated on the LR reaching "
+                          f"its floor (closed loop).")
+                else:
+                    print(f"  Stopping guard: patience {_patience} evals "
+                          f"({_patience * self.eval_every} iters), no stop "
+                          f"before iteration {_min_iter} of {self.iterations}")
             if self.l_curve:
                 # A FIXED subset of rays, so this is a deterministic functional
                 # of the volume and its curve is smooth — but it is not the
                 # residual over the whole sinogram, which is why the kind is
                 # recorded and plotted.
                 kind = "holdout projection" if self.withhold_eval else "eval projection"
-                lcurve = LCurve(patience=self.patience, norm=self.l_curve_norm,
+                lcurve = LCurve(patience=_patience, norm=self.l_curve_norm,
                                 residual_kind=kind)
             rules = StoppingRules(stopper=stopper, lcurve=lcurve,
                                   stop_on=self.stop_on)

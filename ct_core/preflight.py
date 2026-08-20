@@ -24,8 +24,9 @@ be uncomfortably tight" cases up front, not to be byte-accurate:
          volume split; a note says larger free VRAM = fewer splits = faster.
          RAM: ~4x volume + ~3x sinogram (measured: 12 GB RSS at a 2.9 GiB
          volume — TIGRE and the crossval path keep several copies).
-  voxel  VRAM: 4x parameters (fp32 param + grad + Adam m/v) + sinogram +
-         per-batch ray buffers.
+  voxel  VRAM: parameters x the optimizer's state count (4x for Adam: param
+         + grad + m + v; 2x for plain SGD, which keeps no state) + sinogram
+         + per-batch ray buffers.
          RAM: raw projections + float sinogram + exported volume.
 
 Verdicts: ok / tight (>85% of free) / insufficient / no-gpu. `insufficient`
@@ -43,6 +44,13 @@ from .errors import PreflightAbort
 from .utils import query_gpu_memory
 
 GiB = float(2 ** 30)
+
+# Resident fp32 copies of the parameters, per optimizer. Adam keeps the two
+# moment buffers on top of the weights and their gradient; plain SGD keeps no
+# state at all, so an --emulate-sart run needs HALF the VRAM an Adam run of
+# the same grid does. Estimating every voxel run at Adam's 4x turned that into
+# a spurious `insufficient` verdict and a floored ray batch.
+PARAM_COPIES = {"adam": 4, "sgd": 2}
 F32 = 4
 SAFETY = 1.15          # multiplied onto every estimate
 TIGHT_FRAC = 0.85      # need > 85% of free => "tight"
@@ -116,8 +124,13 @@ def _vol_bytes(vol_shape) -> int:
 
 
 def estimate(backend: str, *, n_angles: int, n_b: int, n_a: int, vol_shape,
-             rays_per_batch: int = 0, samples_per_ray: int = 0):
-    """(gpu_bytes, host_bytes, gpu_required, notes) for one backend."""
+             rays_per_batch: int = 0, samples_per_ray: int = 0,
+             optimizer: str = "adam"):
+    """(gpu_bytes, host_bytes, gpu_required, notes) for one backend.
+
+    ``optimizer`` applies to the voxel backend only and decides how many
+    resident copies of the parameters the run needs (see ``PARAM_COPIES``).
+    """
     sino = _sino_bytes(n_angles, n_b, n_a)
     vol = _vol_bytes(vol_shape)
     notes: list[str] = []
@@ -146,12 +159,15 @@ def estimate(backend: str, *, n_angles: int, n_b: int, n_a: int, vol_shape,
 
     if backend == "voxel":
         params = vol  # one fp32 parameter per voxel
+        copies = PARAM_COPIES.get(str(optimizer).strip().lower(), 4)
         batch = (int(rays_per_batch) * max(1, int(samples_per_ray))
                  * BATCH_BYTES_PER_SAMPLE)
-        gpu = int((4 * params + sino + batch) * SAFETY)
+        gpu = int((copies * params + sino + batch) * SAFETY)
         host = int((2 * sino + vol) * SAFETY)
-        notes.append("Voxel grid trains param+grad+Adam(m,v) = 4x volume on "
-                     "the GPU. CPU fallback exists but is impractically slow.")
+        notes.append(
+            f"Voxel grid trains param+grad"
+            f"{'+Adam(m,v)' if copies == 4 else ''} = {copies}x volume on the "
+            f"GPU. CPU fallback exists but is impractically slow.")
         return gpu, host, False, notes
 
     raise ValueError(f"unknown backend {backend!r}")
@@ -169,6 +185,7 @@ AUTO_BATCH_FILL = 0.75
 
 def auto_rays_per_batch(vram_free, *, n_angles: int, n_b: int, n_a: int,
                         vol_shape, samples_per_ray: int,
+                        optimizer: str = "adam",
                         floor: int = AUTO_BATCH_FLOOR,
                         cap: int = AUTO_BATCH_CAP,
                         fill: float = AUTO_BATCH_FILL) -> dict:
@@ -176,7 +193,7 @@ def auto_rays_per_batch(vram_free, *, n_angles: int, n_b: int, n_a: int,
 
     Same pattern the FDK backend uses for its projection chunks: take the
     memory the card actually has free, subtract what must stay resident for
-    the whole run (4x parameters for fp32 weights + grad + Adam m/v, plus the
+    the whole run (``PARAM_COPIES[optimizer]`` x parameters, plus the
     sinogram), and spend the rest on the per-step ray buffers. This is what
     lets one command saturate a 16 GB card and an 80 GB card without a
     hardware-specific flag — the batch is the only knob that scales with VRAM,
@@ -188,7 +205,8 @@ def auto_rays_per_batch(vram_free, *, n_angles: int, n_b: int, n_a: int,
     reasoning rather than an unexplained number.
     """
     spp = max(1, int(samples_per_ray))
-    persistent = int((4 * _vol_bytes(vol_shape)
+    copies = PARAM_COPIES.get(str(optimizer).strip().lower(), 4)
+    persistent = int((copies * _vol_bytes(vol_shape)
                       + _sino_bytes(n_angles, n_b, n_a)) * SAFETY)
     per_ray = spp * BATCH_BYTES_PER_SAMPLE
 
@@ -204,6 +222,7 @@ def auto_rays_per_batch(vram_free, *, n_angles: int, n_b: int, n_a: int,
     return {
         'rays': rays,
         'samples_per_ray': spp,
+        'param_copies': copies,
         'persistent_bytes': persistent,
         'budget_bytes': budget,
         'available_bytes': available,
@@ -217,6 +236,7 @@ def auto_rays_per_batch(vram_free, *, n_angles: int, n_b: int, n_a: int,
 
 def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
                   rays_per_batch: int = 0, samples_per_ray: int = 0,
+                  optimizer: str = "adam",
                   skip: bool = False, only: bool = False,
                   logger=None) -> PreflightReport:
     """Print the machine-fit report; abort on a fatal verdict unless skipped.
@@ -237,7 +257,8 @@ def run_preflight(backend: str, ctx, *, gpu_index: int = 0,
     gpu_b, host_b, gpu_req, notes = estimate(
         backend, n_angles=n_angles, n_b=n_b, n_a=n_a,
         vol_shape=ctx.geometry["vol_shape"],
-        rays_per_batch=rays_per_batch, samples_per_ray=samples_per_ray)
+        rays_per_batch=rays_per_batch, samples_per_ray=samples_per_ray,
+        optimizer=optimizer)
 
     gpu = query_gpu_memory(gpu_index)
     report = PreflightReport(

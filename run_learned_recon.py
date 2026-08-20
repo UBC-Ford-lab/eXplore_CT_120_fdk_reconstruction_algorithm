@@ -48,20 +48,53 @@ from .ct_core.early_stop import STOP_METRICS
 SUPPORTED_LEARNED_ALGORITHMS = ("voxel",)
 
 
+def _resolve_optimizer(args):
+    """Which optimizer this run will actually use.
+
+    The trainer decides this (``--optimizer``, defaulting to SGD under
+    ``--emulate-sart``), but the LEARNING RATE and the VRAM estimate are both
+    needed before the trainer exists — and both differ by a factor that makes
+    the wrong answer visible: 1e-4 vs 1.0 on the step size, 4x vs 2x on the
+    resident parameter copies. Resolved once here so the two cannot disagree
+    with each other or with ``trainer.py``.
+    """
+    if args.optimizer is not None:
+        return str(args.optimizer).strip().lower()
+    return "sgd" if args.emulate_sart else "adam"
+
+
 def _resolve_lr(args):
     """The learning rate, defaulted per OPTIMIZER rather than globally.
 
     Adam and SGD differ by ~4-5 orders of magnitude here: Adam divides by the
     gradient's own running scale, so 1e-4 is a step in units of the parameter,
-    while plain SGD steps by the raw gradient. 1.0 is the classical update's
-    implicit step size, not a tuned value.
+    while plain SGD steps by the raw gradient. 1.0 is the classical relaxation
+    parameter lambda, not a tuned value — and it only means that because
+    --emulate-sart descends the SUMMED misfit with an ABSOLUTE C (see
+    learning_based_iterative.sart). Under any other combination the raw
+    gradient carries an arbitrary scale and 1.0 means nothing in particular.
     """
     if args.lr is not None:
         return float(args.lr)
-    optimizer = args.optimizer
-    if optimizer is None:
-        optimizer = "sgd" if args.emulate_sart else "adam"
-    return 1.0 if optimizer == "sgd" else 1e-4
+    return 1.0 if _resolve_optimizer(args) == "sgd" else 1e-4
+
+
+def _build_lr_plateau(args):
+    """The closed-loop LR reducer, or None to leave the cosine in charge.
+
+    Default ON: an open-loop cosine is scheduled over --iterations, but a
+    held-out stopping rule normally fires at a fraction of them, so the
+    annealing phase the schedule exists for never runs. Driving the LR from the
+    stopper's own signal removes the horizon assumption entirely.
+    """
+    if not args.lr_plateau:
+        return None
+    from .ct_core.early_stop import PlateauLRReducer
+    return PlateauLRReducer(
+        factor=args.lr_plateau_factor,
+        patience=args.lr_plateau_patience,
+        min_lr_fraction=args.lr_plateau_min_fraction,
+        cooldown=args.lr_plateau_cooldown)
 
 
 def _parse_loss_options(pairs):
@@ -124,15 +157,18 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
                              'against it. See the list below.')
     parser.add_argument('--emulate-sart', action='store_true',
                         help='Emulate the classical simultaneous update as far '
-                             'as this backend goes: --loss sart (row weighting '
-                             'R = 1/L_i over the object ROI), the coverage '
-                             'preconditioner C on the backward pass, and plain '
-                             'SGD instead of Adam (Adam would be a second, '
-                             'competing preconditioner). The dense voxel grid, '
-                             'the non-negativity projection and the near-air '
-                             'init are already the classical recipe. NOT strict '
-                             'SIRT: batches stay random subsets, which is the '
-                             'SART/ordered-subset family.')
+                             'as this backend goes: --loss sart SUMMED (row '
+                             'weighting R = 1/L_i over the object ROI), the '
+                             'coverage preconditioner C at its absolute '
+                             '1/sum_i A_ij scale on the backward pass, and '
+                             'plain SGD instead of Adam (Adam would be a '
+                             'second, competing preconditioner). Together '
+                             'those make --lr the classical relaxation lambda. '
+                             'The dense voxel grid, the non-negativity '
+                             'projection and the near-air init are already the '
+                             'classical recipe. NOT strict SIRT: batches stay '
+                             'random subsets, which is the SART/ordered-subset '
+                             'family.')
     parser.add_argument('--optimizer', default=None, choices=('adam', 'sgd'),
                         help='Optimizer. Default: adam, or sgd under '
                              '--emulate-sart. Setting it explicitly is always '
@@ -170,11 +206,14 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
                              'on the optimizer, because the two are not on the '
                              'same scale at all: 1e-4 for Adam (~0.5%% of '
                              'mu_water per step, since Adam normalises the '
-                             'gradient to ~unit magnitude) and 1.0 for SGD '
-                             '(the classical update\'s implicit step is 1.0 with '
-                             'the C A^T R structure). Sharing one default would '
-                             'make an SGD run take steps ~1e-4 of the intended '
-                             'size and appear to do nothing.')
+                             'gradient to ~unit magnitude) and 1.0 for SGD, '
+                             'where it is the classical relaxation lambda: '
+                             'with --emulate-sart one step IS one OS-SART '
+                             'update, so lambda<1 under-relaxes and lambda>1 '
+                             'over-relaxes exactly as in the textbook method. '
+                             'Sharing one default would make an SGD run take '
+                             'steps ~1e-4 of the intended size and appear to '
+                             'do nothing.')
     parser.add_argument('--lr-warmup-iters', type=int, default=500,
                         help='Linear LR warmup steps before cosine decay '
                              '(default: 500)')
@@ -218,9 +257,52 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
     parser.add_argument('--eval-every', type=int, default=250, metavar='K',
                         help='Evaluate holdout MSE every K iterations '
                              '(default: 250)')
-    parser.add_argument('--patience', type=int, default=8, metavar='P',
-                        help='Stop after P holdout evals without improvement '
-                             '(default: 8 = 2000 iters at eval-every=250)')
+    parser.add_argument('--patience', type=int, default=None, metavar='P',
+                        help='Stop after P holdout evals without improvement. '
+                             'Default: a quarter of this run\'s evaluations '
+                             '(floor 8), so the rule means the same thing at '
+                             'any --iterations / --eval-every. Stopping late '
+                             'costs only wall-clock — the best iterate is '
+                             'restored either way — while stopping early '
+                             'returns a premature reconstruction.')
+    parser.add_argument(
+        '--lr-plateau', action='store_true', default=True,
+        help='Metric-driven LR decay (default: ON). Instead of an open-loop '
+             'cosine scheduled over --iterations — a horizon a run that stops '
+             'early never reaches, so the annealing never happens — the LR is '
+             'halved whenever the SAME held-out metric the stopper watches '
+             'stops improving, and the run ends only once the LR is at its '
+             'floor and the metric still will not improve. Warmup is '
+             'unaffected; the reducer takes over when it ends.')
+    parser.add_argument(
+        '--no-lr-plateau', dest='lr_plateau', action='store_false',
+        help='Hand the LR back to the open-loop cosine schedule.')
+    parser.add_argument(
+        '--lr-plateau-factor', type=float, default=0.5, metavar='F',
+        help='LR multiplier per reduction (default: %(default)s).')
+    parser.add_argument(
+        '--lr-plateau-patience', type=int, default=2, metavar='P',
+        help='Non-improving evaluations that buy one LR reduction '
+             '(default: %(default)s). This is the REDUCER\'s patience; '
+             '--patience is the separate count that ends the run once the LR '
+             'can no longer drop.')
+    parser.add_argument(
+        '--lr-plateau-min-fraction', type=float, default=0.02, metavar='F',
+        help='LR floor as a fraction of the post-warmup base '
+             '(default: %(default)s). With factor 0.5 that is 6 reductions '
+             'before the floor, after which a plateau ends the run.')
+    parser.add_argument(
+        '--lr-plateau-cooldown', type=int, default=1, metavar='K',
+        help='Evaluations to wait after a reduction before counting again '
+             '(default: %(default)s), so one plateau cannot cascade several '
+             'cuts before the model has responded to the first.')
+    parser.add_argument('--min-stop-iter', type=int, default=None, metavar='N',
+                        help='No stopping rule may fire before iteration N '
+                             '(default: half the scheduled iterations; pass 0 '
+                             'to disable). Guards against ending a run during '
+                             'the high-LR phase, where a plateau reflects the '
+                             'step size the schedule was still going to shrink '
+                             'rather than the reconstruction.')
     parser.add_argument(
         '--stop-metric',
         choices=STOP_METRICS,
@@ -311,7 +393,8 @@ def main():
         n_ang, n_b, n_a = (int(s) for s in ctx.projections.shape)
         plan = auto_rays_per_batch(
             (gpu or {}).get('free_bytes'), n_angles=n_ang, n_b=n_b, n_a=n_a,
-            vol_shape=ctx.geometry['vol_shape'], samples_per_ray=_spp)
+            vol_shape=ctx.geometry['vol_shape'], samples_per_ray=_spp,
+            optimizer=_resolve_optimizer(args))
         args.rays_per_batch = plan['rays']
         if gpu is None:
             print(f"\nRays/batch: auto -> {plan['rays']} (no GPU visible — "
@@ -334,7 +417,12 @@ def main():
         'iterations': args.iterations,
         'rays_per_batch': args.rays_per_batch,
         'rays_per_batch_mode': 'auto' if auto_batch else 'pinned',
-        'lr': args.lr,
+        'lr': _resolve_lr(args),
+        'optimizer': _resolve_optimizer(args),
+        'lr_plateau': bool(args.lr_plateau),
+        'lr_plateau_factor': args.lr_plateau_factor if args.lr_plateau else None,
+        'lr_plateau_patience': (args.lr_plateau_patience if args.lr_plateau
+                                else None),
         'lr_warmup_iters': args.lr_warmup_iters,
         'samples_per_ray': args.samples_per_ray,
         'init_density': args.init_density,
@@ -346,10 +434,12 @@ def main():
     })
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
-    # The voxel grid's VRAM need is dominated by 4x parameters (Adam), plus
-    # the per-batch ray buffers sized just above.
+    # The voxel grid's VRAM need is dominated by the resident parameter copies
+    # (4x under Adam, 2x under SGD), plus the per-batch ray buffers sized just
+    # above.
     if run_preflight('voxel', ctx, gpu_index=args.gpu_index, logger=logger,
                      rays_per_batch=args.rays_per_batch, samples_per_ray=_spp,
+                     optimizer=_resolve_optimizer(args),
                      skip=args.skip_preflight,
                      only=args.preflight_only).dry_run:
         return                      # --preflight-only: the question is answered
@@ -416,6 +506,8 @@ def main():
         withhold_eval=args.withhold_eval,
         eval_every=args.eval_every,
         patience=args.patience,
+        min_stop_iter=args.min_stop_iter,
+        lr_plateau=_build_lr_plateau(args),
         stop_metric=args.stop_metric,
         l_curve=args.l_curve,
         l_curve_norm=args.l_curve_norm,

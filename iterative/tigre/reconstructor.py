@@ -29,6 +29,7 @@ except ImportError:
 from ...ct_core.early_stop import (STOP_METRICS, EarlyStopper, HoldoutScorer,
                                    LCurve, StoppingRules, metrics_dict,
                                    plot_convergence, resolve_holdout_index,
+                                   resolve_min_iter, resolve_patience,
                                    solution_norm, write_metrics)
 from ...ct_core.preprocessing import preprocess_sinogram
 from ...ct_core.utils import query_gpu_memory
@@ -79,7 +80,8 @@ def fdk_angles_to_tigre(angles_fdk):
     return np.asarray(angles_fdk, dtype=np.float64) + np.pi
 
 
-def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None, cpa_raw=None):
+def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None,
+                         cpa_raw=None, min_nxy=None):
     """
     Build a TIGRE Geometry object from the FDK geometry dict.
 
@@ -129,18 +131,25 @@ def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None, cpa_raw=None
         print(f"    ROI dims:   ({Nx_roi}, {Ny_roi}, {Nz_roi})")
         print(f"    Expanded:   ({Nx}, {Ny}, {Nz}) (centered at isocenter)")
 
-    # TIGRE CUDA kernels hang when Nxy is below an empirical threshold.
-    # Tested on 3500x2296 detector, 0.075mm voxels:
-    #   Nxy=879 (Nz=764) → HANG, Nxy=900 (Nz=933) → HANG,
-    #   Nxy=933 (Nz=933) → HANG, Nxy=1000 (Nz=933) → PASS.
-    Nxy_min = max(1000, Nz)
-    if min(Nx, Ny) < Nxy_min:
+    # Optional transaxial padding, off by default and unused by this backend.
+    #
+    # A constant `Nxy_min = max(1000, Nz)` was applied here unconditionally
+    # until 2026-08-19, to dodge a CUDA hang. It cost 1.51x the voxels on the
+    # production geometry, and it described the hang wrongly: the boundary is
+    # a PHYSICAL size, not a voxel count (70.0 mm hangs and 75.0 mm passes at
+    # 0.075, 0.1 AND 0.2 mm voxels), it does not depend on Nz, it moves with
+    # detector width and angle count, and it is a non-monotone BAND — with a
+    # half-width detector, 25 mm passes, 20 and 15 mm hang, 10 and 5 mm pass.
+    #
+    # None of that matters any more: the hang was traced to TIGRE's own
+    # `set_w()` and is avoided at source by `geometric_row_weights`, which see.
+    # This parameter remains only as an escape hatch for a hang elsewhere.
+    if min_nxy is not None and min(Nx, Ny) < int(min_nxy):
         Nx_before_pad, Ny_before_pad = Nx, Ny
-        Nx = max(Nx, Nxy_min)
-        Ny = max(Ny, Nxy_min)
-        print(f"  WARNING: TIGRE CUDA kernels hang for Nxy < ~1000.")
-        print(f"  Auto-padding volume from ({Nx_before_pad}, {Ny_before_pad}, {Nz}) "
-              f"to ({Nx}, {Ny}, {Nz}).")
+        Nx = max(Nx, int(min_nxy))
+        Ny = max(Ny, int(min_nxy))
+        print(f"  TIGRE hang workaround: padding volume from "
+              f"({Nx_before_pad}, {Ny_before_pad}, {Nz}) to ({Nx}, {Ny}, {Nz}).")
 
     geo.nVoxel = np.array([Nz, Ny, Nx], dtype=np.int64)
     geo.dVoxel = np.array([dz, dx, dx], dtype=np.float64)
@@ -196,6 +205,55 @@ def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None, cpa_raw=None
     return geo
 
 
+def geometric_row_weights(geo, angles, gpuids=None,
+                          projection_type="Siddon", grid=8):
+    """R = diag(1/L_i): the reciprocal ray path length through the FOV box.
+
+    This is what ``IterativeReconAlg.set_w`` computes internally, reproduced
+    here for one reason: TIGRE's version pins ``nVoxel = [2, 2, 2]`` and that
+    grid HANGS THE CUDA KERNEL for some field sizes.
+
+    THE BUG, located 2026-08-19. ``set_w`` does not project the reconstruction
+    volume — it builds a stand-in box (transaxial extent x1.1, z at least the
+    detector height) and forces ``nVoxel`` to 2 per axis, so only the PHYSICAL
+    extent ever reaches the kernel. In ``Siddon_projection.cu`` the ray walk is
+
+        float imin,imax,jmin,jmax,kmin,kmax;          // <- float
+        unsigned long Np = (imax-imin+1)+(jmax-jmin+1)+(kmax-kmin+1);
+        for (unsigned long ii=0; ii<Np; ii++){ ... }
+
+    For rays that graze or miss the box those bounds go degenerate, and the
+    float->unsigned long conversion turns the intersection count into an
+    astronomically large ``Np``, so the loop never ends. With only 2 voxels per
+    axis the index arithmetic is coarse enough that whether any ray lands there
+    flips with small changes in box size, detector width and angle set —
+    MEASURED as a non-monotone hang BAND in physical millimetres, independent
+    of the reconstruction's own voxel count (which never reaches the kernel).
+    Signature: 100% GPU utilisation with ~325 MiB allocated, because the hang
+    happens before anything large is allocated.
+
+    THE FIX. A box of ones has line integral = chord length whatever the voxel
+    count, so a finer grid is the same quantity computed on a grid that does
+    not trip the degeneracy. MEASURED at 81.4 mm, where TIGRE's own grid still
+    works: grid=8 and grid=2 agree to 0.000% median AND p99 relative difference
+    over every ray with a real path (they differ only on grazing rays, which
+    the mask below sends to inf anyway). Supplying ``W`` also means
+    ``IterativeReconAlg.__init__`` never calls ``set_w`` at all — it is guarded
+    by ``if not hasattr(self, "W")`` — so the hang cannot occur. A geometry
+    that hung indefinitely reconstructs in 11.6 s this way.
+    """
+    geox = copy.deepcopy(geo)
+    geox.sVoxel[1:] = geox.sVoxel[1:] * 1.1   # TIGRE's own margin, kept
+    geox.sVoxel[0] = max(geox.sDetector[0], geox.sVoxel[0])
+    n = int(grid)
+    geox.nVoxel = np.array([n, n, n])
+    geox.dVoxel = geox.sVoxel / geox.nVoxel
+    W = tigre.Ax(np.ones(geox.nVoxel, dtype=np.float32), geox, angles,
+                 projection_type, gpuids=gpuids)
+    W[W <= min(geo.dVoxel / 2)] = np.inf
+    return (1.0 / W).astype(np.float32)
+
+
 def _pwls_weight(sinogram, geo, angles, gpuids=None):
     """
     Combined geometric x statistical per-ray weight array for PWLS-SIRT,
@@ -227,15 +285,10 @@ def _pwls_weight(sinogram, geo, angles, gpuids=None):
     T = np.clip(np.exp(-sinogram.astype(np.float64)), 1e-6, 2.0)
     w_stat = (T / T.mean()).astype(np.float32)
 
-    geox = copy.deepcopy(geo)
-    geox.sVoxel[1:] = geox.sVoxel[1:] * 1.1
-    geox.sVoxel[0] = max(geox.sDetector[0], geox.sVoxel[0])
-    geox.nVoxel = np.array([2, 2, 2])
-    geox.dVoxel = geox.sVoxel / geox.nVoxel
-    W_geom = tigre.Ax(np.ones(geox.nVoxel, dtype=np.float32), geox, angles,
-                       "interpolated", gpuids=gpuids)
-    W_geom[W_geom <= min(geo.dVoxel / 2)] = np.inf
-    W_geom = 1.0 / W_geom
+    # Same geometric factor as plain SIRT, on a grid that cannot hang the
+    # kernel (this function used to carry its own nVoxel=[2,2,2] copy).
+    W_geom = geometric_row_weights(geo, angles, gpuids=gpuids,
+                                   projection_type="interpolated")
 
     return (W_geom * w_stat).astype(np.float32)
 
@@ -253,7 +306,8 @@ class TIGREReconstructor:
 
     def __init__(self, projections, angles, geometry,
                  algorithm='ossart', iterations=100,
-                 blocksize=15, lmbda=0.5, lmbda_red=0.97,
+                 blocksize=15, lmbda=1.0, lmbda_red=1.0,
+                 set_w_grid=8,
                  nonneg=True, gpu_index=0,
                  bright_field=None, dark_field=None,
                  geometry_autocal=True, detector_psi_deg=None,
@@ -264,7 +318,7 @@ class TIGREReconstructor:
                  air_normalization=True,
                  crossval=True, holdout_index=None,
                  withhold_eval=False,
-                 eval_every=10, patience=3,
+                 eval_every=10, patience=None, min_stop_iter=None,
                  stop_metric='ssim', l_curve=False, l_curve_norm='l2',
                  stop_on=('holdout',),
                  tv_lambda=0.0, tv_iters=50,
@@ -292,10 +346,28 @@ class TIGREReconstructor:
             blocksize: Number of projections per OS-SART block (default 15).
                 Smaller = more subsets = faster convergence but noisier per-update.
                 Ignored for mlem (always full-batch).
-            lmbda: Relaxation parameter (default 0.5). Controls update step size;
-                lower values give smoother convergence, less streak artifacts.
-            lmbda_red: Relaxation reduction factor per iteration (default 0.97).
-                Lambda decays as lmbda * lmbda_red^iter, annealing toward zero.
+            lmbda: Relaxation parameter (default 1.0, matching TIGRE's own).
+                The step size in x <- x + lambda C A^T R (b - A x), applied at
+                IterativeReconAlg as res += lmbda * (1/V) * Atb(W * residual).
+                SIRT converges for any lambda in (0, 2) — the iteration matrix
+                C A^T R A has spectral radius <= 1 under these row/column
+                normalisations — so 1.0 is the unrelaxed textbook choice.
+                Lower values smooth the trajectory and suppress early streaks
+                at roughly proportional cost in iterations; they are worth
+                considering for the ORDERED-SUBSET methods (ossart, sart),
+                whose noisy per-block updates can orbit the solution at full
+                relaxation, but not for full-batch sirt.
+            lmbda_red: Relaxation reduction per iteration (default 1.0 = NO
+                decay, matching TIGRE's own). Lambda decays as
+                lmbda * lmbda_red^iter, so the TOTAL update budget is
+                sum(lambda_k) = lmbda / (1 - lmbda_red) and is FINITE for any
+                lmbda_red < 1: the iterate converges to wherever the shrinking
+                step leaves it, not to the solution. The previous 0.5/0.97
+                default gave a budget of ~17 against 100 for lambda=1 held over
+                100 iterations, and was effectively frozen past ~150 — a run
+                asked to "iterate until converged" could not. Semi-convergence
+                belongs to the stopping rule, which finds the peak and restores
+                that iterate; annealing the step only hides the turnover.
             nonneg: Enforce non-negativity constraint (default True)
             gpu_index: CUDA device index (default 0)
             bright_field: Unattenuated beam reference for flat-field correction
@@ -399,6 +471,7 @@ class TIGREReconstructor:
         self.algorithm = algorithm
         self.iterations = iterations
         self.blocksize = blocksize
+        self.set_w_grid = int(set_w_grid)
         self.lmbda = lmbda
         self.lmbda_red = lmbda_red
         self.nonneg = nonneg
@@ -443,7 +516,9 @@ class TIGREReconstructor:
         self.diag_fn = diag_fn
         self.holdout_index = holdout_index
         self.eval_every = eval_every
+        # None = derive from the schedule (ct_core.early_stop).
         self.patience = patience
+        self.min_stop_iter = min_stop_iter
         # Which held-out metric peaks. SSIM is the default here — the historical
         # choice for this backend, and the structural one, which turns over
         # earliest of the three.
@@ -719,13 +794,15 @@ class TIGREReconstructor:
                 print(f"\nCross-validation: WITHHOLDING projection {idx} "
                       f"({holdout_deg:.1f}° FDK) from the reconstruction; "
                       f"eval every {self.eval_every} iters, "
-                      f"patience={self.patience} checkpoints.")
+                      f"patience={resolve_patience(self.iterations, self.eval_every, self.patience)} "
+                      f"checkpoints.")
             else:
                 print(f"\nDiagnostics: evaluating against projection {idx} "
                       f"({holdout_deg:.1f}° FDK), which STAYS in the "
                       f"reconstruction (pass withhold_eval for true "
                       f"validation); eval every {self.eval_every} iters, "
-                      f"patience={self.patience} checkpoints.")
+                      f"patience={resolve_patience(self.iterations, self.eval_every, self.patience)} "
+                      f"checkpoints.")
 
         if self.algorithm == 'mlem':
             # MLEM's ratio update x_{k+1} = x_k * Atb(p/Ax_k) / Atb(1) implicitly
@@ -761,6 +838,20 @@ class TIGREReconstructor:
 
         if self.gpu_index != 0:
             kwargs['gpuids'] = tigre.utilities.gpu.GpuIds(self.gpu_index)
+
+        if not self.pwls and self.algorithm != 'mlem':
+            # Supply R = 1/L_i ourselves so IterativeReconAlg.set_w() — whose
+            # nVoxel=[2,2,2] grid hangs the CUDA kernel at some field sizes —
+            # is never called. Same quantity, non-degenerate grid; see
+            # geometric_row_weights. MLEM has no relaxation weights.
+            print("\nComputing row weights R = 1/L_i "
+                  f"(grid {self.set_w_grid}^3; TIGRE's own 2^3 grid hangs at "
+                  f"some field sizes)...")
+            _t = time.time()
+            kwargs['W'] = geometric_row_weights(
+                geo, tigre_angles, gpuids=kwargs.get('gpuids'),
+                grid=self.set_w_grid)
+            print(f"  done in {time.time() - _t:.1f} s")
 
         if self.pwls:
             print("\nComputing PWLS weights (geometric x statistical)...")
@@ -832,19 +923,24 @@ class TIGREReconstructor:
             # that decided when to stop was therefore not the number you could
             # see, and neither was comparable with any other backend's.
             scorer = HoldoutScorer(holdout_proj, label=f"projection {idx}")
-            stopper = EarlyStopper(patience=self.patience, metric=self.stop_metric)
+            _patience = resolve_patience(self.iterations, self.eval_every,
+                                         self.patience)
+            _min_iter = resolve_min_iter(self.iterations, self.min_stop_iter)
+            stopper = EarlyStopper(patience=_patience, metric=self.stop_metric,
+                                   min_iter=_min_iter)
             lcurve = None
             if self.l_curve:
                 # A volume backend can afford the EXACT residual over the whole
                 # sinogram — one forward projection per checkpoint — so this
                 # L-curve is the real thing, not a subset proxy.
-                lcurve = LCurve(patience=self.patience, norm=self.l_curve_norm,
+                lcurve = LCurve(patience=_patience, norm=self.l_curve_norm,
                                 residual_kind="full sinogram")
             rules = StoppingRules(stopper=stopper, lcurve=lcurve,
                                   stop_on=self.stop_on)
             self._lcurve = lcurve
             print(f"  Stopping on {' + '.join(self.stop_on)}: held-out "
-                  f"{self.stop_metric} (patience {self.patience})"
+                  f"{self.stop_metric} (patience {_patience}, no stop "
+                  f"before iteration {_min_iter})"
                   + (f", L-curve corner ({self.l_curve_norm} norm, exact residual)"
                      if lcurve is not None else ""))
 
@@ -935,7 +1031,7 @@ class TIGREReconstructor:
                     if 'lcurve' in self.stop_on:
                         lcurve_vols[i_done] = vol_tigre.copy()
                         keep_depth = (max(LCurve.MIN_POINTS, lcurve.smooth)
-                                      + self.patience + 1)
+                                      + _patience + 1)
                         for old in sorted(lcurve_vols)[:-keep_depth]:
                             del lcurve_vols[old]
                     if self.log_fn is not None:
