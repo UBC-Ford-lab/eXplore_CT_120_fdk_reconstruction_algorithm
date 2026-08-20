@@ -205,6 +205,20 @@ def build_tigre_geometry(geometry, N_b, N_a, detector_psi_deg=None,
     return geo
 
 
+def _restore_geo_scalars(geo, scalars):
+    """Put the calibrated per-scan geometry back into TIGRE's scalar form.
+
+    ``IterativeReconAlg`` repmats these to ``(N_angles, k)`` in place, and a
+    one-angle ``Ax`` cannot consume that shape, so they must be reset between
+    the two. Restoring the CALIBRATED values rather than zeros is what keeps
+    psi (and any column-CoR offset) applied for the whole run.
+    """
+    geo.offOrigin = scalars['offOrigin'].copy()
+    geo.offDetector = scalars['offDetector'].copy()
+    geo.rotDetector = scalars['rotDetector'].copy()
+    geo.COR = scalars['COR']
+
+
 def geometric_row_weights(geo, angles, gpuids=None,
                           projection_type="Siddon", grid=8):
     """R = diag(1/L_i): the reciprocal ray path length through the FOV box.
@@ -760,6 +774,17 @@ class TIGREReconstructor:
         print(f"  Detector: {geo.nDetector} px, {geo.dDetector} mm/px")
         print(f"  Volume: {geo.nVoxel} voxels (z,y,x), {geo.dVoxel} mm/voxel")
 
+        # The CALIBRATED scalar form, captured before TIGRE ever repmats
+        # it. Every algorithm call rewrites these in place to
+        # (N_angles, k); the diagnostic Ax needs the (k,) form back, and
+        # restoring them from HERE is what keeps psi alive across chunks.
+        _geo_scalars = {
+            'offOrigin': np.array(geo.offOrigin, dtype=np.float64).copy(),
+            'offDetector': np.array(geo.offDetector, dtype=np.float64).copy(),
+            'rotDetector': np.array(geo.rotDetector, dtype=np.float64).copy(),
+            'COR': float(np.ravel(geo.COR)[0]),
+        }
+
         # Step 3: Convert angles
         tigre_angles = fdk_angles_to_tigre(self.angles)
         print(f"\nAngles: {len(tigre_angles)} projections, "
@@ -967,13 +992,22 @@ class TIGREReconstructor:
                 if self.tv_lambda > 0:
                     vol_tigre = _im3ddenoise(vol_tigre, self.tv_iters, self.tv_lambda)
 
-                # TIGRE's check_geo repmat-s offOrigin→(N,3), offDetector→(N,2),
-                # rotDetector→(N,3), and COR→(N,) during reconstruction.
-                # Reset all to scalar form so Ax passes check_geo for 1 angle.
-                geo.offOrigin = np.array([0.0, 0.0, 0.0])
-                geo.offDetector = np.array([0.0, 0.0])
-                geo.rotDetector = np.array([0.0, 0.0, 0.0])
-                geo.COR = 0.0
+                # TIGRE's check_geo repmat-s offOrigin/offDetector/
+                # rotDetector/COR to (N_angles, k) IN PLACE during
+                # reconstruction (Ax works on a deepcopy, alg_func does
+                # not), and the diagnostic Ax below passes ONE angle,
+                # which cannot consume that shape. So they must go back
+                # to scalar form here - but to the CALIBRATED values.
+                #
+                # Zeroing them (until 2026-08-19) silently dropped the
+                # detector in-plane rotation psi after the FIRST
+                # checkpoint: `geo` is the same object handed to the next
+                # chunk, so a 500-iteration run at --eval-every 10 used
+                # psi for 10 iterations and psi=0 for the other 490. The
+                # projection diagnostics could not catch it because the
+                # diagnostic Ax used the same zeroed geometry - self-
+                # consistent, and blind to exactly this error.
+                _restore_geo_scalars(geo, _geo_scalars)
 
                 # Forward-project at holdout angle and compute metrics.
                 pred = tigre.Ax(vol_tigre, geo, holdout_angle, 'interpolated')[0]
