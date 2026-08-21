@@ -281,7 +281,7 @@ def main():
 
     logger.log_sinogram_preview(ctx.projections)
     logger.log_volume_summary(volume_hu, ctx)
-    logger.log_recon_slices(volume_hu)
+    logger.log_recon_slices(volume_hu, geometry=ctx.geometry)
     logger.finish()
 
     end = time.time()

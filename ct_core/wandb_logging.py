@@ -109,6 +109,55 @@ def add_wandb_args(parser, wandb_default: bool = True) -> None:
 
 HU_WINDOW = (-1000.0, 2000.0)
 
+# --- the canonical axial-slice axis ---------------------------------------
+# A finished volume logs its slices at a step that encodes their PHYSICAL z,
+# not their position in the array and not the run's iteration counter. Two
+# runs of different algorithms, iteration counts and voxel pitches therefore
+# put the same anatomical plane at the same slider position, which is the
+# only way the media panel can compare them slice for slice.
+SLICE_STEP_BASE = 10_000_000   # above any iteration count we will ever run
+SLICE_PITCH_MM = 0.25          # one slider notch, in mm
+
+
+def canonical_slice_plan(n_z: int, dz: float, origin_z: float = 0.0, *,
+                         pitch_mm: float = SLICE_PITCH_MM,
+                         max_slices: int | None = 240):
+    """Map a volume's z axis onto the shared slider grid.
+
+    Returns ``[(step, k, z_mm), ...]``: the W&B step to log at, the source
+    slice index in the volume, and the physical z of that canonical plane
+    (mm, isocentre-referenced, the frame ``geometry['vol_origin']`` is in).
+
+    When the volume needs more notches than ``max_slices``, the pitch is
+    doubled rather than divided by an arbitrary stride, so a coarsened run's
+    steps stay a SUBSET of a finer run's and the two still line up.
+    """
+    n_z = int(n_z)
+    dz = float(dz)
+    if n_z <= 0 or not np.isfinite(dz) or dz <= 0:
+        return []
+    pitch = float(pitch_mm)
+    if not np.isfinite(pitch) or pitch <= 0:
+        raise ValueError(f"pitch_mm must be positive, got {pitch_mm!r}")
+
+    z_lo = float(origin_z) - (n_z - 1) / 2.0 * dz   # centre of slice 0
+    mult = 1
+    if max_slices:
+        extent = (n_z - 1) * dz
+        while extent / (pitch * mult) + 1 > int(max_slices):
+            mult *= 2
+
+    step_mm = pitch * mult
+    i_lo = int(np.ceil(z_lo / step_mm - 1e-9))
+    i_hi = int(np.floor((z_lo + (n_z - 1) * dz) / step_mm + 1e-9))
+    plan = []
+    for i in range(i_lo, i_hi + 1):
+        z = i * step_mm
+        k = int(np.clip(round((z - z_lo) / dz), 0, n_z - 1))
+        plan.append((SLICE_STEP_BASE + i * mult, k, z))
+    return plan
+
+
 
 def midplane_views(volume, geometry: dict):
     """The three central orthogonal slices of an (Nx, Ny, Nz) volume.
@@ -452,12 +501,22 @@ class ReconLogger:
         except Exception as e:                                # noqa: BLE001
             print(f"W&B summary update failed ({type(e).__name__}: {e})")
 
-    def log_volume_summary(self, volume_hu, ctx, hu_window=HU_WINDOW) -> None:
+    def log_volume_summary(self, volume_hu, ctx, hu_window=HU_WINDOW,
+                           views_from=None) -> None:
         """Three individual midplane views + HU histogram + summary scalars
-        for any backend."""
+        for any backend.
+
+        ``views_from`` draws the VIEWS from a different array than the one
+        measured — for a foreign volume that had to be resampled onto our grid
+        to line up with the other runs. That resampling interpolates, and
+        interpolation smooths the histogram, so the HU percentiles and the
+        histogram must keep describing the volume AS STORED while the pictures
+        show the aligned copy.
+        """
         vol = np.asarray(volume_hu)
+        pics = vol if views_from is None else np.asarray(views_from)
         if self.plots_enabled or self.run is not None:
-            for name, sl, xl, yl, extent in midplane_views(vol, ctx.geometry):
+            for name, sl, xl, yl, extent in midplane_views(pics, ctx.geometry):
                 self._emit(f"view_{name}",
                            single_view_figure(name, sl, xl, yl, extent,
                                               hu_window=hu_window))
@@ -571,34 +630,72 @@ class ReconLogger:
         return m
 
     def log_recon_slices(self, volume_hu, hu_window=HU_WINDOW,
-                         max_slices: int = 240) -> None:
+                         max_slices: int = 240, geometry: dict | None = None,
+                         pitch_mm: float = SLICE_PITCH_MM) -> None:
         """The finished volume as a scrollable axial-slice sequence (W&B
-        only — hundreds of local PNGs would just be clutter). Slices log at
-        steps beyond the last training step so they never collide."""
+        only — hundreds of local PNGs would just be clutter).
+
+        With a ``geometry`` (any dict carrying ``dz`` and ``vol_origin``) the
+        slices land on the canonical physical-z grid, so this run's slider
+        agrees plane for plane with every other run of the same scan. Without
+        one they fall back to array index, which is comparable only between
+        volumes that happen to share a grid.
+        """
         if self.run is None:
             return
         try:
             import wandb
             vol = np.asarray(volume_hu)
             Nz = vol.shape[2]
-            stride = max(1, int(np.ceil(Nz / max_slices)))
             lo, hi = hu_window
             # W&B's internal step also advances on every un-stepped log call
-            # (each figure upload), so start beyond BOTH counters — otherwise
-            # the first slices land on already-passed steps and are dropped.
+            # (each figure upload), so anything we log has to sit beyond BOTH
+            # counters — otherwise it lands on an already-passed step and is
+            # dropped.
             wb_step = int(getattr(self.run, "step", 0) or 0)
-            base = max(self._max_step, wb_step) + 1
-            n_logged = 0
-            for k in range(0, Nz, stride):
+            reached = max(self._max_step, wb_step)
+
+            plan, canonical = [], False
+            if geometry is not None:
+                dz = float(geometry.get("dz", 0.0) or 0.0)
+                origin_z = float((geometry.get("vol_origin")
+                                  or (0.0, 0.0, 0.0))[2])
+                plan = canonical_slice_plan(Nz, dz, origin_z,
+                                            pitch_mm=pitch_mm,
+                                            max_slices=max_slices)
+                canonical = bool(plan) and plan[0][0] > reached
+                if plan and not canonical:
+                    print(f"  W&B: run already at step {reached}, past the "
+                          f"canonical slice axis — falling back to array "
+                          f"index (these slices will NOT line up with other "
+                          f"runs)")
+            if not canonical:
+                stride = max(1, int(np.ceil(Nz / max_slices)))
+                base = reached + 1
+                plan = [(base + k, k, float("nan"))
+                        for k in range(0, Nz, stride)]
+
+            for step, k, z_mm in plan:
                 sl = np.clip((vol[:, :, k].T - lo) / (hi - lo), 0.0, 1.0)
                 img = (sl * 255.0).astype(np.uint8)[::-1]  # origin-lower
-                self.run.log(
-                    {"recon_slices": wandb.Image(
-                        img, caption=f"z-slice {k}/{Nz}")},
-                    step=base + k)
-                n_logged += 1
-            print(f"  W&B: logged {n_logged} axial slices (recon_slices"
-                  f"{f', stride {stride}' if stride > 1 else ''})")
+                caption = (f"z = {z_mm:+.2f} mm (slice {k}/{Nz})"
+                           if canonical else f"z-slice {k}/{Nz}")
+                payload = {"recon_slices": wandb.Image(img, caption=caption)}
+                if canonical:
+                    # Companion keys so the media panel's slider can be keyed
+                    # on physical z instead of _step and still agree across
+                    # runs. Logged in the SAME call, as W&B requires.
+                    payload["slice_z_mm"] = z_mm
+                    payload["slice_index"] = step - SLICE_STEP_BASE
+                self.run.log(payload, step=step)
+            if canonical:
+                notch = (plan[1][0] - plan[0][0]) if len(plan) > 1 else 1
+                print(f"  W&B: logged {len(plan)} axial slices "
+                      f"(recon_slices, canonical z axis, "
+                      f"{notch * pitch_mm:.2f} mm per notch)")
+            else:
+                print(f"  W&B: logged {len(plan)} axial slices "
+                      f"(recon_slices, array index)")
         except Exception as e:
             print(f"W&B recon_slices failed ({type(e).__name__}: {e})")
 

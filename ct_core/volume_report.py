@@ -77,6 +77,7 @@ def load_sidecar(path, *, verbose: bool = True) -> dict:
 # --------------------------------------------------------------------- load --
 
 def load_reconstructed_volume(path, *, y_flip: bool = True,
+                              flip_axes=(),
                               hu_from_header: bool = False,
                               verbose: bool = True):
     """Load a finished volume as float32 HU in the pipeline's (x, y, z) order.
@@ -88,6 +89,19 @@ def load_reconstructed_volume(path, *, y_flip: bool = True,
     it off for a foreign file that is mirrored the other way. ``hu_from_header``
     applies the header's water/air anchors — see the module docstring for why
     that is normally wrong.
+
+    ``flip_axes`` reverses whole axes AFTER the load, in the final (x, y, z)
+    order — for a foreign file whose axis conventions differ from this
+    package's. It is separate from ``y_flip`` on purpose: ``y_flip`` inverts
+    OUR OWN writer, while this describes THEIR convention.
+
+    MEASURED 2026-08-19 on Scan_1510's vendor volume: it needs ``('x',)``.
+    Scoring all eight sign combinations against a trusted reconstruction
+    resampled onto the same lattice gave -x+y+z at NCC 0.899, against 0.788 for
+    +x+y+z and 0.634 for +x-y+z. Because a coronal view is (z, x), an
+    unaccounted x mirror shows up as a left-right flipped coronal image while
+    leaving the axial view looking plausible — check all three axes, not just
+    the one there is a flag for.
 
     Returns ``(volume, header)`` where volume is float32 (Nx, Ny, Nz).
     """
@@ -117,6 +131,14 @@ def load_reconstructed_volume(path, *, y_flip: bool = True,
     if y_flip:
         data = data[:, ::-1, :]
     volume = np.ascontiguousarray(data.transpose(2, 1, 0), dtype=np.float32)
+
+    for _ax in (flip_axes or ()):
+        _i = {'x': 0, 'y': 1, 'z': 2}.get(str(_ax).lower())
+        if _i is None:
+            raise ValueError(f"flip_axes entries must be x, y or z, got {_ax!r}")
+        volume = np.ascontiguousarray(np.flip(volume, axis=_i))
+    if verbose and flip_axes:
+        print(f"  Flipped axes {tuple(flip_axes)} (foreign axis convention)")
 
     if hu_from_header:
         water = float(header.get('water', 0.0))
