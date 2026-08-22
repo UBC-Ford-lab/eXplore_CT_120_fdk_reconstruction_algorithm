@@ -36,11 +36,13 @@ from typing import Iterable, Mapping
 import torch
 import torch.nn as nn
 
+from .adam_bf16 import AdamBF16
+
 __all__ = [
-    "AMP_MODES", "LR_SCHEDULES", "autocast_ctx", "build_optimizer",
-    "build_param_groups", "clip_grad_norm", "lr_multiplier",
-    "maybe_compile_model", "project_nonneg", "resolve_amp_dtype",
-    "unwrap_model",
+    "AdamBF16", "AMP_MODES", "LR_SCHEDULES", "OPTIMIZERS", "autocast_ctx",
+    "build_optimizer", "build_param_groups", "clip_grad_norm",
+    "fused_adam_supported", "lr_multiplier", "maybe_compile_model",
+    "project_nonneg", "resolve_amp_dtype", "unwrap_model",
 ]
 
 #: Accepted `amp` settings. 'fp16' is recognised only so it can be rejected
@@ -253,25 +255,82 @@ def build_param_groups(model: nn.Module, *, lr: float,
     return groups
 
 
+#: The optimizers a run may name. Adam and its bfloat16-state variant take the
+#: same arguments and produce the same update; SGD is the classical one (see
+#: the note in `build_optimizer`). Keys must stay in step with
+#: `ct_core.preflight.PARAM_COPIES`, which sizes VRAM from the same names.
+OPTIMIZERS = {
+    "adam": torch.optim.Adam,
+    "adam_bf16": AdamBF16,
+    "sgd": torch.optim.SGD,
+}
+
+
+def fused_adam_supported(param_groups) -> bool:
+    """Whether torch's FUSED Adam kernel can take these parameters.
+
+    Worth asking, because the answer is worth 2.5x the optimizer step and the
+    optimizer step is not a rounding error here: on the voxel backend the
+    parameters ARE the volume, so Adam moves ~0.5 GiB per iteration whatever
+    the ray batch is. MEASURED on a P100 at 34 M parameters: 4.65 ms for the
+    default foreach path (a chain of separate elementwise kernels, each one
+    re-reading its operands) against 1.88 ms fused (one kernel, one pass).
+    The two agree to 1e-6 over 200 steps — same arithmetic, fewer trips to
+    memory.
+
+    Fused Adam is CUDA-only and floating-point-only. Everything else — CPU
+    runs, the test suite, an exotic dtype — has to take the ordinary path,
+    so this is a question rather than an assumption.
+    """
+    params = [p for g in param_groups for p in g.get("params", ())]
+    if not params or not torch.cuda.is_available():
+        return False
+    ok = (torch.float32, torch.float16, torch.bfloat16)
+    return all(p.is_cuda and p.dtype in ok for p in params)
+
+
 def build_optimizer(model: nn.Module, *, lr: float, weight_decay: float = 0.0,
                     group_lrs: Mapping[str, float] | None = None,
                     optimizer: str = "adam", verbose: bool = True):
-    """Adam (or SGD) over `build_param_groups`.
+    """Adam, Adam with bfloat16 moments, or SGD over `build_param_groups`.
 
     SGD is offered because it is what the classical update is: Adam's
     second-moment normalisation is itself a per-parameter preconditioner, so a
     run that also applies an explicit one (SART's C) would have two competing
     and would not be the classical method.
+
+    ``adam_bf16`` is the same update as ``adam`` with the two moment buffers
+    held in bfloat16 — on the voxel backend each of those buffers is a whole
+    CT volume, so it returns one volume of VRAM to the ray batch. See
+    `adam_bf16.AdamBF16` for why that needs stochastic rounding to be correct.
     """
     name = str(optimizer).strip().lower()
-    if name not in ("adam", "sgd"):
-        raise ValueError(f"optimizer must be 'adam' or 'sgd', got {optimizer!r}")
+    if name not in OPTIMIZERS:
+        raise ValueError(
+            f"optimizer must be one of {sorted(OPTIMIZERS)}, got {optimizer!r}")
     if verbose:
-        print(f"  Optimizer: {name.upper()} (weight_decay {weight_decay:g})")
+        note = (" — moments in bfloat16, 3x resident volumes instead of 4x"
+                if name == "adam_bf16" else "")
+        print(f"  Optimizer: {name.upper()} (weight_decay {weight_decay:g})"
+              f"{note}")
     groups = build_param_groups(model, lr=lr, group_lrs=group_lrs,
                                 verbose=verbose)
-    cls = torch.optim.Adam if name == "adam" else torch.optim.SGD
-    return cls(groups, weight_decay=float(weight_decay))
+    kwargs = dict(weight_decay=float(weight_decay))
+    if name == "adam" and fused_adam_supported(groups):
+        kwargs["fused"] = True
+    try:
+        return OPTIMIZERS[name](groups, **kwargs)
+    except (RuntimeError, TypeError) as exc:
+        # A torch that does not accept `fused`, or accepts it and then refuses
+        # these tensors. The unfused path is the same optimizer, so fall back
+        # loudly rather than failing the run over a performance flag.
+        if "fused" not in kwargs:
+            raise
+        if verbose:
+            print(f"    (fused Adam unavailable: {exc} — using the standard "
+                  f"kernel)")
+        kwargs.pop("fused")
+        return OPTIMIZERS[name](groups, **kwargs)
 
 
 # ------------------------------------------------------------------- steps --

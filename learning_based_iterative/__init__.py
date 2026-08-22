@@ -52,14 +52,16 @@ from .renderer import (
     render_rays_hierarchical,
     scale_grad,
     set_render_compile,
+    fusion_supported,
 )
 from .detector_warp import (
     DetectorWarp,
     detector_serial_from_scan,
     resolve_detector_warp,
 )
-from .training import (autocast_ctx, build_optimizer, build_param_groups,
-                       clip_grad_norm, maybe_compile_model, project_nonneg,
+from .training import (OPTIMIZERS, AdamBF16, autocast_ctx, build_optimizer,
+                       build_param_groups, clip_grad_norm,
+                       maybe_compile_model, project_nonneg,
                        resolve_amp_dtype, unwrap_model)
 from .trainer import LearnedReconstructor
 from .voxel.model import VoxelGrid, voxel_grid_shape
@@ -74,7 +76,9 @@ __all__ = [
     "ray_aabb_intersect", "ray_cylinder_intersect", "ray_domain_intersect",
     "render_rays", "render_rays_hierarchical", "scale_grad",
     "COMPILE_MODES", "render_compile_mode", "set_render_compile",
+    "fusion_supported",
     "DetectorWarp", "detector_serial_from_scan", "resolve_detector_warp",
+    "OPTIMIZERS", "AdamBF16",
     "autocast_ctx", "build_optimizer", "build_param_groups",
     "clip_grad_norm", "maybe_compile_model", "project_nonneg",
     "resolve_amp_dtype", "unwrap_model",

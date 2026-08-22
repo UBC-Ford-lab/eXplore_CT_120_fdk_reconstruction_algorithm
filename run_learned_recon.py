@@ -169,12 +169,18 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
                              'classical recipe. NOT strict SIRT: batches stay '
                              'random subsets, which is the SART/ordered-subset '
                              'family.')
-    parser.add_argument('--optimizer', default=None, choices=('adam', 'sgd'),
+    parser.add_argument('--optimizer', default=None,
+                        choices=('adam', 'adam_bf16', 'sgd'),
                         help='Optimizer. Default: adam, or sgd under '
                              '--emulate-sart. Setting it explicitly is always '
                              'respected — pairing adam with --emulate-sart '
                              'warns rather than being overridden, since Adam is '
-                             'itself a preconditioner competing with C.')
+                             'itself a preconditioner competing with C. '
+                             'adam_bf16 is the same update with the moment '
+                             'buffers in bfloat16: on the voxel backend each '
+                             'buffer is a whole volume, so it drops the '
+                             'resident cost from 4x to 3x and buys back ~1.7x '
+                             'the ray batch.')
     parser.add_argument('--sart-outside-weight', type=float, default=0.25,
                         metavar='W',
                         help='With --emulate-sart, the rate at which path '
@@ -217,6 +223,18 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
     parser.add_argument('--lr-warmup-iters', type=int, default=500,
                         help='Linear LR warmup steps before cosine decay '
                              '(default: 500)')
+    parser.add_argument(
+        '--subpixel-rays', action=argparse.BooleanOptionalAction, default=True,
+        help='(default: on) Place each training ray uniformly inside its '
+             'detector pixel '
+             'instead of at the pixel centre. A detector pixel integrates the '
+             'beam over its footprint (84.9 um at isocentre on Scan_1988 at '
+             '--downsample 3, comparable to a 100 um voxel); sampling the '
+             'centre models it as a delta function, making the forward model '
+             'sharper than the instrument. Since rays are already drawn at '
+             'random this costs nothing — over iterations the jitter becomes a '
+             'Monte-Carlo integral over the pixel. Changes the forward '
+             'operator, so runs with and without it are not bit-comparable.')
     parser.add_argument('--samples-per-ray', type=int, default=None,
                         help='Quadrature samples per ray (default: auto = '
                              '~0.55-voxel steps across the FOV chord, the '
@@ -229,16 +247,18 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
                         help='Sampling seed (default: 0)')
     parser.add_argument('--gpu-index', type=int, default=0,
                         help='CUDA device index (default: 0)')
-    parser.add_argument('--compile', dest='compile_mode', default='off',
+    parser.add_argument('--compile', dest='compile_mode', default='on',
                         choices=('off', 'on', 'max-autotune'),
                         help='Fuse the renderer kernels with torch.compile '
-                             '(default: off). The forward is bandwidth-bound, '
+                             '(default: on). The forward is bandwidth-bound, '
                              'so fusing the quadrature chain cuts the traffic '
-                             'per step roughly in half. Off by default because '
-                             'fusion reorders floating-point ops: a compiled '
-                             'run is comparable with other compiled runs, not '
-                             'with an eager baseline. max-autotune benchmarks '
-                             'kernel variants (minutes of extra compile).')
+                             'per step roughly in half. Needs Triton, i.e. '
+                             'compute capability >= 7.0; on an older card the '
+                             'run prints why and proceeds eager. Pass off to '
+                             'make a run bit-comparable with an eager '
+                             'baseline, since fusion reorders floating-point '
+                             'ops. max-autotune benchmarks kernel variants '
+                             '(minutes of extra compile).')
     parser.add_argument('--detector-warp', default='off',
                         choices=('off', 'auto', 'nonaffine', 'full'),
                         help='Per-pixel detector distortion correction applied '
@@ -425,6 +445,8 @@ def main():
                                 else None),
         'lr_warmup_iters': args.lr_warmup_iters,
         'samples_per_ray': args.samples_per_ray,
+        'samples_per_ray_mode': 'pinned' if args.samples_per_ray else 'auto',
+        'subpixel_rays': args.subpixel_rays,
         'init_density': args.init_density,
         'seed': args.seed,
         'compile': args.compile_mode,
@@ -484,6 +506,7 @@ def main():
         iterations=args.iterations,
         rays_per_batch=args.rays_per_batch,
         samples_per_ray=args.samples_per_ray,
+        subpixel_rays=args.subpixel_rays,
         lr_warmup_iters=args.lr_warmup_iters,
         init_density=args.init_density,
         gpu_index=args.gpu_index,
@@ -534,6 +557,33 @@ def main():
         extra={'data/iterations_run': reconstructor.iterations_run,
                'data/rays_per_batch': reconstructor.rays_per_batch,
                'data/rays_per_batch_mode': 'auto' if auto_batch else 'pinned'})
+
+    # The other half of that trade. Rays/batch is VRAM-limited by rays x
+    # samples, so the ray step and the data budget above are bought with the
+    # same memory: a coarser step buys more measurements per iteration and
+    # pays in forward-model fidelity. Recording both makes the exchange rate
+    # of a run legible after the fact instead of a thing to re-derive from
+    # the geometry. Read off the trainer, which resolves 'auto' against the
+    # MEASURED model domain — the driver's own estimate above only has to be
+    # close enough to size VRAM.
+    _q = getattr(reconstructor, 'quadrature', None) or {}
+    if _q:
+        logger.set_summary({
+            'quadrature/samples_per_ray': int(_q['samples_per_ray']),
+            'quadrature/mode': str(_q['mode']),
+            'quadrature/step_mm_mean': float(_q['step_mm_mean']),
+            'quadrature/step_mm_widest': float(_q['step_mm_widest']),
+            'quadrature/step_voxels_mean': float(_q['step_voxels_mean']),
+            'quadrature/step_voxels_widest': float(_q['step_voxels_widest']),
+            'quadrature/samples_per_voxel_mean':
+                float(_q['samples_per_voxel_mean']),
+            'quadrature/samples_per_voxel_widest':
+                float(_q['samples_per_voxel_widest']),
+            'quadrature/chord_mm_mean': float(_q['chord_mm_mean']),
+            'quadrature/chord_mm_widest': float(_q['chord_mm_widest']),
+            'quadrature/voxel_mm': float(_q['voxel_mm']),
+            'quadrature/ray_hit_fraction': float(_q['ray_hit_fraction']),
+        })
 
     # Crop the reconstruction domain down to what is worth saving, THEN
     # calibrate and export. Everything downstream reports the delivered

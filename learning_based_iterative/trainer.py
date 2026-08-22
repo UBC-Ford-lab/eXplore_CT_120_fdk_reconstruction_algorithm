@@ -86,10 +86,12 @@ from ..ct_core.preprocessing import preprocess_sinogram
 from .losses import DEFAULT_DATA_TERM, build_data_term
 from .ray_sampler import (rays_from_indices, sample_projection_patch,
                           sample_random_rays, sample_random_rows)
-from .renderer import render_compile_mode, render_rays, set_render_compile
+from .renderer import (fusion_supported, ray_domain_intersect,
+                       render_compile_mode, render_rays, set_render_compile)
 from .scene import Scene, model_domain_from_geometry
 from ..ct_core.early_stop import resolve_min_iter, resolve_patience
-from .training import (autocast_ctx, build_optimizer, clip_grad_norm,
+from .training import (OPTIMIZERS, autocast_ctx, build_optimizer,
+                       clip_grad_norm,
                        lr_multiplier, maybe_compile_model, project_nonneg,
                        resolve_amp_dtype, unwrap_model)
 from .volume import EXPORT_CHUNK, render_volume  # noqa: F401 (EXPORT_CHUNK re-exported)
@@ -110,10 +112,11 @@ class LearnedReconstructor:
                  rays_per_batch: int = 16384,
                  lr: float = 1e-4,
                  samples_per_ray: int | None = None,
+                 subpixel_rays: bool = True,
                  lr_warmup_iters: int = 500,
                  gpu_index: int = 0,
                  seed: int = 0,
-                 compile_mode: str = "off",
+                 compile_mode: str = "on",
                  bright_field=None, dark_field=None,
                  ring_correction: bool = False,
                  air_normalization: bool = True,
@@ -166,13 +169,23 @@ class LearnedReconstructor:
         self.rays_per_batch = int(rays_per_batch)
         self.lr = float(lr)
         self.samples_per_ray = samples_per_ray
+        #: Place each ray uniformly inside its detector pixel rather than at
+        #: the centre. ON by default: the pixel INTEGRATES the beam over its
+        #: footprint, so the centre is an approximation the stochastic sampler
+        #: removes for free (measured -14% volume noise, -19% edge fringes on
+        #: Scan_1988). See ray_sampler.sample_random_rays.
+        self.subpixel_rays = bool(subpixel_rays)
         self.lr_warmup_iters = int(lr_warmup_iters)
         self.gpu_index = int(gpu_index)
         self.seed = int(seed)
-        # torch.compile fusion of the RENDERER's elementwise kernels. Off by
-        # default: fusion reorders floating-point ops, so a compiled run is
-        # not bit-comparable with an eager one and the mode has to travel
-        # with the run's config. See renderer.set_render_compile. The MODEL is
+        # torch.compile fusion of the RENDERER's elementwise kernels. ON by
+        # default: the forward is bandwidth-bound and fusion roughly halves
+        # the traffic. It reorders floating-point ops, so a compiled run is
+        # not bit-comparable with an eager one — which is why the mode has to
+        # travel with the run's config, and why a run that must match an eager
+        # baseline passes 'off' explicitly. Downgraded to eager, with a
+        # printed reason, on hardware Triton cannot target (see
+        # renderer.fusion_supported). The MODEL is
         # compiled separately (`compile_model`) because the two are worth
         # different amounts: a hash grid + MLP trunk benefits, a single
         # grid_sample does not.
@@ -342,14 +355,14 @@ class LearnedReconstructor:
             self.optimizer_name = str(optimizer).strip().lower()
         if self.emulate_sart:
             self.loss = "sart"
-            if self.optimizer_name == "adam":
+            if self.optimizer_name.startswith("adam"):
                 print("  NOTE: --emulate-sart with Adam. Adam's second-moment "
                       "normalisation is itself a preconditioner and competes "
                       "with C, so this is not the classical update. Drop "
                       "--optimizer to get SGD.")
-        if self.optimizer_name not in ("adam", "sgd"):
+        if self.optimizer_name not in OPTIMIZERS:
             raise ValueError(
-                f"optimizer must be 'adam' or 'sgd', got "
+                f"optimizer must be one of {sorted(OPTIMIZERS)}, got "
                 f"{self.optimizer_name!r}")
 
         # Optional live-metric sink: Callable[[dict, int], None]. Keeps this
@@ -367,6 +380,8 @@ class LearnedReconstructor:
         self.delivered_iter = 0
         self.stopped_by = None
         self.convergence: dict | None = None
+        #: Resolved+measured ray quadrature; see _measure_quadrature.
+        self.quadrature: dict = {}
         self.n_measurements = 0
         self.iterations_run = 0
         self.data_visits = 0.0
@@ -436,6 +451,83 @@ class LearnedReconstructor:
         chord = (2.0 * float(domain.radius_xy) if domain.radius_xy is not None
                  else float((domain.aabb_max - domain.aabb_min).max()))
         return max(64, int(math.ceil(chord / (0.55 * dx))))
+
+    class _SkipProbeError(Exception):
+        """n_probe=0 — report the analytic step only, draw no rays."""
+
+    def _measure_quadrature(self, scene, domain, spp: int, device,
+                            n_probe: int = 8192) -> dict:
+        """What the ray step ACTUALLY is, measured rather than assumed.
+
+        `_auto_samples_per_ray` sizes the step from the WIDEST chord, so that
+        number is an upper bound on the step and every other ray is sampled
+        finer than it. The average matters because it, not the bound, is what
+        the quadrature error is a function of across the batch — and the gap
+        between them is large whenever the model domain is much wider than the
+        object (a short chord through the edge of the cylinder gets the same
+        `spp` as one straight through the middle).
+
+        Probe rays come from their own generator: this must not consume the
+        training RNG stream, or turning the measurement on would change the
+        reconstruction. No model is evaluated — it is a geometry intersection.
+        """
+        dx = float(self.geometry["dx"])
+        widest = (2.0 * float(domain.radius_xy) if domain.radius_xy is not None
+                  else float((domain.aabb_max - domain.aabb_min).max()))
+        rec = {
+            "samples_per_ray": int(spp),
+            "mode": "pinned" if self.samples_per_ray else "auto",
+            "chord_mm_widest": float(widest),
+            "step_mm_widest": float(widest) / int(spp),
+            "voxel_mm": dx,
+        }
+        if int(n_probe) <= 0:                  # probe off: analytic fields only
+            rec["chord_mm_mean"] = float("nan")
+            rec["ray_hit_fraction"] = float("nan")
+            n_probe = 0
+        try:
+            if not n_probe:
+                raise self._SkipProbeError
+            gen = torch.Generator(device=device).manual_seed(self.seed + 7717)
+            # Same exclusion the training sampler uses, so this describes the
+            # rays the run actually integrates. Nothing is evaluated here, so
+            # it leaks no held-out signal either way — but a probe that
+            # measured a different ray population than it reports on would be
+            # quietly wrong the moment an angle is withheld.
+            exclude = None
+            if self.withhold_eval and self.crossval and scene.n_angles > 1:
+                exclude = resolve_holdout_index(self.holdout_index,
+                                                scene.n_angles)
+            o, d, _ = sample_random_rays(scene, int(n_probe), generator=gen,
+                                         device=device, exclude_angle=exclude,
+                                         subpixel=self.subpixel_rays)
+            with torch.no_grad():
+                t_near, t_far, hit = ray_domain_intersect(o, d, domain)
+                # `hit` is the renderer's OWN validity mask, not a >0 test on
+                # the segment: a ray that misses still returns a clamped
+                # interval, and averaging those in would understate the step.
+                seg = (t_far - t_near)[hit]
+                chord_mean = float(seg.mean()) if seg.numel() else float("nan")
+            rec["chord_mm_mean"] = chord_mean
+            rec["ray_hit_fraction"] = float(hit.float().mean())
+        except self._SkipProbeError:
+            pass
+        except Exception as e:                      # pragma: no cover - env dep
+            print(f"  (quadrature probe unavailable: {type(e).__name__}: {e})")
+            rec["chord_mm_mean"] = float("nan")
+            rec["ray_hit_fraction"] = float("nan")
+
+        rec["step_mm_mean"] = rec["chord_mm_mean"] / int(spp)
+        rec["step_voxels_mean"] = rec["step_mm_mean"] / dx
+        rec["step_voxels_widest"] = rec["step_mm_widest"] / dx
+        # The oversampling factor the auto rule is written in terms of: 1.00
+        # is one sample per voxel (Nyquist for a trilinear grid only if the
+        # field were band-limited, which it is not), 1.82 is the 0.55 default.
+        rec["samples_per_voxel_mean"] = (dx / rec["step_mm_mean"]
+                                         if rec["step_mm_mean"] else float("nan"))
+        rec["samples_per_voxel_widest"] = (dx / rec["step_mm_widest"]
+                                           if rec["step_mm_widest"] else float("nan"))
+        return rec
 
     def _preprocess(self) -> np.ndarray:
         return preprocess_sinogram(
@@ -520,7 +612,7 @@ class LearnedReconstructor:
             def sample_batch(*, exclude_angle=None):
                 o, d, tgt = sample_random_rays(
                     scene, self.rays_per_batch, generator=gen, device=device,
-                    exclude_angle=exclude_angle)
+                    exclude_angle=exclude_angle, subpixel=self.subpixel_rays)
                 chord_state["chord"] = ray_support_lengths(
                     o, d, scene, spp, roi_min=rmin, roi_max=rmax,
                     roi_radius=radius, roi_center_xy=centre,
@@ -570,7 +662,8 @@ class LearnedReconstructor:
             def sample_batch(*, exclude_angle=None):
                 return sample_random_rays(scene, self.rays_per_batch,
                                           generator=gen, device=device,
-                                          exclude_angle=exclude_angle)
+                                          exclude_angle=exclude_angle,
+                                          subpixel=self.subpixel_rays)
             desc = f"{self.rays_per_batch} random rays per step"
 
         return build_data_term(self.loss, **opts), sample_batch, desc
@@ -599,9 +692,14 @@ class LearnedReconstructor:
 
         spp = (int(self.samples_per_ray) if self.samples_per_ray
                else self._auto_samples_per_ray(domain))
-        step_mm = (2.0 * float(domain.radius_xy)) / spp if domain.radius_xy else float("nan")
-        print(f"  Quadrature: {spp} samples/ray (~{step_mm:.4f} mm; export "
-              f"voxel {float(self.geometry['dx']):.4f} mm)")
+        self.quadrature = self._measure_quadrature(scene, domain, spp, device)
+        q = self.quadrature
+        print(f"  Quadrature: {spp} samples/ray "
+              f"({'auto' if not self.samples_per_ray else 'pinned'}) — "
+              f"step {q['step_mm_mean']:.4f} mm mean / "
+              f"{q['step_mm_widest']:.4f} mm at the widest chord, i.e. "
+              f"{q['samples_per_voxel_mean']:.2f} samples per "
+              f"{float(self.geometry['dx']):.4f} mm voxel")
 
         model = self.build_model(domain, device).to(device)
         n_params = sum(p.numel() for p in unwrap_model(model).parameters())
@@ -728,12 +826,21 @@ class LearnedReconstructor:
         # stream are all exactly what an eager run would see — the only
         # difference between `--compile off` and `--compile on` is the kernels.
         set_render_compile(self.compile_mode)
+        if self.compile_mode != "off":
+            # Checked before compiling, not caught after: on a card Triton
+            # cannot target this is the difference between one honest line and
+            # a compile attempt that raises through _fused on the first render.
+            _ok, _why = fusion_supported(device)
+            if not _ok:
+                set_render_compile("off")
+                print(f"  torch.compile skipped: {_why} — running eager.")
         if render_compile_mode() != "off" or self.compile_model:
             t_c = time.time()
             warm_gen = torch.Generator(device=device).manual_seed(self.seed + 9973)
             w_o, w_d, w_t = sample_random_rays(
                 scene, self.rays_per_batch, generator=warm_gen, device=device,
-                exclude_angle=holdout if self.withhold_eval else None)
+                exclude_angle=holdout if self.withhold_eval else None,
+                subpixel=self.subpixel_rays)
             with autocast_ctx(amp_dtype, device.type):
                 w_pred = self._render_fn(w_o, w_d, model, scene,
                                          num_samples=spp, stratified=True,

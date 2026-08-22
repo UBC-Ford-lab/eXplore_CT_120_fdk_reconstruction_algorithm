@@ -29,10 +29,17 @@ the backward pass. Note this is NOT AMP: `grid_sample`, the elementwise chain
 and the reduction all stay float32 (autocast would downcast none of them
 anyway, as it only targets matmul, of which this path has none).
 
-Off by default, because fusion reorders floating-point operations: results
-move in the last bits, so an fp32 baseline and a compiled run are not exactly
-comparable and a run must record which mode produced it. Turn it on with
-`--compile on` (the driver) or `set_render_compile('on')`.
+ON by default since 2026-08-21. Fusion reorders floating-point operations, so
+results move in the last bits and an eager baseline is not bit-comparable with
+a compiled run — which is why the mode travels with the run's config rather
+than why it stays off. Turn it off with `--compile off` (the driver) or
+`set_render_compile('off')` when a run has to be bit-comparable with an eager
+one.
+
+The fusion needs Triton, which needs compute capability >= 7.0 (Volta). On
+anything older — a P100 is Pascal, 6.0 — `fusion_supported` reports why and
+the caller downgrades to eager, so asking for fusion on a card that cannot do
+it costs nothing and says so.
 """
 
 from __future__ import annotations
@@ -81,6 +88,35 @@ def set_render_compile(mode: str = "off") -> str:
         _COMPILE_FAILED = False
     _COMPILE_MODE = mode
     return _COMPILE_MODE
+
+
+#: Volta. Triton, torch.compile's Inductor backend, does not support Pascal.
+#: Same gate as `training.TENSOR_CORE_CAPABILITY`, kept here so the renderer
+#: does not import the training module for one integer.
+FUSION_MIN_CAPABILITY = 7
+
+
+def fusion_supported(device=None) -> tuple[bool, str]:
+    """Whether `torch.compile` fusion can actually run here, and why not.
+
+    Checked BEFORE compiling rather than caught after, so a run on a card that
+    cannot fuse prints one honest line and proceeds eager, instead of paying a
+    compile attempt and raising a RuntimeWarning through `_fused`.
+    """
+    if not hasattr(torch, "compile"):
+        return False, "this torch has no torch.compile"
+    if not torch.cuda.is_available():
+        return False, "no CUDA device (Inductor's CPU backend is not the win here)"
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+    except Exception as exc:                       # pragma: no cover - env dep
+        return False, f"could not read the compute capability ({exc})"
+    if major < FUSION_MIN_CAPABILITY:
+        name = torch.cuda.get_device_name(device)
+        return False, (f"{name} is compute capability {major}.{minor} < "
+                       f"{FUSION_MIN_CAPABILITY}.0 — Triton/Inductor does not "
+                       f"support Pascal")
+    return True, ""
 
 
 def render_compile_mode() -> str:

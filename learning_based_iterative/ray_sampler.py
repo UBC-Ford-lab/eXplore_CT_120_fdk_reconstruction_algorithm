@@ -67,8 +67,15 @@ def rays_from_indices(
     angle_idx: torch.Tensor,
     b_idx: torch.Tensor,
     a_idx: torch.Tensor,
+    b_sub: torch.Tensor | None = None,
+    a_sub: torch.Tensor | None = None,
 ):
     """Construct rays from index tensors (all 1-D, length N).
+
+    ``b_sub``/``a_sub`` displace the ray WITHIN its detector pixel, in units of
+    the pixel pitch. They move the ray only — the measurement is still read at
+    the integer pixel, because that integer pixel is what the detector
+    reported. See `sample_random_rays` for why anyone would want that.
 
     Returns
     -------
@@ -114,6 +121,15 @@ def rays_from_indices(
     # consistent. Absent => exact no-op. See inr_pipeline/detector_warp.py.
     _warp = geom.get("detector_warp")
     a_i, b_i = a_idx.to(theta), b_idx.to(theta)
+    # Sub-pixel displacement goes on the RAW index, before the warp: the
+    # position being described is a physical spot on the detector, and the warp
+    # is the map from raw detector coordinates to the ideal grid the geometry
+    # equations assume. Displacing after the warp would move the ray to a place
+    # no photon came from.
+    if a_sub is not None:
+        a_i = a_i + a_sub.to(theta)
+    if b_sub is not None:
+        b_i = b_i + b_sub.to(theta)
     if _warp is not None:
         b_i, a_i = _warp.ideal_indices(b_i, a_i,
                                        downsample=int(geom.get("sinogram_downsample", 1)))
@@ -154,6 +170,7 @@ def sample_random_rays(
     generator: torch.Generator | None = None,
     device: torch.device | str | None = None,
     exclude_angle: int | None = None,
+    subpixel: bool = True,
 ):
     """Sample n rays uniformly across (angle, row, col).
 
@@ -165,6 +182,37 @@ def sample_random_rays(
     Per-iter overhead is dominated by the renderer + MLP, not this function.
 
     ``exclude_angle`` (if set) is never sampled — the held-out validation angle.
+
+    ``subpixel`` (ON by default since 2026-08-22) places each ray uniformly
+    inside its detector pixel instead of exactly at the centre. The centre is
+    the approximation: a detector pixel
+    does not sample a point, it INTEGRATES the beam over its footprint — 84.9 um
+    at isocentre on Scan_1988 at downsample 3, which is comparable to a 100 um
+    voxel. Sampling the centre models the detector as a grid of delta functions
+    when it is physically a grid of boxes, so the forward model is sharper than
+    the instrument and the fit has to invent high-frequency structure to
+    reconcile the two.
+
+    Because rays are already drawn at random, the fix is free: over iterations
+    the jittered ray becomes a Monte-Carlo integral over the pixel footprint,
+    and the model is driven to match the pixel MEAN of the line integral. That
+    is the linear part of the detector's response. The remaining nonlinearity —
+    the detector averages TRANSMISSION, so the true value is
+    -ln(mean exp(-p)) rather than mean(p) — needs several rays per pixel
+    combined nonlinearly, and matters only where the line integral varies
+    steeply within one pixel (rays nearly tangent to a high-contrast surface).
+
+    MEASURED on Scan_1988 (voxel Adam, identical settings either way, 100 um
+    grid): volume noise 246.8 -> 212.3 HU and the edge-fringe field 86.3 -> 69.7
+    HU peak-to-peak, with the HU level unchanged — achieved while running 13%
+    LONGER, which normally adds noise rather than removing it.
+
+    Deliberately NOT applied in `sample_random_rows`: the row samplers feed the
+    ramp-filtered and structural losses, which assume samples on the uniform
+    detector grid they filter along. Also not applied by `projection.render_projection`,
+    which renders whole projections for evaluation: sampling the pixel centre
+    there is the MIDPOINT RULE, a deterministic second-order estimate of the
+    same pixel mean, and a jittered eval metric would be noisy for no gain.
     """
     device = device if device is not None else scene.sinogram.device
     n_angles = scene.n_angles
@@ -173,7 +221,14 @@ def sample_random_rays(
     angle_idx = _sample_angle_idx(n_angles, (n,), generator, device, exclude_angle)
     b_idx = torch.randint(n_b, (n,), generator=generator, device=device)
     a_idx = torch.randint(n_a, (n,), generator=generator, device=device)
-    return rays_from_indices(scene, angle_idx, b_idx, a_idx)
+    b_sub = a_sub = None
+    if subpixel:
+        # Uniform over [-0.5, 0.5) on both axes = exactly the pixel's box
+        # footprint. Drawn from the caller's generator so the ray stream stays
+        # reproducible and stays out of the global one.
+        b_sub = torch.rand(n, generator=generator, device=device) - 0.5
+        a_sub = torch.rand(n, generator=generator, device=device) - 0.5
+    return rays_from_indices(scene, angle_idx, b_idx, a_idx, b_sub, a_sub)
 
 
 def sample_random_rows(

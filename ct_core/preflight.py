@@ -45,12 +45,16 @@ from .utils import query_gpu_memory
 
 GiB = float(2 ** 30)
 
-# Resident fp32 copies of the parameters, per optimizer. Adam keeps the two
-# moment buffers on top of the weights and their gradient; plain SGD keeps no
-# state at all, so an --emulate-sart run needs HALF the VRAM an Adam run of
-# the same grid does. Estimating every voxel run at Adam's 4x turned that into
-# a spurious `insufficient` verdict and a floored ray batch.
-PARAM_COPIES = {"adam": 4, "sgd": 2}
+# Resident fp32-EQUIVALENT copies of the parameters, per optimizer. Adam keeps
+# the two moment buffers on top of the weights and their gradient; plain SGD
+# keeps no state at all, so an --emulate-sart run needs HALF the VRAM an Adam
+# run of the same grid does. Estimating every voxel run at Adam's 4x turned
+# that into a spurious `insufficient` verdict and a floored ray batch.
+# `adam_bf16` holds the same two moments at half width, so the pair costs one
+# volume instead of two — the count is in fp32 units, hence 3 and not an
+# integer number of buffers. Keys must stay in step with
+# `learning_based_iterative.training.OPTIMIZERS`.
+PARAM_COPIES = {"adam": 4, "adam_bf16": 3, "sgd": 2}
 F32 = 4
 SAFETY = 1.15          # multiplied onto every estimate
 TIGHT_FRAC = 0.85      # need > 85% of free => "tight"
@@ -164,9 +168,9 @@ def estimate(backend: str, *, n_angles: int, n_b: int, n_a: int, vol_shape,
                  * BATCH_BYTES_PER_SAMPLE)
         gpu = int((copies * params + sino + batch) * SAFETY)
         host = int((2 * sino + vol) * SAFETY)
+        extra = {4: "+Adam(m,v)", 3: "+Adam(m,v in bf16)"}.get(copies, "")
         notes.append(
-            f"Voxel grid trains param+grad"
-            f"{'+Adam(m,v)' if copies == 4 else ''} = {copies}x volume on the "
+            f"Voxel grid trains param+grad{extra} = {copies}x volume on the "
             f"GPU. CPU fallback exists but is impractically slow.")
         return gpu, host, False, notes
 
