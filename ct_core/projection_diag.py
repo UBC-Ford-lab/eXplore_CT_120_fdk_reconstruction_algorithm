@@ -386,6 +386,8 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
                                   downsample: int = 2,
                                   samples_per_ray: int | None = None,
                                   chunk_size: int = 8192,
+                                  geometry: dict | None = None,
+                                  window: tuple | None = None,
                                   device=None):
     """Render one projection through a reconstructed volume.
 
@@ -396,6 +398,23 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
     `volume` is (Nx, Ny, Nz) spanning geometry['vol_shape'] (the backend
     contract); `measured` is the PREPROCESSED evaluation projection
     (N_b, N_a). Returns (pred, target) numpy arrays at `downsample` stride.
+
+    `geometry` overrides `ctx.geometry`. A driver reconstructing its own
+    volume never needs it; a POST-HOC caller scoring a foreign volume does,
+    because the grid that volume lives on is a property of the file, not of
+    the scan — pass ctx.geometry with vol_shape/vol_origin/dx/dz replaced by
+    the volume's own and every other entry (the projection geometry) left
+    alone. That forward-projects each volume at its NATIVE resolution, which
+    is what a comparison wants: resampling onto a common lattice would soften
+    the sharper volume before measuring how sharp it is.
+
+    `window` pins the scored detector rectangle to (b_min, b_max, a_min,
+    a_max) instead of deriving it from the domain. THIS MATTERS FOR ANY
+    COMPARISON: the window `covered_detector_window` returns depends on the
+    reconstruction domain, so two volumes with different extents would
+    otherwise be scored over different parts of the detector and their
+    SSIM/PSNR would not be comparable. Pass the intersection over every
+    volume in the comparison.
     """
     from ..learning_based_iterative.scene import Scene, model_domain_from_geometry
     from ..learning_based_iterative.projection import render_projection
@@ -423,7 +442,7 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
     model.load_volume(torch.from_numpy(np.ascontiguousarray(vol.transpose(2, 1, 0))))
     model = model.to(device)
 
-    geometry = dict(ctx.geometry)
+    geometry = dict(ctx.geometry if geometry is None else geometry)
     domain = model_domain_from_geometry(geometry, shape="cylinder")
     sino = torch.from_numpy(np.ascontiguousarray(measured, dtype=np.float32))[None]
     angles_t = torch.as_tensor([float(np.asarray(ctx.angles)[angle_index])],
@@ -438,7 +457,10 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
         samples_per_ray = max(64, int(math.ceil(chord / (0.55 * dx))))
 
     n_b, n_a = scene.detector_shape
-    b_min, b_max, a_min, a_max = covered_detector_window(geometry, n_b, n_a)
+    if window is None:
+        b_min, b_max, a_min, a_max = covered_detector_window(geometry, n_b, n_a)
+    else:
+        b_min, b_max, a_min, a_max = (int(v) for v in window)
     if (b_max - b_min, a_max - a_min) != (n_b, n_a):
         print(f"  [diag] evaluating detector rows [{b_min}, {b_max}) of {n_b} "
               f"and columns [{a_min}, {a_max}) of {n_a} — rays outside exit "

@@ -237,6 +237,106 @@ def apply_volume_offset(volume, offset_mm, geometry):
                    order=1, mode='nearest').astype(np.float32)
 
 
+def resample_to_geometry(volume, geometry, target_geometry, *,
+                         fill: float = 0.0, chunk: int = 32):
+    """``volume`` resampled onto ``target_geometry``'s lattice, trilinearly.
+
+    Both arguments are the ``vol_shape``/``vol_origin``/``dx``/``dz`` dicts
+    this package passes around, in mm about the isocentre, so the two need
+    share neither a shape, a voxel size nor an origin. That is the whole
+    point: the vendor volume is 0.074795 mm on its own 1166 x 1165 x 765
+    grid, a reconstruction here is 0.075 or 0.1 mm on another, and anything
+    that wants to put the two through the SAME forward model or the same ROI
+    has to move one onto the other's lattice first.
+
+    Positions the source does not cover are filled with ``fill`` rather than
+    edge-extended. An out-of-extent voxel is MISSING data, and smearing the
+    border value into it would invent attenuating material outside the
+    reconstructed FOV — which a forward model would then integrate through,
+    turning a metadata mismatch into a fake projection.
+
+    Resampling is a LAST RESORT for a comparison: it interpolates, so it
+    softens the volume slightly and it perturbs the histogram. Prefer
+    ``aligned_geometry``, which expresses an alignment as metadata and
+    touches no voxel. Use this only where a common lattice is genuinely
+    required.
+
+    The transform is axis-aligned and separable, so it is done as a pair of
+    in-plane warps per output slice blended along z. That keeps the working
+    set at two source planes instead of the three full-size coordinate
+    arrays a direct ``map_coordinates`` would need — 27 GB for a 1155^2 x 846
+    target, which is why the obvious implementation is not the one here.
+    """
+    from scipy.ndimage import map_coordinates
+
+    vol = np.asarray(volume, dtype=np.float32)
+    src_shape = [int(v) for v in geometry['vol_shape']]
+    if tuple(vol.shape) != tuple(src_shape):
+        raise ValueError(
+            f"volume shape {tuple(vol.shape)} does not match its geometry's "
+            f"vol_shape {tuple(src_shape)}")
+    so = [float(v) for v in geometry['vol_origin']]
+    sd = [float(geometry['dx']), float(geometry['dx']), float(geometry['dz'])]
+
+    tx, ty, tz = _grid_mm(target_geometry['vol_shape'],
+                          target_geometry['vol_origin'],
+                          target_geometry['dx'], target_geometry['dz'])
+    nx, ny, nz = len(tx), len(ty), len(tz)
+
+    # Target positions in SOURCE index units, per axis (the separability).
+    #
+    # Snapped to the valid range within a tolerance, because a lattice that
+    # coincides with the source's own lands on index 0 as -8.9e-16 and on
+    # N-1 as N-1+eps. Without the snap the outermost row of every axis falls
+    # the wrong side of the extent test and comes back as `fill`, so
+    # resampling a volume onto ITS OWN geometry would blank its six faces —
+    # an identity that is not the identity.
+    def snap(idx, n, tol=1e-6):
+        idx = np.asarray(idx, dtype=np.float64).copy()
+        idx[(idx < 0) & (idx > -tol)] = 0.0
+        idx[(idx > n - 1) & (idx < n - 1 + tol)] = n - 1.0
+        return idx
+
+    ix = snap((tx - so[0]) / sd[0] + (src_shape[0] - 1) / 2.0, src_shape[0])
+    iy = snap((ty - so[1]) / sd[1] + (src_shape[1] - 1) / 2.0, src_shape[1])
+    iz = snap((tz - so[2]) / sd[2] + (src_shape[2] - 1) / 2.0, src_shape[2])
+
+    gx, gy = np.meshgrid(ix, iy, indexing='ij')
+    plane_coords = np.array([gx.ravel(), gy.ravel()])
+    in_plane = ((gx >= 0) & (gx <= src_shape[0] - 1)
+                & (gy >= 0) & (gy <= src_shape[1] - 1))
+
+    out = np.full((nx, ny, nz), float(fill), dtype=np.float32)
+
+    def warp(k_src):
+        """Source plane ``k_src`` warped onto the target's in-plane lattice."""
+        got = map_coordinates(vol[:, :, k_src], plane_coords, order=1,
+                              mode='nearest').reshape(nx, ny)
+        return np.where(in_plane, got, fill)
+
+    # Walk the output in z chunks so each source plane is warped once even
+    # when several output slices land between the same pair.
+    cache: dict = {}
+    for z0 in range(0, nz, max(1, int(chunk))):
+        z1 = min(nz, z0 + max(1, int(chunk)))
+        zc = iz[z0:z1]
+        lo = np.floor(zc).astype(int)
+        frac = zc - lo
+        need = set(lo[(lo >= 0) & (lo <= src_shape[2] - 1)].tolist())
+        need |= set((lo + 1)[((lo + 1) >= 0)
+                             & ((lo + 1) <= src_shape[2] - 1)].tolist())
+        cache = {k: cache.get(k) if cache.get(k) is not None else warp(k)
+                 for k in need}
+        for j, (k, f) in enumerate(zip(lo, frac)):
+            if k < 0 or k > src_shape[2] - 1:
+                continue          # below or above the source stack
+            if f <= 0:
+                out[:, :, z0 + j] = cache[k]
+            elif k + 1 <= src_shape[2] - 1:
+                out[:, :, z0 + j] = (1.0 - f) * cache[k] + f * cache[k + 1]
+            # else: strictly above the last source plane -> outside, keep fill
+    return out
+
 # ------------------------------------------------------------------ cache ---
 
 def alignment_path(scan_tag: str, volume_name: str) -> Path:
