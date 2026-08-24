@@ -310,7 +310,7 @@ def _fit_anchors_once(
     min_air_mass_frac: float = 0.005,
     min_air_prominence: float = 0.25,
     gap_frac: float = 0.02,
-    min_tissue_prominence: float = 0.05,
+    min_tissue_prominence: float = 0.20,
     min_tissue_mass_frac: float = 0.005,
     max_samples: int = 60_000_000,
 ) -> HUAnchors:
@@ -345,7 +345,13 @@ def _fit_anchors_once(
             partial-volume skirt.
         min_tissue_prominence: the tissue peak's prominence as a fraction of
             its own height. Below this it is a ripple on a monotone decay
-            rather than a mode, and the fit is flagged.
+            rather than a mode, so the fit is flagged and the denoise
+            escalation takes over. MEASURED separation on Scan_1988: genuine
+            soft-tissue modes score 0.49 (ds=3 raw) and 0.83-0.95 (ds=1,
+            blocks 2-6), while the ripples that produced wrong gains scored
+            0.06 and 0.009. Nothing real has ever landed in between, so the
+            gate belongs above the ripples rather than just clear of them —
+            0.05 let a 0.06 ripple through and skipped the escalation.
         min_tissue_mass_frac: the tissue basin must hold at least this share
             of all voxels.
         max_samples: stride the input down to at most this many values.
