@@ -105,6 +105,7 @@ class HUAnchors:
     air_hu: float = AIR_HU_DEFAULT
     tissue_hu: float = TISSUE_HU_DEFAULT
     method: str = "histogram"
+    gain_determined: bool = True
     warnings: list = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
 
@@ -163,6 +164,29 @@ def _subsample(values, max_samples):
         flat = flat[:: int(np.ceil(flat.size / max_samples))]
     flat = flat[np.isfinite(flat)]
     return flat
+
+
+def _bins_for_quantum(lo: float, hi: float, quantum: float) -> int:
+    """Most bins that keep at least two quantisation steps in each."""
+    return max(16, int((hi - lo) / (2.0 * quantum)))
+
+
+def _value_quantum(flat, max_probe: int = 200_000) -> float:
+    """The step between adjacent distinct values, or 0.0 for continuous data.
+
+    Nonzero only when the input has been through a quantiser — which is the
+    normal state of a volume READ BACK from disk, since every VFF is int16 HU.
+    It matters because a histogram finer than the quantum is a comb: half its
+    bins are structurally empty, and the resulting spikes carry a prominence
+    that has nothing to do with the shape of the underlying distribution. That
+    is enough to make a quantised volume look like it has a clean mode when it
+    does not (MEASURED: an 18 % gain error, silently, with no warning).
+    """
+    probe = flat[::max(1, flat.size // max_probe)]
+    u = np.unique(probe)
+    if u.size < 2:
+        return 0.0
+    return float(np.min(np.diff(u)))
 
 
 def _smooth(counts, sigma_bins):
@@ -224,9 +248,59 @@ def _prominence(h, peak):
     return float(h[peak] - saddle), left_base, right_base
 
 
-def find_attenuation_anchors(
+# Floors for a block-averaged copy to still be a reconstruction rather than a
+# blur. Voxel count keeps the histogram populated; the per-axis floor keeps the
+# specimen's shape.
+MIN_BLOCK_VOXELS = 100_000
+MIN_BLOCK_AXIS = 16
+# Two block sizes are independent estimators of the same gain. If the mode is
+# real they agree; if it is noise they do not. MEASURED on Scan_1988 ds=1:
+# blocks 2/3/4/6 agree to 1.2 %, while on a volume blurred past usefulness the
+# same comparison disagrees by factors.
+GAIN_AGREEMENT = 0.10
+
+
+def _block_mean(values, k: int):
+    """Average ``values`` over non-overlapping k x k x k voxel blocks.
+
+    The estimator's problem child is NOISE, and noise is the one thing the
+    histogram axis cannot fix: smoothing the histogram harder blurs the modes
+    together, because the noise widened each material's distribution in VALUE.
+    Only spatial averaging narrows it — by k^1.5 in 3D — and because the mean
+    of a homogeneous region is unchanged, every mode stays exactly where it
+    was. That is what lets a denoised fit be applied to the undenoised volume.
+
+    Block-averaging is also AFFINE-EQUIVARIANT: the block mean of ``a*mu + b``
+    is ``a*(block mean) + b``, so the scale-freedom this module is built on
+    survives the escalation untouched.
+
+    Returns None when the input is not a 3D array (the calibrator accepts flat
+    values too, and there is no neighbourhood to average over then) or when
+    the volume is too small to give up a block.
+    """
+    a = np.asarray(values)
+    if k <= 1 or a.ndim != 3:
+        return None
+    trimmed = tuple((n // k) * k for n in a.shape)
+    if min(trimmed) == 0:
+        return None
+    # A block size that leaves too little behind stops being a denoiser and
+    # starts being a destroyer: MEASURED on a 48x96x96 phantom, block 4 leaves
+    # 6912 voxels, collapses the histogram to a single blob, and then reports
+    # mass 0.995 / prominence 1.000 for a gain that is 2x wrong. Confident and
+    # wrong is the exact failure mode this module exists to prevent.
+    out_shape = tuple(n // k for n in trimmed)
+    if min(out_shape) < MIN_BLOCK_AXIS or int(np.prod(out_shape)) < MIN_BLOCK_VOXELS:
+        return None
+    a = a[:trimmed[0], :trimmed[1], :trimmed[2]]
+    a = a.reshape(trimmed[0] // k, k, trimmed[1] // k, k, trimmed[2] // k, k)
+    return a.mean(axis=(1, 3, 5), dtype=np.float64).astype(np.float32)
+
+
+def _fit_anchors_once(
     values,
     *,
+    report_data_quality: bool = True,
     air_hu: float = AIR_HU_DEFAULT,
     tissue_hu: float = TISSUE_HU_DEFAULT,
     bins: int = 1024,
@@ -294,6 +368,14 @@ def find_attenuation_anchors(
     lo -= pad_frac * span
     hi += pad_frac * span
 
+    # Never resolve finer than the data itself: at least two quantisation
+    # steps per bin, or the comb above shows up as structure. Block-averaged
+    # copies are means of integers, so their quantum is negligible and this
+    # clamp is inert for them — which is exactly right, since they are the
+    # copies whose mode we actually trust.
+    quantum = _value_quantum(flat)
+    if quantum > 0:
+        bins = int(max(16, min(int(bins), int(_bins_for_quantum(lo, hi, quantum)))))
     counts, edges = np.histogram(flat, bins=bins, range=(lo, hi))
     centers = 0.5 * (edges[:-1] + edges[1:])
     h = _smooth(counts, smooth_bins)
@@ -307,12 +389,12 @@ def find_attenuation_anchors(
     vmin, vmax = float(flat.min()), float(flat.max())
     frac_at_min = float(np.count_nonzero(flat == vmin) / flat.size)
     frac_at_max = float(np.count_nonzero(flat == vmax) / flat.size)
-    if frac_at_min > 0.01:
+    if frac_at_min > 0.01 and report_data_quality:
         warnings_.append(
             f"{100 * frac_at_min:.1f} % of voxels sit on exactly {vmin:.1f} — "
             f"this volume is clipped from below, and the air anchor is "
             f"measuring the clamp rather than air")
-    if frac_at_max > 0.001:
+    if frac_at_max > 0.001 and report_data_quality:
         warnings_.append(
             f"{100 * frac_at_max:.3f} % of voxels sit on exactly {vmax:.1f} — "
             f"this volume is saturated from above")
@@ -434,12 +516,15 @@ def find_attenuation_anchors(
     if not tissue_value > air_value:
         raise ValueError("tissue anchor did not land above the air anchor")
 
+    passed = (prominence_ratio >= min_tissue_prominence
+              and mass_frac >= min_tissue_mass_frac)
     return HUAnchors(
         value_air=air_value,
         value_tissue=tissue_value,
         air_hu=float(air_hu),
         tissue_hu=float(tissue_hu),
         method="histogram",
+        gain_determined=bool(passed),
         warnings=warnings_,
         diagnostics=dict(
             counts=counts,
@@ -457,8 +542,114 @@ def find_attenuation_anchors(
             value_max=vmax,
             n_samples=int(flat.size),
             bins=int(bins),
+            value_quantum=float(quantum),
         ),
-    )
+    ), passed
+
+
+def find_attenuation_anchors(values, *, denoise_blocks: Sequence[int] = (1, 2, 3, 4, 6),
+                             **kwargs) -> HUAnchors:
+    """Locate the air and bulk-tissue anchors, denoising only if it is needed.
+
+    The single-pass fit (``_fit_anchors_once``) finds the soft-tissue mode by
+    its prominence and mass. Both collapse when the reconstruction is noisy
+    enough that the mode stops being a local maximum at all — and then the
+    search falls back to the largest ripple on a monotone decay, which is a
+    gain error of several hundred percent wearing the costume of a finished
+    calibration. MEASURED on Scan_1988: prominence goes 0.49 -> 0.045 by
+    sigma = 0.005 mm^-1 of added voxel noise, a quarter of mu_water, and the
+    fitted gain is already 5x wrong at sigma = 0.010.
+
+    So: try the volume as it is, and only if the tissue anchor fails its
+    quality gates, retry on progressively block-averaged copies until the mode
+    reappears. Escalation is strictly opt-in per volume — a fit that passes at
+    block 1 is returned unchanged, so every volume that calibrates correctly
+    today calibrates IDENTICALLY, and nothing historical moves.
+
+    When no block size recovers a mode the gain genuinely is not determined by
+    this volume. The k=1 fit is returned (it is the one computed from the real
+    voxels) with ``gain_determined=False`` rather than a silent number, and
+    the caller is expected to pin the scale with ``mu_water``.
+    """
+    raw_k = int(denoise_blocks[0]) if denoise_blocks else 1
+    cache: dict = {}
+    failure = None
+
+    def fit(k):
+        """Fit at block size k, or None if that copy cannot be made or fit."""
+        nonlocal failure
+        if k not in cache:
+            sample = values if k <= 1 else _block_mean(values, k)
+            if sample is None:
+                cache[k] = None
+            else:
+                try:
+                    anchors, passed = _fit_anchors_once(
+                        sample, report_data_quality=(k == raw_k), **kwargs)
+                    anchors.diagnostics["denoise_block"] = int(k)
+                    cache[k] = (anchors, passed)
+                except ValueError as e:
+                    # "no population above air" is the EXTREME form of the
+                    # very failure this escalation exists for, so it must not
+                    # end the search — a volume too noisy to show a mode is
+                    # exactly the one a block-averaged copy can rescue.
+                    failure = failure or e
+                    cache[k] = None
+        return cache[k]
+
+    blocks = [int(k) for k in denoise_blocks]
+    primary = fit(raw_k)
+    if primary is not None and primary[1]:
+        return primary[0]                       # the untouched volume was fine
+
+    for i, k in enumerate(blocks):
+        if k == raw_k:
+            continue
+        got = fit(k)
+        if got is None or not got[1]:
+            continue
+        anchors = got[0]
+        gain = anchors.implied_mu_water
+
+        # Corroborate against the next block size that produces a fit at all.
+        # Two block sizes are independent estimators of the same gain, so
+        # agreement is evidence the mode is real rather than a noise feature
+        # that happened to clear the thresholds.
+        partner = next((fit(k2) for k2 in blocks[i + 1:]
+                        if fit(k2) is not None), None)
+        note = []
+        if partner is None:
+            note.append(
+                "no second block size was available to corroborate the gain "
+                "(the volume is too small to average further), so this fit "
+                "rests on one estimate")
+        elif abs(partner[0].implied_mu_water - gain) > GAIN_AGREEMENT * abs(gain):
+            continue                            # they disagree — not a mode
+
+        prior = list(primary[0].warnings) if primary is not None else [
+            "the raw volume has no fittable histogram at all (no population "
+            "above air), so the usual data-quality checks on it could not run"]
+        anchors.warnings = prior + [
+            f"the soft-tissue mode was not resolvable in the raw volume; the "
+            f"anchors were fitted on a {k}x{k}x{k} block-averaged copy "
+            f"(noise / {k ** 1.5:.1f}) and applied to the full-resolution "
+            f"data"] + note + list(anchors.warnings)
+        return anchors
+
+    usable = [v for v in (cache.get(k) for k in blocks) if v is not None]
+    if primary is not None:
+        result = primary[0]
+    elif usable:
+        result = usable[0][0]
+    else:
+        raise failure or ValueError("no finite values to calibrate from")
+    result.gain_determined = False
+    result.warnings.append(
+        "no block size recovered a corroborated soft-tissue mode — the GAIN "
+        "of this calibration is not determined by the data and the HU scale "
+        "should not be trusted; pin it with mu_water "
+        "(--hu-calibration fixed)")
+    return result
 
 
 def resolve_anchors(values, mode: str = "auto", *,
@@ -576,9 +767,13 @@ def calibration_scalars(anchors: HUAnchors) -> dict:
         "hu/offset": anchors.offset,
         "hu/implied_mu_water": anchors.implied_mu_water,
         "hu/n_warnings": len(anchors.warnings),
+        # The two that say whether this fit can be trusted at all. Logged as
+        # scalars so a broken calibration is visible on the run page without
+        # anyone reading the console output of a job that ended hours ago.
+        "hu/gain_determined": int(bool(anchors.gain_determined)),
     }
-    for key in ("tissue_mass_frac", "tissue_prominence_ratio", "air_frac",
-                "frac_at_min", "frac_at_max"):
+    for key in ("denoise_block", "tissue_mass_frac", "tissue_prominence_ratio",
+                "air_frac", "frac_at_min", "frac_at_max"):
         if key in d:
             out[f"hu/{key}"] = float(d[key])
     return out
@@ -587,8 +782,11 @@ def calibration_scalars(anchors: HUAnchors) -> dict:
 def format_calibration(anchors: HUAnchors) -> str:
     """Human-readable block for the driver's stdout."""
     d = anchors.diagnostics
+    block = d.get("denoise_block", 1)
     lines = [
-        f"  Method:        {anchors.method}",
+        f"  Method:        {anchors.method}"
+        + ("" if block <= 1 else
+           f" (anchors fitted on a {block}x{block}x{block} block-averaged copy)"),
         f"  Air anchor:    {anchors.value_air:12.6f}  ->  "
         f"{anchors.air_hu:+.1f} HU",
         f"  Tissue anchor: {anchors.value_tissue:12.6f}  ->  "
@@ -603,6 +801,9 @@ def format_calibration(anchors: HUAnchors) -> str:
             f"  Tissue population: {100 * d['tissue_mass_frac']:.1f} % of "
             f"voxels, {100 * d['tissue_prominence_ratio']:.0f} % prominent; "
             f"air below anchor: {100 * d['air_frac']:.1f} %")
+    if not anchors.gain_determined:
+        lines.append("  *** GAIN NOT DETERMINED — the HU scale of this volume "
+                     "is unreliable ***")
     for w in anchors.warnings:
         lines.append(f"  WARNING: {w}")
     return "\n".join(lines)
