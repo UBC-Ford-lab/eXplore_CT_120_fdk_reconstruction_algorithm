@@ -22,6 +22,13 @@ integration domain is, and how a volume comes out:
 
 * ``voxel``          — dense voxel grid (SIRT's representation).
                        Future siblings: nerf/, hashgrid/, gaussian_splatting/.
+
+Each also ships a ``LearnedAlgorithm`` descriptor (``registry``) carrying the
+three things the DRIVER cannot guess either — the flags it adds to the CLI,
+the constructor arguments it takes, and how much of the machine it needs — and
+registers it below. That is what ``--algorithm`` selects over, so adding a
+representation touches this package and nothing else: not the driver, not
+``ct_core``.
 """
 
 from .scene import (
@@ -64,8 +71,23 @@ from .training import (OPTIMIZERS, AdamBF16, autocast_ctx, build_optimizer,
                        maybe_compile_model, project_nonneg,
                        resolve_amp_dtype, unwrap_model)
 from .trainer import LearnedReconstructor
+# Short names inside `registry` (get/names/describe read well qualified);
+# unambiguous ones out here, where they sit beside Scene and render_rays.
+from .registry import LearnedAlgorithm, algorithms
+from .registry import describe as describe_algorithms
+from .registry import get as get_algorithm
+from .registry import names as algorithm_names
+from .registry import register as register_algorithm
 from .voxel.model import VoxelGrid, voxel_grid_shape
 from .voxel.reconstructor import VoxelReconstructor
+from .voxel import ALGORITHM as VOXEL_ALGORITHM
+
+# ---------------------------------------------------------- registration --
+# Importing this package is what makes an algorithm selectable, and every
+# entry point already imports it. Registration is a call rather than a
+# decorator so the set is visible in one place; a third-party representation
+# calls `register_algorithm` from its own module instead.
+register_algorithm(VOXEL_ALGORITHM)
 
 __all__ = [
     "DOMAIN_SPECS", "ModelDomain", "Scene", "model_domain_from_bounds",
@@ -83,6 +105,8 @@ __all__ = [
     "clip_grad_norm", "maybe_compile_model", "project_nonneg",
     "resolve_amp_dtype", "unwrap_model",
     "LearnedReconstructor",
-    "VoxelGrid", "voxel_grid_shape", "VoxelReconstructor",
+    "LearnedAlgorithm", "register_algorithm", "get_algorithm",
+    "algorithm_names", "algorithms", "describe_algorithms",
+    "VoxelGrid", "voxel_grid_shape", "VoxelReconstructor", "VOXEL_ALGORITHM",
     "resolve_export_grid", "resolve_export_roi",
 ]

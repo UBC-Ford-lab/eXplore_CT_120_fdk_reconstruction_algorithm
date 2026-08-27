@@ -177,9 +177,12 @@ learning_based_iterative/   reconstruction as optimization (autograd)
   │                             no copy of any of them)
   ├─ trainer.py                 LearnedReconstructor — THE LOOP, independent
   │                             of the representation
+  ├─ registry.py                LearnedAlgorithm — what `--algorithm` selects
+  │                             over (flags, options, machine footprint)
   └─ voxel/                     dense voxel grid (SIRT's representation)
       ├─ model.py                   VoxelGrid + grid-shape rules
-      └─ reconstructor.py           the loop's three hooks, answered (96 lines)
+      ├─ reconstructor.py           the loop's three hooks, answered (96 lines)
+      └─ algorithm.py               its descriptor: --init-density, VRAM model
 ```
 
 A learning-based backend is only the three answers the loop cannot guess:
@@ -206,6 +209,44 @@ Backend contract: consume `ScanContext.projections` (raw counts,
 HU. Anything honouring that contract plugs into the same drivers — the voxel
 backend is the template for future learning-based algorithms (nerf/,
 hashgrid/, gaussian_splatting/ as siblings of voxel/).
+
+### Adding a representation
+
+The three hooks make it work; a `LearnedAlgorithm` descriptor
+(`registry.py`) makes `--algorithm` able to *name* it. The descriptor carries
+the three things the DRIVER cannot guess either, each of them a place
+`run_learned_recon.py` would otherwise grow a branch:
+
+| field | for |
+|---|---|
+| `add_args(parser)` | flags only this representation understands. `--init-density` is voxel-only (the parameter IS mu, so its start is a modelling choice); a network sets its output scale in its head |
+| `options(args)` | its constructor arguments — **and** its run-config entries, from one list, because two lists that must agree are two lists that drift |
+| `footprint(args, req)` | its machine footprint. Build it on `preflight.learned_footprint`, whose one free number is `param_bytes`: `req.vol_bytes` for a dense grid, the architecture's own weight count for a network. There is no default — inheriting the grid's `4 x volume` reads as "fits comfortably" right up until the OOM |
+
+So a new representation is: a `LearnedReconstructor` subclass answering the
+three hooks, one `LearnedAlgorithm`, and a `register_algorithm()` call in
+`learning_based_iterative/__init__.py`. Nothing in the driver, nothing in
+`ct_core`. Registering also teaches the preflight, so a name the driver can
+select can always be sized. `voxel/algorithm.py` is the worked example, and
+`tests/test_learned_algorithm_registry.py` drives a second representation
+(one whose parameters are *not* the export grid) through the whole path.
+
+**A representation defined outside this package** — in a parent repo, in a
+scratch experiment — needs no fork and no entry in `__init__.py`. Registration
+is a side effect of importing the module that calls `register_algorithm`, so
+name that module and it becomes an ordinary `--algorithm`:
+
+```bash
+python -m reconstruction.run_learned_recon SCAN \
+    --algorithm-module inr_pipeline.algorithms --algorithm parent_inr
+```
+
+(`$CT_LEARNED_ALGORITHMS` does the same once, for a shell or a job script.)
+Everything downstream treats it exactly like `voxel`: its own preflight
+footprint, `--help` group, output naming, W&B run name and config, HU
+calibration, VFF + sidecar. The module NAME is what travels — not a file path
+— because the module has to be importable for its reconstructor to be, and a
+dotted name keeps a filesystem path out of the run's provenance.
 
 The `learning_based_iterative` package is also the canonical home of the
 machinery muNeRF shares (scene containers, cone-beam ray generation, the

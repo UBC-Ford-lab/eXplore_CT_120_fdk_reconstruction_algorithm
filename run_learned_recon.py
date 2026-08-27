@@ -6,8 +6,15 @@ integrals by gradient descent through a differentiable forward projector
 (reconstruction as optimization — the same argmin classical iterative recon
 solves, with autograd replacing the hand-derived update rule).
 
-Algorithms (each in its own subfolder of ``learning_based_iterative/``):
+Algorithms (each in its own subfolder of ``learning_based_iterative/``, each
+registering a ``LearnedAlgorithm`` descriptor — see that package's
+``registry``):
   - voxel: dense voxel grid — SIRT's representation trained with Adam + MSE.
+
+``--algorithm`` selects over the registry, and nothing in this file knows
+which one it got. A representation contributes its own CLI flags, its own
+constructor arguments and its own machine footprint through the descriptor,
+so adding one touches ``learning_based_iterative`` and not this driver.
 
 All algorithm-independent stages (scan loading, geometry build, detector
 downsampling, detector-psi calibration, HU calibration + VFF export) live in
@@ -20,13 +27,15 @@ Usage:
 """
 
 import argparse
+import os
 import time
 
 import numpy as np
 
 from .learning_based_iterative.losses import (DATA_TERMS, DEFAULT_DATA_TERM,
                                               describe_data_terms)
-from .learning_based_iterative.voxel.reconstructor import VoxelReconstructor
+from .learning_based_iterative import (algorithm_names, describe_algorithms,
+                                       get_algorithm)
 from .learning_based_iterative.detector_warp import resolve_detector_warp
 from .ct_core.pipeline import (
     ReconLogger,
@@ -46,7 +55,94 @@ from .ct_core.projection_diag import measure_noise_ceiling
 from .ct_core.utils import query_gpu_memory
 from .ct_core.early_stop import STOP_METRICS
 
-SUPPORTED_LEARNED_ALGORITHMS = ("voxel",)
+#: What ``--algorithm`` defaults to. The dense grid, because it is the
+#: like-for-like comparison against classical SIRT and therefore the
+#: reference every other representation is read against.
+DEFAULT_ALGORITHM = "voxel"
+
+
+#: Env var naming modules to import before ``--algorithm`` is resolved, so a
+#: shell or a job script can make an out-of-tree representation available once
+#: instead of on every command line. Same meaning as ``--algorithm-module``,
+#: separated by commas or the platform path separator.
+ALGORITHM_MODULE_ENV = "CT_LEARNED_ALGORITHMS"
+
+
+def _load_algorithm_modules(names) -> list:
+    """Import modules whose import registers a representation.
+
+    THIS IS WHAT MAKES AN OUT-OF-TREE MODEL A FIRST-CLASS ``--algorithm``.
+    Registration happens as a side effect of importing the module that calls
+    ``register_algorithm``, and a driver run as ``python -m
+    reconstruction.run_learned_recon`` imports only the submodule — so a
+    representation defined anywhere else (muNeRF's ``inr_pipeline``, a
+    scratch experiment, another repo entirely) is invisible to it until
+    something says which module to import. That is the whole mechanism:
+
+        python -m reconstruction.run_learned_recon SCAN \
+            --algorithm-module inr_pipeline.algorithms --algorithm parent_inr
+
+    Deliberately a MODULE NAME and not a file path: the module has to be
+    importable anyway for its reconstructor to be, so a name that resolves
+    on ``sys.path`` is the honest unit, and it keeps a filesystem path out of
+    the run's provenance.
+
+    Errors name the module and the likely cause. An out-of-tree algorithm
+    failing to import is the single most common way this goes wrong, and a
+    bare ``ModuleNotFoundError`` from inside argparse would not say why.
+    """
+    import importlib
+
+    out = []
+    for name in names:
+        for part in str(name).replace(os.pathsep, ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                importlib.import_module(part)
+            except ImportError as e:
+                raise ConfigError(
+                    f"--algorithm-module {part!r} could not be imported "
+                    f"({e}). It must be importable from where this driver "
+                    f"runs — for a module in the parent repo, run from the "
+                    f"repo root or set PYTHONPATH.") from None
+            out.append(part)
+    return out
+
+
+def _resolve_algorithm(argv=None):
+    """``--algorithm``, parsed before the parser whose shape it decides.
+
+    A two-pass parse rather than one, for two reasons that both need an answer
+    before the real parser exists. ``--algorithm-module`` decides WHICH
+    algorithms exist at all (importing a module is what registers one), and
+    ``--algorithm`` then decides which flags the parser must accept — the
+    voxel grid contributes ``--init-density``, another representation
+    contributes its own. So: import the plugins, resolve the name, and only
+    then build the parser around the answer. ``--help`` shows the flags of the
+    algorithm actually selected, and a run records only knobs that mean
+    something to it.
+
+    Returns ``(algorithm, modules)`` — the modules travel on so the run can
+    record where its representation came from.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--algorithm', default=DEFAULT_ALGORITHM)
+    pre.add_argument('--algorithm-module', action='append', default=[])
+    known, _ = pre.parse_known_args(argv)
+    modules = _load_algorithm_modules(
+        list(known.algorithm_module)
+        + ([os.environ[ALGORITHM_MODULE_ENV]]
+           if os.environ.get(ALGORITHM_MODULE_ENV) else []))
+    try:
+        return get_algorithm(known.algorithm), modules
+    except ValueError as e:
+        hint = ("" if modules else
+                f" If it is defined outside this package, name the module "
+                f"that registers it with --algorithm-module (or "
+                f"{ALGORITHM_MODULE_ENV}).")
+        raise ConfigError(str(e) + hint) from None
 
 
 def _resolve_optimizer(args):
@@ -196,12 +292,21 @@ def _parse_loss_options(pairs):
     return out
 
 
-def parse_args():
+def parse_args(argv=None):
+    """The parsed namespace AND the algorithm it was built for.
+
+    Returned together because they are one answer: the namespace is only
+    meaningful alongside the descriptor whose flags shaped it.
+    """
+    algorithm, algorithm_modules = _resolve_algorithm(argv)
     parser = argparse.ArgumentParser(
         description="Learning-based iterative reconstruction "
                     "(differentiable projector + gradient descent)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Algorithms (--algorithm):
+""" + describe_algorithms() + """
+
 Examples:
   python -m reconstruction.run_learned_recon data/scans/Scan_1510
   python -m reconstruction.run_learned_recon data/scans/Scan_1510 --iterations 40000
@@ -220,10 +325,29 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
     add_common_args(parser)
     add_model_domain_args(parser)
 
-    parser.add_argument('--algorithm', default='voxel',
-                        choices=SUPPORTED_LEARNED_ALGORITHMS,
-                        help='Representation to optimize (default: voxel). '
-                             'Future: nerf, hashgrid, gaussian_splatting.')
+    # Declared on the real parser too, so it appears in --help and does not
+    # come back as an unrecognized argument; the pre-parser already acted on it.
+    parser.add_argument('--algorithm-module', action='append', default=[],
+                        metavar='MODULE',
+                        help='Import MODULE before resolving --algorithm, so a '
+                             'representation defined OUTSIDE this package '
+                             'becomes selectable (registration is a side '
+                             'effect of the import). Repeatable; also settable '
+                             'once via $' + ALGORITHM_MODULE_ENV + '. e.g. '
+                             '--algorithm-module inr_pipeline.algorithms')
+    parser.add_argument('--algorithm', default=DEFAULT_ALGORITHM,
+                        choices=algorithm_names(),
+                        help='Representation to optimize (default: '
+                             '%(default)s). Listed under "Algorithms" below; '
+                             'each brings its own options group. The list is '
+                             'whatever is registered, so it grows with '
+                             '--algorithm-module.')
+    # Whatever the selected representation adds for itself. Grouped so
+    # `--help` says which flags stop meaning anything under --algorithm X.
+    algorithm.add_args(parser.add_argument_group(
+        f'{algorithm.name} options',
+        f'Flags specific to --algorithm {algorithm.name} '
+        f'({algorithm.summary}).'))
     parser.add_argument('--loss', default=DEFAULT_DATA_TERM,
                         choices=sorted(DATA_TERMS),
                         help='Data term (default: %(default)s). MSE is the '
@@ -314,10 +438,6 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
                         help='Quadrature samples per ray (default: auto = '
                              '~0.55-voxel steps across the FOV chord, the '
                              'anti-aliasing rule from the validated recipe)')
-    parser.add_argument('--init-density', type=float, default=0.001,
-                        help='Initial mu everywhere, in 1/mm (default: 0.001 '
-                             '— near air, so gradients raise mu only where '
-                             'the projections demand it)')
     parser.add_argument('--seed', type=int, default=0,
                         help='Sampling seed (default: 0)')
     parser.add_argument('--gpu-index', type=int, default=0,
@@ -482,11 +602,16 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
              "logged and plotted."
     )
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    # What was actually imported, not what was asked for: the env var
+    # contributes too, and a run should record the modules its representation
+    # really came from.
+    args.algorithm_module = algorithm_modules
+    return args, algorithm
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args, algorithm = parse_args(argv)
     start = time.time()
 
     auto_batch = str(args.rays_per_batch).strip().lower() == 'auto'
@@ -499,7 +624,8 @@ def main():
                 f"got {args.rays_per_batch!r}") from None
 
     print("=" * 60)
-    print(f"Learning-based Iterative Reconstruction ({args.algorithm})")
+    print(f"Learning-based Iterative Reconstruction "
+          f"({algorithm.name}: {algorithm.summary})")
     print("=" * 60)
     print(f"Data folder: {args.data_folder}")
     print(f"Iterations: {args.iterations}  "
@@ -513,7 +639,7 @@ def main():
         output_path = args.output
     else:
         output_path = ctx.default_output_path(
-            f'_recon_{args.algorithm}_{args.iterations}it')
+            f'_recon_{algorithm.name}_{args.iterations}it')
     print(f"\nOutput path: {output_path}")
 
     # Quadrature samples per ray — needed before the trainer exists, both to
@@ -532,7 +658,13 @@ def main():
         plan = auto_rays_per_batch(
             (gpu or {}).get('free_bytes'), n_angles=n_ang, n_b=n_b, n_a=n_a,
             vol_shape=ctx.geometry['vol_shape'], samples_per_ray=_spp,
-            optimizer=_resolve_optimizer(args))
+            optimizer=_resolve_optimizer(args),
+            # What stays resident is the REPRESENTATION'S, not the export
+            # grid's: 4x the volume for a dense grid, 4x a few million weights
+            # for a network. The batch is whatever the card has left, so the
+            # difference is the difference between a floored batch and a
+            # capped one.
+            backend=algorithm.name, footprint=algorithm.bind_footprint(args))
         args.rays_per_batch = plan['rays']
         if gpu is None:
             print(f"\nRays/batch: auto -> {plan['rays']} (no GPU visible — "
@@ -551,7 +683,12 @@ def main():
     # Created BEFORE preflight (an auto-aborted job is recorded as a FAILED
     # run with the verdict); the trainer then logs LIVE (loss/lr/holdout-MSE
     # per step) through the log_fn callback.
-    logger = ReconLogger(args, ctx, args.algorithm, output_path, params={
+    logger = ReconLogger(args, ctx, algorithm.name, output_path, params={
+        # `algorithm.config(args)` is spliced in below: the representation's
+        # own options, recorded under the same names its constructor takes,
+        # so the run config says what the algorithm was actually given without
+        # this driver listing knobs it does not understand.
+        **algorithm.config(args),
         'iterations': args.iterations,
         'rays_per_batch': args.rays_per_batch,
         'rays_per_batch_mode': 'auto' if auto_batch else 'pinned',
@@ -568,19 +705,26 @@ def main():
         'samples_per_ray': args.samples_per_ray,
         'samples_per_ray_mode': 'pinned' if args.samples_per_ray else 'auto',
         'subpixel_rays': args.subpixel_rays,
-        'init_density': args.init_density,
         'seed': args.seed,
         'compile': args.compile_mode,
         'detector_warp': args.detector_warp,
         'crossval': not args.no_crossval,
         'withhold_eval': bool(args.withhold_eval),
+        # Where the representation came from. A dotted module NAME (never a
+        # filesystem path), so a run using an out-of-tree model still says
+        # which module defined it; empty for the ones this package ships.
+        'algorithm_modules': ','.join(args.algorithm_module),
     })
 
     # Machine fit check (GPU presence / VRAM / RAM) before any big allocation.
-    # The voxel grid's VRAM need is dominated by the resident parameter copies
-    # (4x under Adam, 2x under SGD), plus the per-batch ray buffers sized just
-    # above.
-    if run_preflight('voxel', ctx, gpu_index=args.gpu_index, logger=logger,
+    # The size model comes from the ALGORITHM (`bind_footprint`), because the
+    # resident parameter copies are the one term this driver cannot derive:
+    # a dense grid's parameters are the exported volume, a network's have
+    # nothing to do with it. Getting that wrong is a spurious abort in one
+    # direction and an OOM ten minutes into the run in the other.
+    if run_preflight(algorithm.name, ctx,
+                     footprint=algorithm.bind_footprint(args),
+                     gpu_index=args.gpu_index, logger=logger,
                      rays_per_batch=args.rays_per_batch, samples_per_ray=_spp,
                      optimizer=_resolve_optimizer(args),
                      skip=args.skip_preflight,
@@ -620,7 +764,13 @@ def main():
     logger.set_noise_ceiling(measure_noise_ceiling(
         ctx, eval_idx, phase=args.phase))
 
-    reconstructor = VoxelReconstructor(
+    # `shared` is the LOOP's configuration — data, objective, schedule, the
+    # stopping rules, the logging hooks — and every representation gets all of
+    # it. The representation adds only `algorithm.options(args)` below, the
+    # constructor arguments its own flags produced, and answers the three
+    # hooks (model / domain / export) itself. Nothing in this call names a
+    # representation.
+    shared = dict(
         projections=ctx.projections,
         angles=ctx.angles,
         geometry=ctx.geometry,
@@ -629,7 +779,6 @@ def main():
         samples_per_ray=args.samples_per_ray,
         subpixel_rays=args.subpixel_rays,
         lr_warmup_iters=args.lr_warmup_iters,
-        init_density=args.init_density,
         gpu_index=args.gpu_index,
         seed=args.seed,
         compile_mode=args.compile_mode,
@@ -667,6 +816,19 @@ def main():
         # curve alone.
         on_lr_stage=_lr_stage_views_fn(ctx, args, logger),
     )
+
+    # An option named like one of the shared arguments would silently decide
+    # which of the two the reconstructor sees (or raise a bare TypeError about
+    # duplicate keywords, deep in a constructor). Named here instead, where
+    # the fix — rename the flag — is obvious.
+    options = algorithm.options(args)
+    clash = sorted(set(options) & set(shared))
+    if clash:
+        raise ConfigError(
+            f"--algorithm {algorithm.name} declares option(s) {clash} that "
+            f"collide with arguments every representation already gets. "
+            f"Rename them in its LearnedAlgorithm.options.")
+    reconstructor = algorithm.reconstructor(**shared, **options)
 
     reconstructor.reconstruct()
 
@@ -720,7 +882,7 @@ def main():
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
     _, _, volume_hu = save_outputs(vol_export, ctx, args, output_path,
-                                   logger=logger, algorithm=args.algorithm)
+                                   logger=logger, algorithm=algorithm.name)
 
     # replay_steps=False: the trainer already streamed these live via diag_fn.
     logger.log_convergence(reconstructor.crossval_history, replay_steps=False)
