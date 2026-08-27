@@ -550,10 +550,16 @@ class ReconLogger:
 
         Its own keys rather than the delivered volume's on purpose. The two
         answer different questions and are not on the same footing: the
-        summary views show the volume AS SHIPPED, on the HU map fitted to it,
-        while a sequence is only readable if every frame shares one map (see
-        the caller — a per-frame refit would make the gain drift look like a
-        change in the reconstruction). Sharing a key would interleave the two.
+        summary views show the volume AS SHIPPED, once, at the end, while
+        these are intermediate states that exist to be compared with each
+        other. Sharing a key would interleave the two into one slider.
+
+        This method does not calibrate. It draws whatever HU array it is
+        handed in the fixed window, and the caller owns the map — including
+        the question of whether the frames share one. They deliberately do
+        NOT: an unconverged frame's fit is a valid histogram in the wrong
+        units, and pinning the sequence to it saturates every later frame
+        (see ``_lr_stage_views_fn`` in run_learned_recon for the measurement).
 
         ``label`` goes in each figure's title, so a frame lifted out of the
         sequence still says which stage it is. ``slug`` names both the W&B

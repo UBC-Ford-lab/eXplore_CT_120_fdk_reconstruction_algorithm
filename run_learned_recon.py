@@ -106,38 +106,68 @@ def _lr_stage_views_fn(ctx, args, logger):
     logger — none of which the trainer knows about, and none of which it
     should have to.
 
-    ONE HU map for the whole sequence, fitted on stage 0 and reused for every
-    frame after it. The map is fitted from each volume's OWN histogram, and it
-    drifts with exactly the noise the sequence exists to show: a noisier
-    volume has a less prominent soft-tissue peak and a worse-determined gain.
-    Refitting per frame would rescale each picture by a different amount, and
-    a change in contrast would then be indistinguishable from a change in
-    calibration. The delivered volume is unaffected — it is still calibrated
-    on its own histogram at export, as every run's volume always has been.
+    The HU map is refitted on EVERY frame and the gain it found is written
+    into the title and logged as a scalar. It was fitted ONCE, on stage 0,
+    and reused for the whole sequence, so that a change in the picture could
+    only ever be a change in the reconstruction. That argument was right
+    about what it wanted and wrong about how to get it: stage 0 is the
+    reducer TAKEOVER, a few hundred iterations in, and the volume there has
+    not yet grown to its physical attenuation. The histogram fit is scale-
+    EQUIVARIANT on purpose — it has to work on volumes in arbitrary units —
+    so a volume whose mu is f times too small returns a gain 1/f times too
+    large, and that gain then saturates every later frame to white.
+
+    MEASURED on a finished Scan_1510 volume, shrinking its mu and refitting:
+
+        mu x f    implied mu_water    real soft tissue (mu 0.0235) lands at
+          1.0          0.02312                        +132 HU
+          0.5          0.01156                       +1270 HU
+          0.1          0.00231                      +10378 HU
+
+    No quality gate catches this. Prominence, tissue mass and the block-
+    average corroboration are all scale-invariant and read IDENTICALLY at
+    every f (0.677 in all three rows above), because a shrunken volume is a
+    perfectly well-formed histogram — just not one in mm^-1.
+
+    Refitting per frame cannot fail that way: a bad fit stays inside the
+    frame that produced it. The objection it raises — a drifting gain then
+    looks like a change in contrast — is answered by REPORTING the gain
+    instead of freezing it, so the two are told apart by reading a number.
     """
     if not getattr(args, 'lr_stage_views', True):
         return None
     if logger.run is None and not logger.plots_enabled:
         return None      # nothing would receive the figures
 
-    state = {}
-
     def on_lr_stage(volume_mu, iteration, stage, lr):
         vol, geom = crop_to_export_roi(volume_mu, ctx.geometry)
-        if 'anchors' not in state:
-            state['anchors'] = resolve_anchors(
+        try:
+            anchors = resolve_anchors(
                 vol, getattr(args, 'hu_calibration', 'auto'),
                 mu_water=getattr(args, 'mu_water', None),
                 tissue_hu=getattr(args, 'tissue_hu', None), verbose=False)
-            print(f"  lr_plateau: stage views pinned to the stage-0 HU map "
-                  f"(scale {state['anchors'].scale:.0f}, offset "
-                  f"{state['anchors'].offset:+.1f} HU) so every frame is on "
-                  f"one scale")
+        except ValueError as e:
+            # An early frame can be too formless to have a histogram at all.
+            # That is a fact about stage `stage`, not a reason to lose the
+            # rest of the sequence.
+            print(f"  lr_plateau: stage {stage} has no fittable histogram "
+                  f"({e}) — views skipped for this stage")
+            return
+        gain = anchors.implied_mu_water
+        flag = "" if anchors.gain_determined else " (UNDETERMINED)"
         logger.log_stage_views(
-            state['anchors'].apply(vol), geom, step=int(iteration),
+            anchors.apply(vol), geom, step=int(iteration),
             slug=f"lr_stage{int(stage):02d}",
             label=(f"LR stage {stage} \u00b7 lr {lr:.2e} \u00b7 "
-                   f"iter {iteration} (stage-0 HU map)"))
+                   f"iter {iteration} \u00b7 fitted mu_water "
+                   f"{gain:.5f}/mm{flag}"))
+        # The gain as a curve, so a frame that looks brighter can be checked
+        # against the calibration in one glance rather than by eye.
+        logger.log({'lr_stage/implied_mu_water': float(gain),
+                    'lr_stage/hu_scale': float(anchors.scale),
+                    'lr_stage/gain_determined': int(bool(anchors.gain_determined)),
+                    'lr_stage/lr': float(lr),
+                    'lr_stage/stage': int(stage)}, step=int(iteration))
 
     return on_lr_stage
 
