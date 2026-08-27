@@ -131,6 +131,7 @@ class LearnedReconstructor:
                  min_stop_iter: int | None = None,
                  stop_metric: str = "mse",
                  stop_min_delta: float = 0.0,
+                 stop_min_gain: float = 0.0,
                  save_best: bool = True,
                  l_curve: bool = False,
                  l_curve_norm: str = "l2",
@@ -219,6 +220,16 @@ class LearnedReconstructor:
         # between ssim/psnr/mse — EarlyStopper warns when the threshold is
         # large enough to make every checkpoint a failure.
         self.stop_min_delta = float(stop_min_delta)
+        # Relative improvement per SINOGRAM VISIT — per unit of data, not per
+        # evaluation and not per iteration. Everything else moves under you:
+        # the gain one evaluation can show scales with --eval-every (13.5x
+        # between run ny96yzab's 3372 and the driver default of 250), and the
+        # gain one ITERATION can show scales with --rays-per-batch (1.79x
+        # between a pinned 131072 and what an 80 GB card auto-sizes). A visit
+        # is iterations x rays / measurements, so both cancel and one number
+        # means one thing on any cadence, any batch, any card, any scan. The
+        # conversion happens here because this is where all three are known.
+        self.stop_min_gain = float(stop_min_gain)
         # Keeping the best state costs a full model clone on every improvement.
         # Worth it almost always — it is the point of watching — but a large
         # dense grid with a monotone criterion makes "best" mean "last", and
@@ -976,12 +987,17 @@ class LearnedReconstructor:
             # --iterations / --eval-every rather than silently becoming
             # stricter as runs get longer.
             _closed = self.lr_plateau is not None
+            # Data one evaluation is worth, as a fraction of the sinogram.
+            # This is what makes the tolerance portable (see stop_min_gain).
+            _visits_per_eval = (self.eval_every * self.rays_per_batch
+                                / max(1, self.n_measurements))
             _patience = resolve_patience(self.iterations, self.eval_every,
                                          self.patience, closed_loop=_closed)
             _min_iter = resolve_min_iter(self.iterations, self.min_stop_iter,
                                          closed_loop=_closed)
             stopper = self._early_stopper or EarlyStopper(
                 patience=_patience, min_delta=self.stop_min_delta,
+                min_delta_rel=self.stop_min_gain * _visits_per_eval,
                 metric=self.stop_metric, min_iter=_min_iter)
             if self.patience is None or self.min_stop_iter is None:
                 if _closed:
@@ -1005,6 +1021,14 @@ class LearnedReconstructor:
                                   stop_on=self.stop_on)
             print(f"  Stopping on {' + '.join(self.stop_on)}: held-out "
                   f"{self.stop_metric} (patience {self.patience})"
+                  + (f", tolerance {100 * self.stop_min_gain:g} % per "
+                     f"sinogram visit = "
+                     f"{100 * self.stop_min_gain * _visits_per_eval:g} % per "
+                     f"evaluation ({_visits_per_eval:.2f} visits each) — a "
+                     f"smaller gain is NOT an improvement"
+                     if self.stop_min_gain > 0 else
+                     ", ZERO tolerance (any decrease counts; a plateau may "
+                     "never be detected)")
                   + (f", L-curve corner ({self.l_curve_norm} norm)"
                      if lcurve is not None else ""))
 

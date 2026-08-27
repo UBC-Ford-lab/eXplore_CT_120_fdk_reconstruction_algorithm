@@ -82,6 +82,16 @@ STOP_METRICS = tuple(_MODE)
 #: Floor on patience in evaluations, so short runs behave as they always did.
 DEFAULT_PATIENCE_EVALS = 8
 
+#: Floor on patience when a PlateauLRReducer is driving the LR. Lower than the
+#: open-loop floor on purpose: by the time the stop counter is even allowed to
+#: run, the LR is at its floor, which means the reducer has ALREADY observed a
+#: plateau six separate times and annealed the step size by 50x. Demanding
+#: another eight in a row re-asks a question that has been answered. MEASURED
+#: on run ny96yzab: 8 -> 4 is the single largest saving available (11.7 h ->
+#: 8.6 h on its own, 5.1 h combined with a tolerance), for 0.0004 of held-out
+#: SSIM on a projection already fitted below its own noise floor.
+CLOSED_LOOP_PATIENCE_EVALS = 4
+
 #: A plateau must cover this fraction of the scheduled run to end it.
 PATIENCE_FRACTION = 0.25
 
@@ -91,25 +101,43 @@ PATIENCE_FRACTION = 0.25
 #: size the schedule was still going to shrink.
 MIN_PROGRESS_FRACTION = 0.5
 
+# How much better than the running best a value has to be to COUNT as better,
+# as a fraction of the best itself. Zero — "any decrease at all is an
+# improvement" — is what a plateau rule cannot survive: MEASURED on run
+# ny96yzab (Scan_1510 voxel/adam, 700k iterations, 207 evaluations), the
+# longest run of consecutive non-improving evaluations in the WHOLE run was 3,
+# against a stop that needs 8. The rule was not slow, it was UNREACHABLE, and
+# the run could only ever end on its iteration cap: 11.7 h, of which the last
+# 5.2 h bought 1.6 % of held-out MSE.
+#
+# The threshold has to be RELATIVE because the metrics differ by orders of
+# magnitude (SSIM in [0, 1], PSNR in tens of dB, MSE ~1e-5 here), which is
+# exactly why the absolute `min_delta` below has always been left at 0. Same
+# convention as torch's ReduceLROnPlateau `threshold_mode='rel'`.
+DEFAULT_MIN_DELTA_REL = 0.0
+
 
 def resolve_patience(total_iterations, eval_every, patience=None, *,
                      closed_loop: bool = False,
                      fraction: float = PATIENCE_FRACTION,
-                     floor: int = DEFAULT_PATIENCE_EVALS) -> int:
+                     floor: int = DEFAULT_PATIENCE_EVALS,
+                     closed_loop_floor: int = CLOSED_LOOP_PATIENCE_EVALS) -> int:
     """Patience in EVALUATIONS, scaled to the length of the run.
 
     ``patience`` explicitly set is always honoured — this only supplies the
     default. Returns at least ``floor`` so short runs are unaffected.
 
-    ``closed_loop=True`` (a ``PlateauLRReducer`` is driving the LR) returns the
-    floor instead of the fraction, because waiting is then the REDUCER's job:
-    a plateau buys an LR cut, and only a plateau at the LR floor ends the run.
-    Scaling this patience up as well would just delay that final exit.
+    ``closed_loop=True`` (a ``PlateauLRReducer`` is driving the LR) returns
+    ``closed_loop_floor`` instead of the fraction, because waiting is then the
+    REDUCER's job: a plateau buys an LR cut, and only a plateau at the LR floor
+    ends the run. Scaling this patience up as well would just delay that final
+    exit — and even the open-loop floor is more waiting than the closed loop
+    needs, since reaching the LR floor already required six detected plateaus.
     """
     if patience is not None:
         return int(patience)
     if closed_loop:
-        return int(floor)
+        return int(closed_loop_floor)
     total = max(1, int(total_iterations))
     every = max(1, int(eval_every))
     n_evals = max(1, total // every)
@@ -256,10 +284,14 @@ class EarlyStopper:
     """Peak-metric tracker with patience, best-state capture, and history."""
 
     def __init__(self, patience: int = 3, min_delta: float = 0.0,
-                 metric: str = "ssim", min_iter: int = 0):
+                 metric: str = "ssim", min_iter: int = 0,
+                 min_delta_rel: float = DEFAULT_MIN_DELTA_REL):
         if metric not in _MODE:
             raise ValueError(
                 f"early-stop metric must be one of {list(_MODE)}, got {metric!r}")
+        if not (0.0 <= float(min_delta_rel) < 1.0):
+            raise ValueError("min_delta_rel is a FRACTION of the running best "
+                             f"and must be in [0, 1), got {min_delta_rel}")
         self.patience = int(patience)
         # Iterations before which `should_stop` stays False no matter how long
         # the plateau. Best-state capture is UNAFFECTED — an early peak is
@@ -277,6 +309,10 @@ class EarlyStopper:
         # catches that on the first update rather than letting it look like fast
         # convergence.
         self.min_delta = float(min_delta)
+        # ...which is why the useful threshold is the RELATIVE one: a fraction
+        # of the running best, so one number means the same thing to every
+        # metric and at every stage of a run. See DEFAULT_MIN_DELTA_REL.
+        self.min_delta_rel = float(min_delta_rel)
         self.metric = metric
         self.mode = _MODE[metric]
         self._min_delta_checked = False
@@ -315,19 +351,57 @@ class EarlyStopper:
                   f"after {self.patience} of them. For {self.metric}, try "
                   f"~{0.001 * abs(v):.2g}-{0.01 * abs(v):.2g} or 0.")
 
-    def _is_better(self, v: float) -> bool:
+    def improvement_threshold(self) -> float:
+        """How much better than the running best a value must be to count.
+
+        The larger of the absolute and relative thresholds. Before the first
+        update ``best`` is +-inf, where a relative threshold is meaningless (and
+        would be inf), so the absolute one stands alone and the first finite
+        value is always an improvement.
+        """
+        if not np.isfinite(self.best) or self.best == 0.0:
+            return self.min_delta
+        return max(self.min_delta, self.min_delta_rel * abs(self.best))
+
+    def _is_best(self, v: float) -> bool:
+        """Is this the best value seen? NO tolerance — the best iterate is the
+        best iterate, and which one gets restored must not depend on a
+        threshold whose job is to decide when to STOP."""
         if not np.isfinite(v):
             return False
+        return v > self.best if self.mode == "max" else v < self.best
+
+    def _is_better(self, v: float) -> bool:
+        """Does this evaluation beat the best by enough to count as progress?
+
+        Measured against ``self.best``, which is maintained WITHOUT the
+        tolerance (see ``_is_best``). That separation is load-bearing: when the
+        threshold also gated the best, a value that just missed left the best
+        at an older, easier number, so the NEXT value cleared it more easily
+        and reset the patience — making the stopping iteration a non-monotone,
+        knife-edge function of the tolerance. MEASURED on run ny96yzab: moving
+        the threshold by 0.2 % moved the stop from 306 852 to 441 732, and the
+        STRICTER setting ran LONGER. With the best decoupled, raising the
+        tolerance can only ever stop the run sooner.
+        """
+        if not np.isfinite(v):
+            return False
+        t = self.improvement_threshold()
         if self.mode == "max":
-            return v > self.best + self.min_delta
-        return v < self.best - self.min_delta
+            return v > self.best + t
+        return v < self.best - t
 
     def update(self, iteration: int, metrics: dict, snapshot_fn=None) -> bool:
         """Record one evaluation. Returns True if it was a new best.
 
+        Returns True if this counted as PROGRESS (beat the best by more than
+        the tolerance) — the flag the reducer and the patience counter run on.
+        That is not the same question as "was this the best", which is asked
+        without any tolerance so the restored iterate is always the true best.
+
         ``metrics`` must contain the criterion key (self.metric); ssim/psnr/mse
         and optional fdk_* are recorded for the figure. ``snapshot_fn`` (if
-        given) is called only on improvement and its return value stored as the
+        given) is called only on a new best and its return value stored as the
         best state — so the cost of copying a volume is paid only when there is
         something better to keep.
         """
@@ -339,15 +413,21 @@ class EarlyStopper:
         v = metrics[self.metric]
         if not self._min_delta_checked:
             self._check_min_delta(v)
-        if self._is_better(v):
+        # Two questions, deliberately answered separately: is this the best
+        # iterate (keep it), and is this enough progress to count (keep going).
+        # `improved` is judged against the best BEFORE this evaluation, so the
+        # comparison never moves under the threshold's feet.
+        improved = self._is_better(v)
+        if self._is_best(v):
             self.best = v
             self.best_iter = int(iteration)
-            self.num_bad = 0
             if snapshot_fn is not None:
                 self.best_state = snapshot_fn()
-            return True
-        self.num_bad += 1
-        return False
+        if improved:
+            self.num_bad = 0
+        else:
+            self.num_bad += 1
+        return improved
 
     @property
     def should_stop(self) -> bool:

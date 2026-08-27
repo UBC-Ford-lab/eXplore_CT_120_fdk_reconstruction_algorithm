@@ -324,12 +324,14 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
                              '(default: 250)')
     parser.add_argument('--patience', type=int, default=None, metavar='P',
                         help='Stop after P holdout evals without improvement. '
-                             'Default: a quarter of this run\'s evaluations '
-                             '(floor 8), so the rule means the same thing at '
-                             'any --iterations / --eval-every. Stopping late '
-                             'costs only wall-clock — the best iterate is '
-                             'restored either way — while stopping early '
-                             'returns a premature reconstruction.')
+                             'Default: 4 with --lr-plateau on (reaching the LR '
+                             'floor already required six detected plateaus, so '
+                             'the waiting is the reducer\'s job), else a '
+                             'quarter of this run\'s evaluations with a floor '
+                             'of 8, so the rule means the same thing at any '
+                             '--iterations / --eval-every. Counted in '
+                             'EVALUATIONS, so what it is worth in iterations '
+                             'is P x --eval-every.')
     parser.add_argument(
         '--lr-plateau', action='store_true', default=True,
         help='Metric-driven LR decay (default: ON). Instead of an open-loop '
@@ -375,6 +377,33 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
              'model onto the export grid (cheap for a voxel grid, a render '
              'for anything else), paid at most --lr-plateau-min-fraction '
              'times over the run.')
+    parser.add_argument(
+        '--stop-min-gain', type=float, default=8e-4, metavar='R',
+        help='The plateau definition: the relative improvement per SINOGRAM '
+             'VISIT below which an evaluation does not count as progress '
+             '(default: %(default)s, i.e. 0.08 %% per pass over the data). '
+             'Both the LR reducer and the stop are driven by it. Per visit '
+             'rather than per iteration or per evaluation because those two '
+             'both move: the gain an evaluation can show scales with '
+             '--eval-every, and the gain an iteration can show scales with '
+             '--rays-per-batch. A visit is iterations x rays / measurements, '
+             'so both cancel and one number transfers across cadences, batch '
+             'sizes, cards and scans. Pass 0 for zero tolerance, where any '
+             'decrease however small resets the patience — MEASURED on run '
+             'ny96yzab that made the stop unreachable (longest non-improving '
+             'streak 3 evaluations against a patience of 8) and the run ended '
+             'on its iteration cap after 11.7 h; at this default the same run '
+             'stops at 3.0 h having seen 122 of its 467 visits, for 0.008 of '
+             'held-out SSIM measured on a projection that was already fitted '
+             'below its own noise floor. Halve it toward 4e-4 or 2e-4 if the '
+             'plots/lr_stage/view_* sequence shows the cut stages were still '
+             'adding structure rather than grain.')
+    parser.add_argument(
+        '--stop-min-delta', type=float, default=0.0, metavar='D',
+        help='Absolute improvement threshold in the metric\'s OWN units '
+             '(default: %(default)s). Almost always the wrong knob — a value '
+             'that suits SSIM is enormous next to an MSE — use '
+             '--stop-min-gain instead.')
     parser.add_argument('--min-stop-iter', type=int, default=None, metavar='N',
                         help='No stopping rule may fire before iteration N '
                              '(default: half the scheduled iterations; pass 0 '
@@ -503,6 +532,8 @@ def main():
         'lr_plateau_patience': (args.lr_plateau_patience if args.lr_plateau
                                 else None),
         'lr_stage_views': bool(args.lr_stage_views),
+        'stop_min_gain': args.stop_min_gain,
+        'stop_min_delta': args.stop_min_delta,
         'lr_warmup_iters': args.lr_warmup_iters,
         'samples_per_ray': args.samples_per_ray,
         'samples_per_ray_mode': 'pinned' if args.samples_per_ray else 'auto',
@@ -592,6 +623,8 @@ def main():
         min_stop_iter=args.min_stop_iter,
         lr_plateau=_build_lr_plateau(args),
         stop_metric=args.stop_metric,
+        stop_min_delta=args.stop_min_delta,
+        stop_min_gain=args.stop_min_gain,
         l_curve=args.l_curve,
         l_curve_norm=args.l_curve_norm,
         stop_on=tuple(args.stop_on),
