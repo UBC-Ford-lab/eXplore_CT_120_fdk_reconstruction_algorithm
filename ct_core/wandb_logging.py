@@ -399,16 +399,23 @@ class ReconLogger:
         except Exception as e:
             print(f"W&B log failed ({type(e).__name__}: {e})")
 
-    def _emit(self, name: str, fig: Figure, step: int | None = None) -> None:
+    def _emit(self, name: str, fig: Figure, step: int | None = None,
+              filename: str | None = None) -> None:
         """Save a figure locally and (if enabled) upload it.
 
         With ``step`` the W&B image joins a per-step sequence (slider in the
         UI); the local PNG is overwritten so it always holds the latest.
+
+        ``filename`` overrides the local PNG's stem while leaving the W&B key
+        alone. A sequence logged repeatedly under ONE key is exactly the case
+        where overwriting is wrong: the slider keeps every frame but the disk
+        would keep only the last, so the local copy of a sequence has to be
+        numbered by whatever the frames are indexed on.
         """
         path = None
         if self.plots_enabled:
             self.plot_dir.mkdir(parents=True, exist_ok=True)
-            path = self.plot_dir / f"{name}.png"
+            path = self.plot_dir / f"{filename or name}.png"
             fig.savefig(path)
             print(f"  Plot: {path}")
         if self.run is not None:
@@ -529,6 +536,38 @@ class ReconLogger:
                 "volume/shape": list(vol.shape),
                 "elapsed_min": (time.time() - self._t0) / 60.0,
             })
+
+    def log_stage_views(self, volume_hu, geometry: dict, *, step: int,
+                        label: str = "", slug: str = "stage",
+                        hu_window=HU_WINDOW) -> None:
+        """The three midplane views as a per-step SEQUENCE (a W&B slider).
+
+        Same pictures ``log_volume_summary`` produces for the delivered
+        volume, but logged repeatedly during the run under their own keys —
+        ``plots/lr_stage/view_axial`` and friends — so the reconstruction can
+        be scrolled through as it evolves instead of only inspected once at
+        the end.
+
+        Its own keys rather than the delivered volume's on purpose. The two
+        answer different questions and are not on the same footing: the
+        summary views show the volume AS SHIPPED, on the HU map fitted to it,
+        while a sequence is only readable if every frame shares one map (see
+        the caller — a per-frame refit would make the gain drift look like a
+        change in the reconstruction). Sharing a key would interleave the two.
+
+        ``label`` goes in each figure's title, so a frame lifted out of the
+        sequence still says which stage it is. ``slug`` names both the W&B
+        subkey and the local PNG stem.
+        """
+        vol = np.asarray(volume_hu)
+        if not (self.plots_enabled or self.run is not None):
+            return
+        for name, sl, xl, yl, extent in midplane_views(vol, geometry):
+            title = f"{name} — {label}" if label else name
+            self._emit(f"lr_stage/view_{name}",
+                       single_view_figure(title, sl, xl, yl, extent,
+                                          hu_window=hu_window),
+                       step=step, filename=f"{slug}_view_{name}")
 
     # -- projection diagnostics (diag/*) --------------------------------
 

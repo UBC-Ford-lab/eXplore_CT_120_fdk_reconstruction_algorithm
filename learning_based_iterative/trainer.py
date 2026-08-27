@@ -57,6 +57,7 @@ loop never grows a branch per caller:
 | ``early_stopper=`` | ``EarlyStopper`` | share ONE stopper when the caller reads it too |
 | ``snapshot_fn=`` / ``restore_fn=`` | ``() -> state`` / ``(state)`` | when "the model" is more than one module |
 | ``lr_plateau=`` | ``PlateauLRReducer`` | closed-loop LR; takes over at the end of warmup |
+| ``on_lr_stage=`` | ``(volume_mu, it, stage, lr) -> None`` | the volume at every LR change, for a scrollable record of the stages |
 
 ``render_fn`` returns ONE prediction because that is what the loss is scored
 on. An operator with more outputs — hierarchical's coarse AND fine, GH-NAF's
@@ -150,7 +151,8 @@ class LearnedReconstructor:
                  scene=None, loss_fn=None, sampler_fn=None, render_fn=None,
                  stages=(), extra_loss_fn=None,
                  on_iter=None, on_step=None, on_eval=None,
-                 lr_schedule_fn=None, lr_plateau=None, export: bool = True,
+                 lr_schedule_fn=None, lr_plateau=None,
+                 on_lr_stage=None, export: bool = True,
                  optimizer_fn=None, early_stopper=None,
                  snapshot_fn=None, restore_fn=None,
                  # ---- training mechanics (see .training) ----
@@ -307,6 +309,7 @@ class LearnedReconstructor:
         # stream.
         self._on_step = on_step
         self._on_eval = on_eval
+        self._on_lr_stage = on_lr_stage
         # lr_schedule_fn(it) -> MULTIPLIER on each group's base LR. Defaults to
         # this loop's linear warmup + cosine. Supplied when the caller's
         # schedule is its own (constant / cosine / exponential, with its own
@@ -431,6 +434,26 @@ class LearnedReconstructor:
         if self._export_fn is not None:
             return self._export_fn(model, self.geometry, domain, device)
         return render_volume(model, self.geometry, domain, device=device)
+
+    def _lr_stage(self, model, domain, device, it, stage, lr) -> None:
+        """Hand the CURRENT volume to ``on_lr_stage``, and never let it matter.
+
+        Fired at every LR change, including the reducer taking over — stage 0
+        is the un-annealed reconstruction the later stages have to be read
+        against, so a sequence that starts at the first reduction has no
+        baseline in it.
+
+        Reconstruction is the job and a figure is not worth ending a run over,
+        so every failure here is reported and swallowed — the same contract
+        ``log_fn`` and ``diag_fn`` already have.
+        """
+        if self._on_lr_stage is None:
+            return
+        try:
+            self._on_lr_stage(self.export_volume(model, domain, device),
+                              int(it), int(stage), float(lr))
+        except Exception as e:
+            print(f"  lr_plateau: stage views failed ({type(e).__name__}: {e})")
 
     # ------------------------------------------------------------------ setup
 
@@ -1027,6 +1050,7 @@ class LearnedReconstructor:
                 print(f"  lr_plateau: taking over LR control at iteration {it} "
                       f"(warmup done, base "
                       f"{', '.join(f'{g:.2e}' for g in base_lrs)})")
+                self._lr_stage(model, domain, device, it, 0, base_lrs[0])
 
             if self._on_iter is not None:
                 swap = self._on_iter(model, it, optimizer)
@@ -1138,6 +1162,10 @@ class LearnedReconstructor:
                                  "lr_plateau/lr":
                                      self.lr_plateau.current_lrs(optimizer)[0]},
                                 it + 1)
+                        self._lr_stage(
+                            model, domain, device, it + 1,
+                            self.lr_plateau.num_reductions,
+                            self.lr_plateau.current_lrs(optimizer)[0])
                 if lcurve is not None:
                     state_cpu = self._state_cpu(model)
                     lcurve.add(it + 1, float(np.sqrt(m["mse"])),

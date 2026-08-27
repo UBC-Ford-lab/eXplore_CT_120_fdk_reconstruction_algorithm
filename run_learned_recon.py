@@ -39,6 +39,7 @@ from .ct_core.pipeline import (
     save_outputs,
 )
 from .ct_core.data_budget import RANDOM, data_budget
+from .ct_core.hu_calibration import resolve_anchors
 from .ct_core.errors import ConfigError, cli_main
 from .ct_core.preflight import auto_rays_per_batch
 from .ct_core.projection_diag import measure_noise_ceiling
@@ -95,6 +96,50 @@ def _build_lr_plateau(args):
         patience=args.lr_plateau_patience,
         min_lr_fraction=args.lr_plateau_min_fraction,
         cooldown=args.lr_plateau_cooldown)
+
+
+def _lr_stage_views_fn(ctx, args, logger):
+    """``on_lr_stage`` for the trainer: the volume at every LR change, drawn
+    as the three midplane views the finished run already gets.
+
+    Lives in the driver because it needs the export crop, the HU map and the
+    logger — none of which the trainer knows about, and none of which it
+    should have to.
+
+    ONE HU map for the whole sequence, fitted on stage 0 and reused for every
+    frame after it. The map is fitted from each volume's OWN histogram, and it
+    drifts with exactly the noise the sequence exists to show: a noisier
+    volume has a less prominent soft-tissue peak and a worse-determined gain.
+    Refitting per frame would rescale each picture by a different amount, and
+    a change in contrast would then be indistinguishable from a change in
+    calibration. The delivered volume is unaffected — it is still calibrated
+    on its own histogram at export, as every run's volume always has been.
+    """
+    if not getattr(args, 'lr_stage_views', True):
+        return None
+    if logger.run is None and not logger.plots_enabled:
+        return None      # nothing would receive the figures
+
+    state = {}
+
+    def on_lr_stage(volume_mu, iteration, stage, lr):
+        vol, geom = crop_to_export_roi(volume_mu, ctx.geometry)
+        if 'anchors' not in state:
+            state['anchors'] = resolve_anchors(
+                vol, getattr(args, 'hu_calibration', 'auto'),
+                mu_water=getattr(args, 'mu_water', None),
+                tissue_hu=getattr(args, 'tissue_hu', None), verbose=False)
+            print(f"  lr_plateau: stage views pinned to the stage-0 HU map "
+                  f"(scale {state['anchors'].scale:.0f}, offset "
+                  f"{state['anchors'].offset:+.1f} HU) so every frame is on "
+                  f"one scale")
+        logger.log_stage_views(
+            state['anchors'].apply(vol), geom, step=int(iteration),
+            slug=f"lr_stage{int(stage):02d}",
+            label=(f"LR stage {stage} \u00b7 lr {lr:.2e} \u00b7 "
+                   f"iter {iteration} (stage-0 HU map)"))
+
+    return on_lr_stage
 
 
 def _parse_loss_options(pairs):
@@ -316,6 +361,20 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
         help='Evaluations to wait after a reduction before counting again '
              '(default: %(default)s), so one plateau cannot cascade several '
              'cuts before the model has responded to the first.')
+    parser.add_argument(
+        '--lr-stage-views', action='store_true', default=True,
+        help='Log the three midplane views at every LR change (default: ON) '
+             'as plots/lr_stage/view_axial|coronal|sagittal — a slider over '
+             'the LR stages, so how much of the late fitting is signal and '
+             'how much is noise can be READ OFF the volume instead of '
+             'inferred from the held-out curve. Stage 0 is the un-annealed '
+             'reconstruction; one frame follows per reduction.')
+    parser.add_argument(
+        '--no-lr-stage-views', dest='lr_stage_views', action='store_false',
+        help='Skip the per-stage views. Each one costs a full export of the '
+             'model onto the export grid (cheap for a voxel grid, a render '
+             'for anything else), paid at most --lr-plateau-min-fraction '
+             'times over the run.')
     parser.add_argument('--min-stop-iter', type=int, default=None, metavar='N',
                         help='No stopping rule may fire before iteration N '
                              '(default: half the scheduled iterations; pass 0 '
@@ -443,6 +502,7 @@ def main():
         'lr_plateau_factor': args.lr_plateau_factor if args.lr_plateau else None,
         'lr_plateau_patience': (args.lr_plateau_patience if args.lr_plateau
                                 else None),
+        'lr_stage_views': bool(args.lr_stage_views),
         'lr_warmup_iters': args.lr_warmup_iters,
         'samples_per_ray': args.samples_per_ray,
         'samples_per_ray_mode': 'pinned' if args.samples_per_ray else 'auto',
@@ -539,6 +599,10 @@ def main():
         # diag/* scalars every eval + SSIM-heatmap / power-spectrum figures
         # on a coarser cadence (figure_every_evals), all through the logger.
         diag_fn=logger.log_projection_diag,
+        # plots/lr_stage/view_* — one frame per LR change, so the late
+        # iterations can be judged on the volume rather than on the held-out
+        # curve alone.
+        on_lr_stage=_lr_stage_views_fn(ctx, args, logger),
     )
 
     reconstructor.reconstruct()
