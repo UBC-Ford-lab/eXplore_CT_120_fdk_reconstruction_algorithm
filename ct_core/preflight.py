@@ -252,22 +252,31 @@ def _tigre_footprint(req: MachineRequest) -> Footprint:
 
 
 def learned_footprint(req: MachineRequest, *, param_bytes: int,
+                      activation_bytes_per_sample: int = 0,
                       note: str = "") -> Footprint:
     """The shape EVERY learning-based algorithm's footprint has.
 
     Resident = the optimizer's copies of the parameters + the sinogram;
-    marginal = the renderer's per-ray-sample cost; host = projections + float
-    sinogram + the exported volume. All three are properties of the shared
-    loop and the shared renderer, so they live here and are reused rather than
-    re-derived per algorithm.
+    marginal = the renderer's per-ray-sample traffic PLUS whatever the model
+    itself retains per sample; host = projections + float sinogram + the
+    exported volume. The shape is shared; the two numbers in it are not.
 
-    ``param_bytes`` is the ONE number that differs, and it is deliberately an
-    argument rather than something computed from ``req``: for a dense grid it
-    is ``req.vol_bytes`` (the parameters ARE the exported voxels), for a hash
-    grid or an MLP it is the architecture's own weight count and has nothing
-    to do with the export grid. Guessing either from the other is wrong by
-    orders of magnitude — and in the direction that reads as "fits
-    comfortably" right up until the OOM.
+    ``param_bytes`` — for a dense grid this is ``req.vol_bytes`` (the
+    parameters ARE the exported voxels); for a hash grid or an MLP it is the
+    architecture's own weight count and has nothing to do with the export
+    grid. Guessing either from the other is wrong by orders of magnitude, in
+    the direction that reads as "fits comfortably" right up until the OOM.
+
+    ``activation_bytes_per_sample`` — what the MODEL retains for backward, per
+    quadrature sample, ON TOP of the renderer's ``BATCH_BYTES_PER_SAMPLE``.
+    Zero for a voxel grid: a `grid_sample` keeps its output and nothing else,
+    which is already inside the renderer's constant. NOT zero for a network,
+    and not a detail — MEASURED on a 4x128 ReLU MLP it is 3,336 B, **35x the
+    renderer's own 96 B**, so a batch sized as if the model were free is not
+    merely tight, it cannot start. That is a real defect this argument exists
+    to prevent, and it was found by running an MLP at a batch this preflight
+    had approved: ~125,000 rays x 988 samples, which is 400 GB of activations
+    on a 16 GB card.
 
     Callers are the algorithms themselves, via
     ``learning_based_iterative.registry``; this module never decides which
@@ -278,11 +287,17 @@ def learned_footprint(req: MachineRequest, *, param_bytes: int,
     base = (f"Trains param+grad{extra} = {copies}x "
             f"{int(param_bytes) / GiB:.2f} GiB of parameters on the GPU. "
             f"CPU fallback exists but is impractically slow.")
+    per_sample = BATCH_BYTES_PER_SAMPLE + int(activation_bytes_per_sample)
+    if activation_bytes_per_sample:
+        base += (f" Activations add {int(activation_bytes_per_sample):,} B per "
+                 f"ray-sample on top of the renderer's "
+                 f"{BATCH_BYTES_PER_SAMPLE} B — {per_sample / BATCH_BYTES_PER_SAMPLE:.0f}x "
+                 f"the traffic a voxel grid has — which is what sizes the batch.")
     return Footprint(
         persistent_gpu_bytes=copies * int(param_bytes) + req.sino_bytes,
         host_bytes=2 * req.sino_bytes + req.vol_bytes,
         gpu_required=False,
-        bytes_per_ray_sample=BATCH_BYTES_PER_SAMPLE,
+        bytes_per_ray_sample=per_sample,
         notes=((note,) if note else ()) + (base,))
 
 

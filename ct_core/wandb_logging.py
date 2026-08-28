@@ -343,6 +343,8 @@ class ReconLogger:
         self.plot_dir = self.plot_dir.parent / (self.plot_dir.name + "_plots")
         self.run = None
         self._t0 = time.time()
+        # Accumulated LR-stage frames, re-logged as one table per stage.
+        self._stage_rows: list = []
         # Projection-diagnostics state (see log_projection_diag).
         self.noise_ceiling = None
         self._da = float(ctx.geometry.get("da", 1.0)) if ctx is not None else 1.0
@@ -539,6 +541,7 @@ class ReconLogger:
 
     def log_stage_views(self, volume_hu, geometry: dict, *, step: int,
                         label: str = "", slug: str = "stage",
+                        row: dict | None = None,
                         hu_window=HU_WINDOW) -> None:
         """The three midplane views as a per-step SEQUENCE (a W&B slider).
 
@@ -564,16 +567,54 @@ class ReconLogger:
         ``label`` goes in each figure's title, so a frame lifted out of the
         sequence still says which stage it is. ``slug`` names both the W&B
         subkey and the local PNG stem.
+
+        ``row`` adds the same frames to a TABLE as well, one row per stage,
+        with these scalar columns beside the three pictures. The per-step
+        images alone are not reliably reachable in the UI: a media panel's
+        slider spans the RUN's whole step range, and ``log_recon_slices``
+        puts the finished volume's slices at ``SLICE_STEP_BASE`` (1e7), so
+        stages logged at their true iteration numbers end up inside the
+        first ~1 % of the track and the panel opens past the end of them.
+        MEASURED on run 7hdik769: 7 stages spanning steps 500-96,000 in a
+        run whose last step is 10,000,115. The table has no step axis, so it
+        shows every stage at once however wide the run's steps run — which is
+        also the better shape for the question these frames exist to answer.
         """
         vol = np.asarray(volume_hu)
         if not (self.plots_enabled or self.run is not None):
             return
+        figs = {}
         for name, sl, xl, yl, extent in midplane_views(vol, geometry):
             title = f"{name} — {label}" if label else name
-            self._emit(f"lr_stage/view_{name}",
-                       single_view_figure(title, sl, xl, yl, extent,
-                                          hu_window=hu_window),
+            figs[name] = single_view_figure(title, sl, xl, yl, extent,
+                                            hu_window=hu_window)
+            self._emit(f"lr_stage/view_{name}", figs[name],
                        step=step, filename=f"{slug}_view_{name}")
+        if row is not None:
+            self._append_stage_row(row, figs, step)
+
+    def _append_stage_row(self, row: dict, figs: dict, step: int) -> None:
+        """One table row per stage, re-logged whole each time.
+
+        W&B tables are immutable once logged, so the accumulated rows are
+        re-sent on every stage rather than appended to. At six or seven
+        stages a run that is far cheaper than the figures themselves, and it
+        means a run that dies mid-way still leaves a complete table of the
+        stages it did reach.
+        """
+        if self.run is None:
+            return
+        try:
+            import wandb
+            self._stage_rows.append((dict(row), figs))
+            columns = list(row) + ["axial", "coronal", "sagittal"]
+            data = [[*r.values(), *(wandb.Image(f[n]) for n in
+                                    ("axial", "coronal", "sagittal"))]
+                    for r, f in self._stage_rows]
+            self.log({"lr_stage/stages": wandb.Table(columns=columns,
+                                                     data=data)}, step=step)
+        except Exception as e:
+            print(f"W&B stage table failed ({type(e).__name__}: {e})")
 
     # -- projection diagnostics (diag/*) --------------------------------
 

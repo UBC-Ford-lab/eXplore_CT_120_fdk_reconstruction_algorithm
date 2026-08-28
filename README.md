@@ -221,7 +221,7 @@ the three things the DRIVER cannot guess either, each of them a place
 |---|---|
 | `add_args(parser)` | flags only this representation understands. `--init-density` is voxel-only (the parameter IS mu, so its start is a modelling choice); a network sets its output scale in its head |
 | `options(args)` | its constructor arguments — **and** its run-config entries, from one list, because two lists that must agree are two lists that drift |
-| `footprint(args, req)` | its machine footprint. Build it on `preflight.learned_footprint`, whose one free number is `param_bytes`: `req.vol_bytes` for a dense grid, the architecture's own weight count for a network. There is no default — inheriting the grid's `4 x volume` reads as "fits comfortably" right up until the OOM |
+| `footprint(args, req)` | its machine footprint. Build it on `preflight.learned_footprint`, which has **two** free numbers and needs both. `param_bytes`: `req.vol_bytes` for a dense grid, the architecture's own weight count for a network. `activation_bytes_per_sample`: what the model retains per quadrature sample, on top of the renderer's own traffic — zero for a `grid_sample`, ~46x the renderer's for a 4x128 MLP. There is no default for `param_bytes` because inheriting the grid's `4 x volume` reads as "fits comfortably" right up until the OOM; leaving the second at zero is the same mistake in the other place, and it approves a ray batch that cannot start |
 
 So a new representation is: a `LearnedReconstructor` subclass answering the
 three hooks, one `LearnedAlgorithm`, and a `register_algorithm()` call in
@@ -238,7 +238,7 @@ name that module and it becomes an ordinary `--algorithm`:
 
 ```bash
 python -m reconstruction.run_learned_recon SCAN \
-    --algorithm-module inr_pipeline.algorithms --algorithm parent_inr
+    --algorithm-module inr_pipeline.algorithms --algorithm mlp
 ```
 
 (`$CT_LEARNED_ALGORITHMS` does the same once, for a shell or a job script.)

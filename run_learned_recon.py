@@ -48,6 +48,7 @@ from .ct_core.pipeline import (
     save_outputs,
 )
 from .ct_core.data_budget import RANDOM, data_budget
+from .ct_core.early_stop import DEFAULT_MIN_LR_FRACTION
 from .ct_core.hu_calibration import resolve_anchors
 from .ct_core.errors import ConfigError, cli_main
 from .ct_core.preflight import auto_rays_per_batch
@@ -160,20 +161,38 @@ def _resolve_optimizer(args):
     return "sgd" if args.emulate_sart else "adam"
 
 
-def _resolve_lr(args):
-    """The learning rate, defaulted per OPTIMIZER rather than globally.
+#: Adam's LR for a representation that names none. A step in units of the
+#: parameter — right for a dense grid, where the parameter IS mu.
+DEFAULT_ADAM_LR = 1e-4
 
-    Adam and SGD differ by ~4-5 orders of magnitude here: Adam divides by the
-    gradient's own running scale, so 1e-4 is a step in units of the parameter,
-    while plain SGD steps by the raw gradient. 1.0 is the classical relaxation
-    parameter lambda, not a tuned value — and it only means that because
-    --emulate-sart descends the SUMMED misfit with an ABSOLUTE C (see
-    learning_based_iterative.sart). Under any other combination the raw
-    gradient carries an arbitrary scale and 1.0 means nothing in particular.
+
+def _resolve_lr(args, algorithm=None):
+    """The learning rate: explicit, else per REPRESENTATION, else per optimizer.
+
+    Two defaults, and they answer different questions.
+
+    SGD's 1.0 is the classical relaxation parameter lambda, not a tuned value —
+    and it only means that because --emulate-sart descends the SUMMED misfit
+    with an ABSOLUTE C (see learning_based_iterative.sart). Under any other
+    combination the raw gradient carries an arbitrary scale and 1.0 means
+    nothing in particular. It is a fact about the OPTIMIZER, so it stays here.
+
+    Adam's is a fact about the REPRESENTATION and does not: 1e-4 is a step in
+    units of the parameter, which is a considered size when the parameter is mu
+    and an arbitrary one when it is a weight. So an algorithm may name its own
+    (``LearnedAlgorithm.default_lr``), and the one that does not gets the value
+    that was chosen for the grid. See that field for the measured reason this
+    exists — a comparison run at one fifth of the rate the model's own config
+    specifies, and read as a fact about representations.
     """
     if args.lr is not None:
         return float(args.lr)
-    return 1.0 if _resolve_optimizer(args) == "sgd" else 1e-4
+    if _resolve_optimizer(args) == "sgd":
+        return 1.0
+    named = getattr(algorithm, "default_lr", None)
+    if named is None:
+        return DEFAULT_ADAM_LR
+    return float(named(args) if callable(named) else named)
 
 
 def _build_lr_plateau(args):
@@ -256,7 +275,10 @@ def _lr_stage_views_fn(ctx, args, logger):
             slug=f"lr_stage{int(stage):02d}",
             label=(f"LR stage {stage} \u00b7 lr {lr:.2e} \u00b7 "
                    f"iter {iteration} \u00b7 fitted mu_water "
-                   f"{gain:.5f}/mm{flag}"))
+                   f"{gain:.5f}/mm{flag}"),
+            row={'stage': int(stage), 'iteration': int(iteration),
+                 'lr': float(lr), 'mu_water': float(gain),
+                 'gain_determined': bool(anchors.gain_determined)})
         # The gain as a curve, so a frame that looks brighter can be checked
         # against the calibration in one glance rather than by eye.
         logger.log({'lr_stage/implied_mu_water': float(gain),
@@ -504,10 +526,15 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
              '--patience is the separate count that ends the run once the LR '
              'can no longer drop.')
     parser.add_argument(
-        '--lr-plateau-min-fraction', type=float, default=0.02, metavar='F',
+        '--lr-plateau-min-fraction', type=float,
+        default=DEFAULT_MIN_LR_FRACTION, metavar='F',
         help='LR floor as a fraction of the post-warmup base '
-             '(default: %(default)s). With factor 0.5 that is 6 reductions '
-             'before the floor, after which a plateau ends the run.')
+             '(default: %(default)s). With factor 0.5 that is 3 reductions '
+             'before the floor, after which a plateau ends the run. It was '
+             '0.02 (six reductions); reductions 4-6 were measured to change '
+             'the volume by at most 2 grey levels of the 3000 HU display '
+             'window, in the grain band, for 22 %% of the run. Lower it to '
+             '0.02 to restore the old six if a run needs them.')
     parser.add_argument(
         '--lr-plateau-cooldown', type=int, default=1, metavar='K',
         help='Evaluations to wait after a reduction before counting again '
@@ -692,7 +719,7 @@ def main(argv=None):
         'iterations': args.iterations,
         'rays_per_batch': args.rays_per_batch,
         'rays_per_batch_mode': 'auto' if auto_batch else 'pinned',
-        'lr': _resolve_lr(args),
+        'lr': _resolve_lr(args, algorithm),
         'optimizer': _resolve_optimizer(args),
         'lr_plateau': bool(args.lr_plateau),
         'lr_plateau_factor': args.lr_plateau_factor if args.lr_plateau else None,
@@ -782,7 +809,7 @@ def main(argv=None):
         gpu_index=args.gpu_index,
         seed=args.seed,
         compile_mode=args.compile_mode,
-        lr=_resolve_lr(args),
+        lr=_resolve_lr(args, algorithm),
         loss=args.loss,
         loss_options=_parse_loss_options(args.loss_option),
         emulate_sart=args.emulate_sart,

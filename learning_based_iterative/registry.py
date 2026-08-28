@@ -96,6 +96,30 @@ class LearnedAlgorithm:
     #: network by orders of magnitude — in the direction that reads as "fits
     #: comfortably" right up until the OOM.
     footprint: Callable[[Any, MachineRequest], Footprint] = None
+    #: Adam LR to use when ``--lr`` is not given. None = the driver's global
+    #: default.
+    #:
+    #: THE SHARED DEFAULT IS NOT REPRESENTATION-NEUTRAL, which is easy to miss
+    #: because it looks like one. 1e-4 is a step in units of the parameter, and
+    #: for a dense grid the parameter IS mu (~0.022 for water), so 1e-4 is
+    #: half a percent of water per step — a sensible size that was chosen with
+    #: that in mind. A network's parameters are weights with no physical scale
+    #: and their own conditioning, and the right rate is a property of the
+    #: architecture: muNeRF's own config puts the Fourier+ReLU path at 5e-4
+    #: and the hash-grid MLP head at 1e-3.
+    #:
+    #: MEASURED CONSEQUENCE: the first voxel-vs-MLP comparison ran the MLP at
+    #: 1e-4 because that is what the driver hands out, i.e. at ONE FIFTH of the
+    #: rate muNeRF's own config specifies for exactly that architecture, and
+    #: the result was read as a fact about representations. "Everything else
+    #: unchanged" is a trap whenever an unchanged DEFAULT was tuned for one of
+    #: the things being compared: the flag is the same, the condition is not.
+    #:
+    #: A float, or ``(args) -> float`` when the rate depends on the
+    #: algorithm's OWN flags — a hash-grid trunk and a Fourier trunk are
+    #: different architectures under one ``--algorithm``, and muNeRF tunes
+    #: them to 1e-3 and 5e-4 respectively.
+    default_lr: float | Callable[[Any], float] | None = None
 
     def __post_init__(self):
         if self.footprint is None:

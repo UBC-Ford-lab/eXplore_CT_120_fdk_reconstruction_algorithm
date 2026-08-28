@@ -713,6 +713,25 @@ def solution_norm(volume, norm: str = "l2") -> float:
 # Criterion 3: metric-driven LR decay (learning-based backends)
 # ---------------------------------------------------------------------------
 
+#: LR floor as a fraction of the post-warmup base. With factor 0.5 this is
+#: exactly THREE halvings (0.5^3 = 0.125) before the floor, after which a
+#: plateau ends the run. It was 0.02 = six halvings, and the extra three were
+#: MEASURED to be worthless: on run 7hdik769 (Scan_1510 voxel/Adam/MSE) the
+#: midplane at reduction 4 already differs from the final volume by at most 2
+#: grey levels of a 3000 HU window (~24 HU), reduction 5 by one (~12 HU), and
+#: the difference has moved into the high-frequency band where it is grain
+#: rather than structure (50% and 62% of its power above half Nyquist, against
+#: 24-30% for reductions 1-3). Held-out SSIM over those three reductions moved
+#: +0.0014, on a projection already fitted far past its own noise ceiling.
+#: They cost 22,000 of that run's 100,000 iterations.
+#:
+#: Three, not fewer: the reduction-3 volume still differs from the final by
+#: ~47 HU peak, and reduction 2 by ~106 HU, in the 0.2-2.5 mm band — real
+#: structure, not shading (the heavily-smoothed component carries only 4-8% of
+#: it) and not calibration (the fitted gain moves 0.35% across all six).
+DEFAULT_MIN_LR_FRACTION = 0.125
+
+
 class PlateauLRReducer:
     """Metric-driven LR decay that shares the held-out signal with EarlyStopper.
 
@@ -743,7 +762,8 @@ class PlateauLRReducer:
     """
 
     def __init__(self, factor: float = 0.5, patience: int = 2,
-                 min_lr_fraction: float = 0.02, cooldown: int = 1):
+                 min_lr_fraction: float = DEFAULT_MIN_LR_FRACTION,
+                 cooldown: int = 1):
         if not (0.0 < factor < 1.0):
             raise ValueError(f"lr_plateau.factor must be in (0, 1), got {factor}")
         if not (0.0 < min_lr_fraction <= 1.0):
