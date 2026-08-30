@@ -51,7 +51,7 @@ from .ct_core.data_budget import RANDOM, data_budget
 from .ct_core.early_stop import DEFAULT_MIN_LR_FRACTION
 from .ct_core.hu_calibration import resolve_anchors
 from .ct_core.errors import ConfigError, cli_main
-from .ct_core.preflight import auto_rays_per_batch
+from .ct_core.preflight import MachineRequest, auto_rays_per_batch
 from .ct_core.projection_diag import measure_noise_ceiling
 from .ct_core.utils import query_gpu_memory
 from .ct_core.early_stop import STOP_METRICS
@@ -679,6 +679,24 @@ def main(argv=None):
     # Same pattern as the FDK backend's chunk sizing: measure free VRAM, put
     # the persistent buffers aside, spend the rest per step. Pinning an
     # integer skips this entirely.
+    # A representation with no per-ray-sample cost has no ray batch to size:
+    # it consumes whole views (splatting) or the whole sinogram at once. That
+    # is the same case `Footprint` already documents for FDK/ASTRA/TIGRE, and
+    # it reaches the preflight as bytes_per_ray_sample == 0. Ask the algorithm
+    # rather than name it, so the next such backend needs no branch here; the
+    # VRAM check below still runs, on the persistent term alone.
+    _probe = algorithm.bind_footprint(args)(MachineRequest(
+        n_angles=int(ctx.projections.shape[0]),
+        n_b=int(ctx.projections.shape[1]), n_a=int(ctx.projections.shape[2]),
+        vol_shape=tuple(ctx.geometry['vol_shape']), rays_per_batch=0,
+        samples_per_ray=_spp, optimizer=_resolve_optimizer(args)))
+    if auto_batch and not int(_probe.bytes_per_ray_sample):
+        auto_batch = False
+        args.rays_per_batch = 0
+        print(f"\nRays/batch: not applicable — {algorithm.name} declares no "
+              f"per-ray-sample cost, so it is not trained through the ray "
+              f"sampler. It reports what it actually consumed instead.")
+
     if auto_batch:
         gpu = query_gpu_memory(args.gpu_index)
         n_ang, n_b, n_a = (int(s) for s in ctx.projections.shape)
