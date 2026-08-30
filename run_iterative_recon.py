@@ -38,6 +38,7 @@ from .ct_core.pipeline import (
     save_outputs,
 )
 from .ct_core.projection_diag import (
+    level_to_air,
     measure_noise_ceiling,
     preprocess_frames,
     render_projection_from_volume,
@@ -545,9 +546,15 @@ def main():
                 ctx.projections[eval_idx:eval_idx + 1], ctx)[0]
             # The volume is mu now, so it goes to the forward model as-is
             # — no round trip through an assumed mu_water.
+            # Air to zero first — see `level_to_air`. The anchors are
+            # fitted here rather than reused because save_outputs runs AFTER
+            # this block, and on the CROPPED volume; the level that belongs to
+            # a forward projection is the one measured on the volume actually
+            # being projected.
+            mu_diag, _air = level_to_air(
+                reconstructor.reconstructed_volume, verbose=True)
             pred, target = render_projection_from_volume(
-                reconstructor.reconstructed_volume, ctx, eval_idx, measured,
-                volume_is_hu=False)
+                mu_diag, ctx, eval_idx, measured, volume_is_hu=False)
             logger.log_projection_diag(pred, target)
         except Exception as e:
             print(f"  Final projection diagnostics failed "

@@ -38,6 +38,18 @@ after the single least-squares gain that best matches the measured
 projection. The forward model is linear in mu, so that costs no second
 render: scaling mu by g scales the prediction by g exactly. ``proj/gain_fit``
 is 1.0 for a volume whose calibration already agrees with the data.
+
+  * THE FOURTH THING, and the one that reads as a scale error when it is not:
+    THE EXTENT. ``gain_fit`` has one parameter, so an ADDITIVE disagreement has
+    nowhere to go and comes out as a tilted scale. Every row therefore also
+    reports ``proj/affine_slope`` and ``proj/affine_intercept``, the two-
+    parameter fit ``target ~ slope*pred + offset``. A slope near 1 with a large
+    offset is a volume that is missing matter rather than mis-scaled — most
+    often because it covers less of the scan than the row beside it (the export
+    ROI is ~10 % of the reconstruction domain, and a ray crossing it still
+    crosses the bed). The report warns when the extents differ; the affine fit
+    is where you see what it cost. Both are DIAGNOSTIC: nothing is rescaled or
+    written by either.
 """
 
 from __future__ import annotations
@@ -58,6 +70,7 @@ from .ct_core.pipeline import (
 )
 from .ct_core.projection_diag import (
     covered_detector_window,
+    level_to_air,
     evaluate_projection,
     measure_noise_ceiling,
     preprocess_frames,
@@ -185,8 +198,12 @@ def load_volume_as_mu(path, args, *, vendor: bool = False,
         voxel_xy=args.volume_voxel_xy, voxel_z=args.volume_voxel_z,
         origin=args.volume_origin, sidecar=sidecar, verbose=verbose)
     anchors, how = anchors_for(sidecar, args.mu_water, path.name)
-    mu = np.clip(anchors.invert(volume_hu), 0.0, None)
+    # Level rather than clip: this volume recorded where its own air sits, and
+    # the forward model assumes air integrates to nothing. See
+    # `projection_diag.level_to_air` for why the difference is worth dB.
+    mu, air = level_to_air(anchors.invert(volume_hu), anchors)
     return mu, geometry, {
+        'air_level': air,
         'calibration': how,
         'algorithm': (sidecar or {}).get('algorithm', 'external'),
         'hu_scale': float(anchors.scale),
@@ -218,11 +235,53 @@ def gain_fit(pred: np.ndarray, target: np.ndarray) -> float:
 
     Exact for the forward model, which is linear in mu: rendering g*mu gives
     g*pred, so the gain-corrected metrics need no second render.
+
+    ONE parameter, so it cannot express an ADDITIVE disagreement and has to
+    absorb one by tilting the scale instead. Read it next to `affine_fit`,
+    which can — see that function for what the difference diagnoses.
     """
     p = np.asarray(pred, dtype=np.float64)
     t = np.asarray(target, dtype=np.float64)
     denom = float((p * p).sum())
     return float((p * t).sum() / denom) if denom > 0 else 1.0
+
+
+def affine_fit(pred: np.ndarray, target: np.ndarray) -> tuple:
+    """(slope, intercept) of the least-squares ``target ~ slope*pred + c``.
+
+    DIAGNOSTIC ONLY. Nothing is rescaled by it, nothing is written with it; it
+    is reported beside `gain_fit` so that a scale error and an offset can be
+    told apart. That distinction is not academic — MEASURED on Scan_1510, all
+    three of these move `gain_fit` and NONE of them is a density error:
+
+      * a volume whose air does not sit at mu = 0 (the HU calibration's own
+        offset term) shifts every ray by air_level x path length;
+      * a volume cropped to the export ROI cannot contain the bed or the rest
+        of the specimen, so it under-predicts by a near-constant. Cropping one
+        unchanged FDK to the ROI moved gain_fit 1.097 -> 1.265 while the affine
+        slope stayed put (1.1266 -> 1.1367) and the intercept carried all of it
+        (-0.009 -> +0.044);
+      * clipping mu < 0 before forward-projecting, which FDK/SIRT/ASTRA
+        volumes legitimately have and softplus-based backends do not.
+
+    So: slope is the scale question `gain_fit` was asking, and a non-zero
+    intercept says the rest of the row is answering a different one.
+
+    This is the SAME affine model `ct_core.hu_calibration` fits — that module
+    solves ``mu_hat = g*mu + c`` from the volume's own histogram and APPLIES
+    it; this measures what is left of it against the measured data and only
+    reports. Do not close the loop: the intercept mixes air level, truncation
+    and scatter (after air-levelling one volume's intercept fell to -0.009
+    while another's stayed at +0.043, pure truncation), and feeding it back
+    would also destroy the reference-freedom that module is built around.
+    """
+    p = np.asarray(pred, dtype=np.float64).ravel()
+    t = np.asarray(target, dtype=np.float64).ravel()
+    if p.size == 0 or not np.any(p):
+        return 1.0, 0.0
+    M = np.stack([p, np.ones_like(p)], axis=1)
+    slope, intercept = np.linalg.lstsq(M, t, rcond=None)[0]
+    return float(slope), float(intercept)
 
 
 def score_volume(mu, geometry, ctx, indices, measured, window, *,
@@ -235,16 +294,18 @@ def score_volume(mu, geometry, ctx, indices, measured, window, *,
             mu, ctx, idx, measured[idx], volume_is_hu=False,
             downsample=render_downsample, geometry=geometry, window=window)
         g = gain_fit(pred, target)
+        slope, intercept = affine_fit(pred, target)
         m = evaluate_projection(pred, target)
         mg = evaluate_projection(pred * g, target)
         rows.append({'angle_index': int(idx), 'gain_fit': g,
+                     'affine_slope': slope, 'affine_intercept': intercept,
                      'ssim': m['ssim'], 'psnr': m['psnr'], 'mse': m['mse'],
                      'ssim_gainfit': mg['ssim'], 'psnr_gainfit': mg['psnr'],
                      'mse_gainfit': mg['mse']})
         if verbose:
             print(f"    angle {idx:4d}   ssim {m['ssim']:.4f}   "
                   f"psnr {m['psnr']:6.2f} dB   mse {m['mse']:.4e}   "
-                  f"gain {g:.4f}")
+                  f"gain {g:.4f}   slope {slope:.4f}  offset {intercept:+.5f}")
         if first_pair is None:
             first_pair = (pred, target)
     return rows, first_pair
@@ -256,7 +317,7 @@ def aggregate(rows: list) -> dict:
     have not been separated by this measurement."""
     out = {}
     for key in ('ssim', 'psnr', 'mse', 'ssim_gainfit', 'psnr_gainfit',
-                'mse_gainfit', 'gain_fit'):
+                'mse_gainfit', 'gain_fit', 'affine_slope', 'affine_intercept'):
         vals = np.array([r[key] for r in rows], dtype=np.float64)
         out[f'proj/{key}'] = float(vals.mean())
         out[f'proj/{key}_std'] = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
@@ -412,6 +473,34 @@ def main():
         print("  (the volumes' own windows differ — every row is scored on "
               "the intersection so the columns compare)")
 
+    # ---- and the common EXTENT, which the window does not cover -------
+    # A shared detector window makes two rows look comparable while they still
+    # are not: a ray inside the window crosses the volume AND whatever lies
+    # outside it, so a volume covering less of the scan under-predicts by an
+    # amount that is a property of its FIELD OF VIEW, not of its
+    # reconstruction. The drivers make this easy to hit by accident —
+    # run_learned_recon and run_iterative_recon crop to the export ROI before
+    # saving, run_fdk_recon does not — so scoring an FDK against a learned
+    # volume off disk compares 81 mm of specimen against 25 mm of it.
+    # MEASURED on Scan_1510: cropping ONE unchanged FDK to the ROI cost
+    # 4.65 dB and 0.19 SSIM, and moved gain_fit from 1.097 to 1.265.
+    extents = [(float(g['vol_shape'][0]) * float(g['dx']),
+                float(g['vol_shape'][1]) * float(g['dx']),
+                float(g['vol_shape'][2]) * float(g['dz']))
+               for _, _, g, _ in plan]
+    vols = [e[0] * e[1] * e[2] for e in extents]
+    if vols and min(vols) > 0 and max(vols) / min(vols) > 1.10:
+        print("\n  WARNING: these volumes do not cover the same region, so "
+              "their rows are NOT comparable —")
+        for (label, _p, _g, _v), e in zip(plan, extents):
+            print(f"    {label[:34]:34s} {e[0]:6.1f} x {e[1]:5.1f} x "
+                  f"{e[2]:5.1f} mm")
+        print("  A ray scored inside the common window still crosses matter "
+              "the smaller volume does not\n  contain, so it under-predicts "
+              "by its field of view. Read proj/affine_intercept: that is\n"
+              "  where the truncation lands. Re-export at a common extent "
+              "(--roi off) to compare them.")
+
     # ---- the measured projections ------------------------------------
     measured = {}
     for idx in indices:
@@ -431,6 +520,10 @@ def main():
         mu, _vol_geometry, prov = load_volume_as_mu(path, args, vendor=vendor,
                                                     verbose=False)
         print(f"  HU inverted through its {prov['calibration']}")
+        if prov['air_level']:
+            print(f"  air levelled to zero for the forward model "
+                  f"(mu -= {prov['air_level']:+.6f} mm^-1) — the stored "
+                  f"volume is unchanged")
         rows, pair = score_volume(mu, geometry, ctx, indices, measured, window,
                                   render_downsample=args.render_downsample)
         del mu
@@ -438,6 +531,7 @@ def main():
         results.append({'label': label, 'volume': path.name,
                         'algorithm': prov['algorithm'],
                         'calibration': prov['calibration'],
+                        'air_level': prov['air_level'],
                         'hu_scale': prov['hu_scale'],
                         'vol_shape': list(geometry['vol_shape']),
                         'voxel_xy_mm': float(geometry['dx']),
@@ -446,21 +540,29 @@ def main():
 
     # ---- report -------------------------------------------------------
     print("\n" + "=" * 78)
-    print(f"{'volume':28s} {'ssim':>7s} {'psnr':>8s} {'mse':>11s} "
-          f"{'gain':>7s} {'ssim*':>7s} {'psnr*':>8s}")
-    print("-" * 78)
+    print(f"{'volume':26s} {'ssim':>7s} {'psnr':>8s} {'mse':>11s} "
+          f"{'gain':>7s} {'ssim*':>7s} {'psnr*':>8s} | {'slope':>7s} "
+          f"{'offset':>9s}")
+    print("-" * 96)
     for r in results:
-        print(f"{r['label'][:28]:28s} {r['proj/ssim']:7.4f} "
+        print(f"{r['label'][:26]:26s} {r['proj/ssim']:7.4f} "
               f"{r['proj/psnr']:8.2f} {r['proj/mse']:11.4e} "
               f"{r['proj/gain_fit']:7.4f} {r['proj/ssim_gainfit']:7.4f} "
-              f"{r['proj/psnr_gainfit']:8.2f}")
+              f"{r['proj/psnr_gainfit']:8.2f} | "
+              f"{r['proj/affine_slope']:7.4f} "
+              f"{r['proj/affine_intercept']:+9.5f}")
     if ceiling is not None:
-        print("-" * 78)
-        print(f"{'noise ceiling':28s} {ceiling['ssim']:7.4f} "
+        print("-" * 96)
+        print(f"{'noise ceiling':26s} {ceiling['ssim']:7.4f} "
               f"{ceiling['psnr']:8.2f} {ceiling['mse']:11.4e}"
               f"   ({ceiling['source']})")
-    print("=" * 78)
+    print("=" * 96)
     print("* = after the least-squares gain; see proj/gain_fit.")
+    print("slope/offset = the two-parameter fit target ~ slope*pred + offset. "
+          "A slope near 1 with a\n  large offset is an ADDITIVE disagreement "
+          "(field of view, air level, scatter), not a density\n  error — and "
+          "gain alone cannot tell them apart. Diagnostic only; nothing is "
+          "rescaled by it.")
 
     report_path = Path(args.report) if args.report else (
         Path(args.volume[0]).with_name(

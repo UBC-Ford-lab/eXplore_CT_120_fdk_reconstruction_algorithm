@@ -37,6 +37,7 @@ from .ct_core.pipeline import (
     save_outputs,
 )
 from .ct_core.projection_diag import (
+    level_to_air,
     measure_noise_ceiling,
     preprocess_frames,
     render_projection_from_volume,
@@ -258,9 +259,9 @@ def main():
         note="single backprojection pass over every measurement")
 
     # Shared back half: HU calibration + bilateral filter + VFF export.
-    _, _, volume_hu = save_outputs(reconstructor.reconstructed_volume, ctx,
-                                   args, output_path, logger=logger,
-                                   algorithm='fdk')
+    _, anchors, volume_hu = save_outputs(reconstructor.reconstructed_volume,
+                                         ctx, args, output_path, logger=logger,
+                                         algorithm='fdk')
 
     # Projection diagnostics on the final volume: forward-project at the
     # evaluation angle through the canonical ray tracer -> diag/ssim, psnr,
@@ -271,9 +272,14 @@ def main():
         # The volume is mu now, so it goes to the forward model as-is —
         # no round trip through an assumed mu_water, which used to convert
         # HU back to attenuation with a constant unrelated to this scan.
+        # Air to zero first: FDK reconstructs real negative undershoot, and
+        # the forward model assumes air integrates to nothing. The anchors
+        # save_outputs just fitted say where this volume put air, so this
+        # costs nothing extra. The STORED volume keeps its own offset.
+        mu_diag, _air = level_to_air(reconstructor.reconstructed_volume,
+                                     anchors, verbose=True)
         pred, target = render_projection_from_volume(
-            reconstructor.reconstructed_volume, ctx, eval_idx, measured,
-            volume_is_hu=False)
+            mu_diag, ctx, eval_idx, measured, volume_is_hu=False)
         logger.log_projection_diag(pred, target)
     except Exception as e:
         print(f"  Final projection diagnostics failed "

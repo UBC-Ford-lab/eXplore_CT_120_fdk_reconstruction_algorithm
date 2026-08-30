@@ -278,6 +278,68 @@ def measure_noise_ceiling(ctx, eval_index: int, phase: str = "00",
 
 
 # --------------------------------------------------------------------------
+# Putting air where the forward model assumes it is
+# --------------------------------------------------------------------------
+
+def level_to_air(volume, anchors=None, *, verbose: bool = False):
+    """``(volume - air_level, air_level)`` — air moved to mu = 0.
+
+    The forward model assumes a ray through air integrates to nothing. A
+    reconstruction's air does not land exactly at zero: the offset is real and
+    physical (``hu_calibration``'s own ``c``, from scatter, truncation and the
+    support bias), and the HU fit already MEASURES it as ``value_air``.
+
+    PATH LENGTH IS THE AMPLIFIER, which is why a number this small matters.
+    MEASURED on Scan_1510's FDK: value_air = -0.000828 mm^-1, about 4 % of
+    water, but a ray crosses ~60 mm of domain, so it displaces every line
+    integral by -0.050 against a measured value of ~0.15. A 4 % error in the
+    volume is a 33 % error in the projection, and `gain_fit` reports it as a
+    1.3x density error that is not there.
+
+    Subtracting it is EXACT, because the forward model is linear:
+    ``A(mu - a) = A(mu) - a*A(1)``, so this shifts every ray by exactly the
+    amount the air offset contributes and changes nothing else.
+
+    This REPLACES a `np.clip(volume, 0, None)` that used to sit in
+    `render_projection_from_volume`. Clipping is nonlinear: it fixed the air
+    level only by accident (air is where most negative voxels are) and paid for
+    it by destroying the edge undershoot, which is real signal. MEASURED on the
+    same volume, at the scored angle: clipped 22.09 dB, neither 17.08 dB,
+    levelled 23.25 dB, with the affine intercept collapsing +0.062 -> -0.009.
+
+    Levelling is NOT applied to anything stored — a delivered volume keeps the
+    offset it measured, because that offset is a result. This is for the
+    forward model alone.
+
+    CAVEATS, both measured. It removes the AIR share of the offset and nothing
+    else: a volume cropped to the export ROI keeps its truncation offset
+    (+0.043 after levelling, unchanged). And it is not automatically an
+    improvement — where ``value_air`` is already ~0 (any softplus-based
+    backend) it is a no-op to within noise, and can move a score either way.
+
+    ``anchors`` supplies the level when the caller already has it; otherwise it
+    is fitted from this volume's own histogram, the same estimator that wrote
+    it. Never raises: an unfittable volume is left alone.
+    """
+    vol = np.asarray(volume)
+    if anchors is None:
+        try:
+            from .hu_calibration import resolve_anchors
+            anchors = resolve_anchors(vol, "auto")
+        except Exception as e:
+            if verbose:
+                print(f"  [diag] air level unavailable ({type(e).__name__}: "
+                      f"{e}); forward-projecting unlevelled")
+            return vol, 0.0
+    air = float(getattr(anchors, "value_air", 0.0) or 0.0)
+    if air == 0.0:
+        return vol, 0.0
+    if verbose:
+        print(f"  [diag] levelling air to zero: mu -= {air:+.6f} mm^-1")
+    return vol - air, air
+
+
+# --------------------------------------------------------------------------
 # Forward-project a finished volume at the evaluation angle
 # --------------------------------------------------------------------------
 
@@ -435,7 +497,9 @@ def render_projection_from_volume(volume, ctx, angle_index: int,
         # and with no BHC to switch on there is only the one legacy constant.
         mu_w = MU_WATER_80KV if mu_water is None else float(mu_water)
         vol = fixed_anchors(mu_w).invert(vol)
-    vol = np.clip(vol, 0.0, None)
+    # NOT clipped. A `np.clip(vol, 0.0, None)` lived here until 2026-08-30 and
+    # was silently costing every FDK/SIRT/ASTRA volume a large DC error — see
+    # `level_to_air`, which is what a caller should do instead.
 
     Nx, Ny, Nz = vol.shape
     model = VoxelGrid((Nz, Ny, Nx), init_density=0.0)
