@@ -37,7 +37,7 @@ iterative = ["astra-toolbox"]
 wandb = ["wandb"]
 
 [project.urls]
-Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_fdk_reconstruction_algorithm"
+Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms"
 
 [tool.setuptools.packages.find]
 include = ["ct_core*", "fdk*", "iterative*", "learning_based_iterative*"]
