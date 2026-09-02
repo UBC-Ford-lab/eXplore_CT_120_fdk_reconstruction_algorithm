@@ -1,5 +1,6 @@
 # eXplore CT 120 Reconstruction
 
+[![PyPI](https://img.shields.io/pypi/v/eXplore_CT_120_reconstruction_algorithms.svg)](https://pypi.org/project/eXplore-CT-120-reconstruction-algorithms/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
@@ -137,14 +138,6 @@ Detector calibrations measured from a scan are cached in `data/calibration/`
 of the checkout when running from source, in the per-user data directory
 (`~/.local/share/explore_ct120_recon/calibration` on Linux) for an installed
 copy, or wherever `$CT_CALIBRATION_DIR` points.
-
-## Development
-
-```bash
-git clone https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms.git
-cd eXplore_CT_120_reconstruction_algorithms
-pip install -e ".[dev]"
-```
 
 ## License
 
