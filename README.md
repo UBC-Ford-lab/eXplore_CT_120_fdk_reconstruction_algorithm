@@ -6,7 +6,7 @@
 Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner.
 Point it at a scan folder and get a calibrated HU volume back.
 
-![Cone-beam reconstruction: a ray from the source through the volume to a detector pixel](assets/voxel_model.png)
+![Cone-beam reconstruction: a ray from the source through the volume to a detector pixel](https://raw.githubusercontent.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/main/assets/voxel_model.png)
 
 *Each detector pixel measures a line integral of the attenuation μ along a
 ray from the source. Reconstruction recovers the volume, here a dense voxel

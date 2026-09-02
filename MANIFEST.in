@@ -1,0 +1,4 @@
+prune tests
+prune data
+prune assets
+exclude .gitignore
