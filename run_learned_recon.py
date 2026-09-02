@@ -254,8 +254,18 @@ def _lr_stage_views_fn(ctx, args, logger):
     if logger.run is None and not logger.plots_enabled:
         return None      # nothing would receive the figures
 
-    def on_lr_stage(volume_mu, iteration, stage, lr):
-        vol, geom = crop_to_export_roi(volume_mu, ctx.geometry)
+    def on_lr_stage(volume_mu, iteration, stage, lr, geometry=None,
+                    slug=None):
+        if geometry is None:
+            vol, geom = crop_to_export_roi(volume_mu, ctx.geometry)
+        else:
+            # The backend evaluated the export grid directly and says so:
+            # `geometry` already describes `volume_mu`, there is nothing to
+            # crop. A representation that can be queried at arbitrary points
+            # has no reason to materialise the whole domain for three slices
+            # — MEASURED on the Gaussian backend at Scan_1510 ds3/75 um, the
+            # export ROI renders in 0.9 s where the full domain takes ~1 min.
+            vol, geom = np.asarray(volume_mu), dict(geometry)
         try:
             anchors = resolve_anchors(
                 vol, getattr(args, 'hu_calibration', 'auto'),
@@ -272,7 +282,7 @@ def _lr_stage_views_fn(ctx, args, logger):
         flag = "" if anchors.gain_determined else " (UNDETERMINED)"
         logger.log_stage_views(
             anchors.apply(vol), geom, step=int(iteration),
-            slug=f"lr_stage{int(stage):02d}",
+            slug=(slug or f"lr_stage{int(stage):02d}"),
             label=(f"LR stage {stage} \u00b7 lr {lr:.2e} \u00b7 "
                    f"iter {iteration} \u00b7 fitted mu_water "
                    f"{gain:.5f}/mm{flag}"),

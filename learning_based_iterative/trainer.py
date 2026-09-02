@@ -57,7 +57,7 @@ loop never grows a branch per caller:
 | ``early_stopper=`` | ``EarlyStopper`` | share ONE stopper when the caller reads it too |
 | ``snapshot_fn=`` / ``restore_fn=`` | ``() -> state`` / ``(state)`` | when "the model" is more than one module |
 | ``lr_plateau=`` | ``PlateauLRReducer`` | closed-loop LR; takes over at the end of warmup |
-| ``on_lr_stage=`` | ``(volume_mu, it, stage, lr) -> None`` | the volume at every LR change, for a scrollable record of the stages |
+| ``on_lr_stage=`` | ``(volume_mu, it, stage, lr, geometry=None, slug=None) -> None`` | the volume at every LR change, for a scrollable record of the stages; a backend that renders the export grid itself passes ``geometry`` (nothing to crop) and may name the frame with ``slug`` |
 
 ``render_fn`` returns ONE prediction because that is what the loss is scored
 on. An operator with more outputs — hierarchical's coarse AND fine, GH-NAF's
