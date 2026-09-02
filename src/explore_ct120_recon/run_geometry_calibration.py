@@ -14,8 +14,8 @@ a cluster login/GPU node before submitting long jobs, or with --force after a
 scanner recalibration.
 
 Usage:
-    python -m reconstruction.run_geometry_calibration data/scans/Scan_1510
-    python -m reconstruction.run_geometry_calibration data/scans/Scan_1510 --force
+    ct120-geometry-calibration data/scans/Scan_1510
+    ct120-geometry-calibration data/scans/Scan_1510 --force
 """
 
 import argparse
@@ -82,5 +82,10 @@ def main():
           f"(elapsed {float(record.get('elapsed_s', 0.0)):.0f}s).")
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """Console-script entry point (``[project.scripts]`` in pyproject.toml)."""
     cli_main(main)
+
+
+if __name__ == '__main__':
+    cli()

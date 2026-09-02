@@ -69,10 +69,7 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
-    try:
-        from .vff_io import read_vff
-    except ImportError:
-        from vff_io import read_vff
+    from .vff_io import read_vff
     header, data = read_vff(filename=args.input, verbose=not args.quiet)
 
     outdir = args.outdir

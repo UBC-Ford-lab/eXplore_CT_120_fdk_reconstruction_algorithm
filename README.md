@@ -1,7 +1,7 @@
 # eXplore CT 120 Reconstruction
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
 Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner.
 Point it at a scan folder and get a calibrated HU volume back.
@@ -15,7 +15,7 @@ grid, from those measurements.*
 | Family | Algorithms | Needs |
 |---|---|---|
 | Analytic (`fdk/`) | FDK with ramp / Shepp-Logan / cosine / Hamming windows, Parker weighting | PyTorch |
-| Classical iterative (`iterative/`) | ASTRA: SIRT, CGLS, SART. TIGRE: OS-SART, SART, SIRT, MLEM, +TV | CUDA + `astra-toolbox` or `pytigre` |
+| Classical iterative (`iterative/`) | ASTRA: SIRT, CGLS, SART. TIGRE: OS-SART, SART, SIRT, MLEM, +TV | CUDA + ASTRA or TIGRE |
 | Learning-based (`learning_based_iterative/`) | Differentiable projector + gradient descent; voxel grid by default, other representations pluggable | CUDA |
 
 All three share the same loading, preprocessing, geometry calibration, HU
@@ -24,24 +24,36 @@ calibration and output format, so their volumes are directly comparable.
 ## Install
 
 ```bash
-git clone https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms.git reconstruction
-cd reconstruction && pip install -e .
-pip install astra-toolbox pytigre wandb   # optional backends + logging
+pip install eXplore_CT_120_reconstruction_algorithms
+# or the development version
+pip install git+https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms.git
 ```
 
-The drivers are run as modules from the directory that contains the clone,
-so keep the folder named `reconstruction`.
+Optional backends and logging:
+
+```bash
+pip install astra-toolbox                                            # ASTRA
+pip install "git+https://github.com/CERN/TIGRE.git#subdirectory=Python"   # TIGRE (not on PyPI)
+pip install wandb                                                    # experiment logging
+```
+
+Python 3.10+ and PyTorch 2.0+. The import name is `explore_ct120_recon`.
 
 ## Usage
 
-```bash
-cd ..   # the directory containing reconstruction/
+Six commands are installed:
 
-python -m reconstruction.run_fdk_recon data/scans/Scan_1988
-python -m reconstruction.run_iterative_recon data/scans/Scan_1988 --backend astra --algorithm SIRT3D_CUDA --iterations 100
-python -m reconstruction.run_iterative_recon data/scans/Scan_1988 --backend tigre --algorithm ossart --tv-lambda 10
-python -m reconstruction.run_learned_recon data/scans/Scan_1988 --downsample 3
+```bash
+ct120-fdk data/scans/Scan_1988
+ct120-iterative data/scans/Scan_1988 --backend astra --algorithm SIRT3D_CUDA --iterations 100
+ct120-iterative data/scans/Scan_1988 --backend tigre --algorithm ossart --tv-lambda 10
+ct120-learned data/scans/Scan_1988 --downsample 3
+ct120-volume-report VOLUME.vff
+ct120-projection-report data/scans/Scan_1988 --volume a.vff --volume b.vff
+ct120-geometry-calibration data/scans/Scan_1988
 ```
+
+(`python -m explore_ct120_recon.run_fdk_recon ...` is the same thing.)
 
 A scan folder holds the projection `.vff` files, `scan.xml`, and the
 `bright.vff` / `dark.vff` flat-field frames. Each run writes a `.vff`
@@ -91,26 +103,47 @@ becomes an `--algorithm` choice; `voxel/` is the 100-line example. A
 representation in another package works the same way via
 `--algorithm-module my_package.algorithms`.
 
-## Other tools
+## Report tools
 
-```bash
-python -m reconstruction.run_volume_report VOLUME.vff            # slices, histogram, HU anchors of any finished volume
-python -m reconstruction.run_projection_report SCAN --volume a.vff --volume b.vff   # score volumes against the measured projections
-python -m reconstruction.run_geometry_calibration SCAN           # pre-measure the detector rotation on a GPU node
+`ct120-volume-report` draws slices, the HU histogram and the fitted anchors
+for any finished volume, including the vendor's. `ct120-projection-report`
+forward-projects one or more volumes and scores them against the measured
+projections on the same angles and detector window.
+`ct120-geometry-calibration` pre-measures the detector rotation, for
+example on a GPU node before submitting long jobs. Use `--vendor` with the
+report tools for a GE volume; it applies the vendor's axis conventions and
+locates the ROI from the scan.
+
+Everything is importable too:
+
+```python
+from explore_ct120_recon.ct_core.vff_io import read_vff, write_vff
+from explore_ct120_recon.learning_based_iterative import LearnedReconstructor
 ```
-
-Use `--vendor` with the report tools for a GE volume; it applies the
-vendor's axis conventions and locates the ROI from the scan.
 
 ## Layout
 
 ```
-run_*.py                    drivers, one per family plus the report tools
-ct_core/                    shared: scan loading, preprocessing, geometry
-                            calibration, HU calibration, preflight, VFF I/O
-fdk/                        filtered backprojection
-iterative/{astra,tigre}/    toolbox wrappers
-learning_based_iterative/   trainer, ray sampler, renderer, losses, voxel/
+src/explore_ct120_recon/
+  run_*.py                    drivers, one per family plus the report tools
+  ct_core/                    shared: scan loading, preprocessing, geometry
+                              calibration, HU calibration, preflight, VFF I/O
+  fdk/                        filtered backprojection
+  iterative/{astra,tigre}/    toolbox wrappers
+  learning_based_iterative/   trainer, ray sampler, renderer, losses, voxel/
+```
+
+Detector calibrations measured from a scan are cached in `data/calibration/`
+of the checkout when running from source, in the per-user data directory
+(`~/.local/share/explore_ct120_recon/calibration` on Linux) for an installed
+copy, or wherever `$CT_CALIBRATION_DIR` points.
+
+## Development
+
+```bash
+git clone https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms.git
+cd eXplore_CT_120_reconstruction_algorithms
+pip install -e ".[dev]"
 ```
 
 ## License

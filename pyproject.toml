@@ -3,44 +3,68 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "eXplore-CT-120-fdk-reconstruction"
-version = "0.1.0"
-description = "GPU-accelerated FDK cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner"
+name = "eXplore_CT_120_reconstruction_algorithms"
+dynamic = ["version"]
+description = "Cone-beam CT reconstruction for the GE eXplore CT 120 micro-CT scanner: FDK, ASTRA/TIGRE iterative, and learning-based (differentiable projector) backends with shared calibration and HU pipeline"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Falk Wiegmann"},
 ]
-keywords = ["CT", "reconstruction", "FDK", "cone-beam", "micro-CT", "medical imaging"]
+keywords = ["CT", "cone-beam", "micro-CT", "reconstruction", "FDK", "SIRT", "differentiable-rendering", "medical-imaging"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [
-    "numpy",
-    "scipy",
-    "torch",
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "torch>=2.0",
     "xmltodict",
     "imageio",
     "matplotlib",
     "opencv-python-headless",
     "tqdm",
+    "platformdirs>=3.0",
 ]
 
 [project.optional-dependencies]
-iterative = ["astra-toolbox"]
-wandb = ["wandb"]
+# ASTRA iterative backend (CUDA). TIGRE is not on PyPI; see the README.
+astra = ["astra-toolbox"]
+wandb = ["wandb>=0.16"]
+dev = ["pytest>=8.0", "build", "twine"]
 
 [project.urls]
 Repository = "https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms"
+Issues = "https://github.com/UBC-Ford-lab/eXplore_CT_120_reconstruction_algorithms/issues"
+
+[project.scripts]
+ct120-fdk = "explore_ct120_recon.run_fdk_recon:cli"
+ct120-iterative = "explore_ct120_recon.run_iterative_recon:cli"
+ct120-learned = "explore_ct120_recon.run_learned_recon:cli"
+ct120-volume-report = "explore_ct120_recon.run_volume_report:cli"
+ct120-projection-report = "explore_ct120_recon.run_projection_report:cli"
+ct120-geometry-calibration = "explore_ct120_recon.run_geometry_calibration:cli"
+
+[tool.setuptools.dynamic]
+version = {attr = "explore_ct120_recon.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["ct_core*", "fdk*", "iterative*", "learning_based_iterative*"]
+where = ["src"]
 
-[tool.setuptools]
-py-modules = ["run_fdk_recon", "run_iterative_recon", "run_learned_recon", "run_geometry_calibration", "run_volume_report"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: integration tests that load real scan data (deselected by default)",
+]
+addopts = "-m 'not slow'"

@@ -30,15 +30,15 @@ drivers followed on 2026-08-15.)
 
 Usage:
     # vendor reconstruction, logged to W&B
-    python -m reconstruction.run_volume_report \\
+    ct120-volume-report \\
         data/scans/Scan_1988/Volumes/Half-scan-75um.vff \\
         --wandb-project my-ct-project --algorithm vendor_fdk
 
     # a volume this package produced (round-trips exactly), local plots only
-    python -m reconstruction.run_volume_report Scan_1988_recon.vff --no-wandb
+    ct120-volume-report Scan_1988_recon.vff --no-wandb
 
     # foreign volume: pin the geometry the header cannot carry
-    python -m reconstruction.run_volume_report recon.vff \\
+    ct120-volume-report recon.vff \\
         --voxel-xy 0.075 --voxel-z 0.075 --origin 2.71 -5.53 0.19
 """
 
@@ -74,9 +74,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m reconstruction.run_volume_report vol.vff --wandb-project my-project
-  python -m reconstruction.run_volume_report vol.vff --no-wandb
-  python -m reconstruction.run_volume_report vol.vff --voxel-xy 0.075 --voxel-z 0.075
+  ct120-volume-report vol.vff --wandb-project my-project
+  ct120-volume-report vol.vff --no-wandb
+  ct120-volume-report vol.vff --voxel-xy 0.075 --voxel-z 0.075
         """
     )
     parser.add_argument(
@@ -475,5 +475,10 @@ def main():
     print(f"\nReport finished in {(time.time() - start) / 60:.2f} minutes.")
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """Console-script entry point (``[project.scripts]`` in pyproject.toml)."""
     cli_main(main)
+
+
+if __name__ == '__main__':
+    cli()

@@ -12,9 +12,9 @@ ct_core.pipeline and are shared with the FDK driver — this script only owns
 backend/algorithm selection and the iterative-specific knobs.
 
 Usage:
-    python -m reconstruction.run_iterative_recon data/scans/Scan_1681
-    python -m reconstruction.run_iterative_recon data/scans/Scan_1681 --algorithm CGLS3D_CUDA --iterations 50
-    python -m reconstruction.run_iterative_recon data/scans/Scan_1681 --backend tigre --algorithm ossart --iterations 100
+    ct120-iterative data/scans/Scan_1681
+    ct120-iterative data/scans/Scan_1681 --algorithm CGLS3D_CUDA --iterations 50
+    ct120-iterative data/scans/Scan_1681 --backend tigre --algorithm ossart --iterations 100
 """
 
 import argparse
@@ -52,10 +52,10 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m reconstruction.run_iterative_recon data/scans/Scan_1681
-  python -m reconstruction.run_iterative_recon data/scans/Scan_1681 --algorithm CGLS3D_CUDA --iterations 50
-  python -m reconstruction.run_iterative_recon data/scans/Scan_1681 --backend tigre --algorithm ossart --iterations 100
-  python -m reconstruction.run_iterative_recon data/scans/Scan_1681 --backend tigre --algorithm ossart --iterations 150 --lmbda 0.3
+  ct120-iterative data/scans/Scan_1681
+  ct120-iterative data/scans/Scan_1681 --algorithm CGLS3D_CUDA --iterations 50
+  ct120-iterative data/scans/Scan_1681 --backend tigre --algorithm ossart --iterations 100
+  ct120-iterative data/scans/Scan_1681 --backend tigre --algorithm ossart --iterations 150 --lmbda 0.3
         """
     )
     add_common_args(parser)
@@ -581,5 +581,10 @@ def main():
     print(f"\nReconstruction finished in {(end - start)/60:.2f} minutes.")
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """Console-script entry point (``[project.scripts]`` in pyproject.toml)."""
     cli_main(main)
+
+
+if __name__ == '__main__':
+    cli()

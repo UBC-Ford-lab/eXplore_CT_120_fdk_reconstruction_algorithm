@@ -44,3 +44,9 @@ venv/
 
 # Claude
 .claude/
+
+# Analysis scratch
+analysis/
+
+# Tests (kept in the parent muNeRF repo)
+tests/

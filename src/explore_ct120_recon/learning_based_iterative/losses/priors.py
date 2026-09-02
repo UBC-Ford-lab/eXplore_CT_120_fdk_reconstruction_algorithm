@@ -716,7 +716,7 @@ def estimate_bone_anchors_hu(
     import numpy as np
     from scipy.ndimage import median_filter
 
-    from reconstruction.ct_core.hu_calibration import find_attenuation_anchors
+    from ...ct_core.hu_calibration import find_attenuation_anchors
 
     vol = np.asarray(
         reference_vol.detach().cpu().numpy()

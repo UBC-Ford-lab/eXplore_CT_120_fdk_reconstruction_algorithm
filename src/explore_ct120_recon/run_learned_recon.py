@@ -21,8 +21,8 @@ downsampling, detector-psi calibration, HU calibration + VFF export) live in
 ct_core.pipeline and are shared with the FDK / iterative drivers.
 
 Usage:
-    python -m reconstruction.run_learned_recon data/scans/Scan_1510
-    python -m reconstruction.run_learned_recon data/scans/Scan_1510 \\
+    ct120-learned data/scans/Scan_1510
+    ct120-learned data/scans/Scan_1510 \\
         --iterations 40000 --downsample 3 --lr 1e-4
 """
 
@@ -75,12 +75,12 @@ def _load_algorithm_modules(names) -> list:
     THIS IS WHAT MAKES AN OUT-OF-TREE MODEL A FIRST-CLASS ``--algorithm``.
     Registration happens as a side effect of importing the module that calls
     ``register_algorithm``, and a driver run as ``python -m
-    reconstruction.run_learned_recon`` imports only the submodule — so a
+    explore_ct120_recon.run_learned_recon`` imports only the submodule — so a
     representation defined anywhere else (muNeRF's ``inr_pipeline``, a
     scratch experiment, another repo entirely) is invisible to it until
     something says which module to import. That is the whole mechanism:
 
-        python -m reconstruction.run_learned_recon SCAN \
+        ct120-learned SCAN \
             --algorithm-module inr_pipeline.algorithms --algorithm parent_inr
 
     Deliberately a MODULE NAME and not a file path: the module has to be
@@ -340,11 +340,11 @@ Algorithms (--algorithm):
 """ + describe_algorithms() + """
 
 Examples:
-  python -m reconstruction.run_learned_recon data/scans/Scan_1510
-  python -m reconstruction.run_learned_recon data/scans/Scan_1510 --iterations 40000
-  python -m reconstruction.run_learned_recon data/scans/Scan_1510 --downsample 3 --no-crossval
-  python -m reconstruction.run_learned_recon data/scans/Scan_1510 --loss msssim
-  python -m reconstruction.run_learned_recon data/scans/Scan_1510 --loss huber
+  ct120-learned data/scans/Scan_1510
+  ct120-learned data/scans/Scan_1510 --iterations 40000
+  ct120-learned data/scans/Scan_1510 --downsample 3 --no-crossval
+  ct120-learned data/scans/Scan_1510 --loss msssim
+  ct120-learned data/scans/Scan_1510 --loss huber
 
 Data terms (--loss):
 """ + describe_data_terms() + """
@@ -950,5 +950,10 @@ def main(argv=None):
     print(f"\nReconstruction finished in {(end - start)/60:.2f} minutes.")
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """Console-script entry point (``[project.scripts]`` in pyproject.toml)."""
     cli_main(main)
+
+
+if __name__ == '__main__':
+    cli()

@@ -614,5 +614,10 @@ def main():
     print(f"\nFinished in {(time.time() - start) / 60:.2f} minutes.")
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """Console-script entry point (``[project.scripts]`` in pyproject.toml)."""
     cli_main(main)
+
+
+if __name__ == '__main__':
+    cli()

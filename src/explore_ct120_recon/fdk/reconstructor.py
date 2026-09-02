@@ -122,6 +122,18 @@ def _interpolate_metal_pixels(sinogram_chunk, mask):
     sinogram_chunk.copy_(torch.from_numpy(chunk_np))
 
 
+
+def _chunk_that_fits(available_bytes: float, bytes_per_item: float, n_items: int) -> int:
+    """How many of ``n_items`` fit in ``available_bytes`` — at least one, and
+    all of them when there is no device budget (``float('inf')``, the CPU
+    path). Kept separate because ``inf // x`` is NaN in Python and
+    ``int(NaN)`` raises, so every chunk-sizing site needs this same guard.
+    """
+    if available_bytes == float('inf') or bytes_per_item <= 0:
+        return max(1, n_items)
+    return max(1, min(int(available_bytes // bytes_per_item), n_items))
+
+
 class FDKReconstructor:
     def __init__(self, projections, angles, geometry, folder_name,
                  quantitative=False,
@@ -482,8 +494,8 @@ class FDKReconstructor:
         if do_preprocess:
             persistent += 2 * bytes_per_proj  # dark_gpu + I0_gpu
         peak_multiplier = 7 if do_preprocess else 6
-        chunk_size = int((budget - persistent) // (peak_multiplier * bytes_per_proj))
-        chunk_size = max(1, min(chunk_size, self.N_angles))
+        chunk_size = _chunk_that_fits(budget - persistent,
+                                      peak_multiplier * bytes_per_proj, self.N_angles)
 
         if budget == float('inf'):
             print(f"  GPU memory: CPU mode — no GPU constraint")
@@ -552,8 +564,8 @@ class FDKReconstructor:
             # Re-measure the GPU budget now the flat-field tensors are gone.
             budget = self._gpu_free_bytes()
             persistent = 2 * bytes_per_proj  # cone_weight + filter_kernel
-            chunk_size = int((budget - persistent) // (6 * bytes_per_proj))
-            chunk_size = max(1, min(chunk_size, self.N_angles))
+            chunk_size = _chunk_that_fits(budget - persistent, 6 * bytes_per_proj,
+                                          self.N_angles)
 
         # ---- Pass 2: cone-beam weighting + ramp filter + Parker ------------
         print(f"  Pass 2 (weighting + filtering): chunk_size={chunk_size}")
@@ -629,8 +641,7 @@ class FDKReconstructor:
             # Per z-slice peak: grid_buf(2) + b_3d with broadcast temps(3)
             #   + sampled(1) + chunk_contrib(1) + a_2d expand temp(1) = 8 floats/voxel
             z_per_slice = 8 * Nx * Ny * f32
-            z_chunk_size = int(remaining // z_per_slice) if z_per_slice > 0 else Nz
-            z_chunk_size = max(1, min(z_chunk_size, Nz))
+            z_chunk_size = _chunk_that_fits(remaining, z_per_slice, Nz)
 
             # Print sizing summary
             if budget == float('inf'):

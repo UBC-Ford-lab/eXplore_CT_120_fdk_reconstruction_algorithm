@@ -14,9 +14,9 @@ FDK-specific: the filter settings, Parker weighting, MAR, and the
 FDKReconstructor call.
 
 Usage:
-    python -m reconstruction.run_fdk_recon data/scans/Scan_1681
-    python -m reconstruction.run_fdk_recon data/scans/Scan_1681 --filter-type ramp --filter-cutoff 1.0
-    python -m reconstruction.run_fdk_recon data/scans/Scan_1681 --filter-type cosine --filter-cutoff 0.5
+    ct120-fdk data/scans/Scan_1681
+    ct120-fdk data/scans/Scan_1681 --filter-type ramp --filter-cutoff 1.0
+    ct120-fdk data/scans/Scan_1681 --filter-type cosine --filter-cutoff 0.5
 """
 
 import argparse
@@ -51,9 +51,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m reconstruction.run_fdk_recon data/scans/Scan_1681
-  python -m reconstruction.run_fdk_recon data/scans/Scan_1681 --filter-type ramp --filter-cutoff 1.0
-  python -m reconstruction.run_fdk_recon data/scans/Scan_1681 --filter-type cosine --filter-cutoff 0.5
+  ct120-fdk data/scans/Scan_1681
+  ct120-fdk data/scans/Scan_1681 --filter-type ramp --filter-cutoff 1.0
+  ct120-fdk data/scans/Scan_1681 --filter-type cosine --filter-cutoff 0.5
         """
     )
     add_common_args(parser)
@@ -294,5 +294,10 @@ def main():
     print(f"\nReconstruction finished in {(end - start)/60:.2f} minutes.")
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """Console-script entry point (``[project.scripts]`` in pyproject.toml)."""
     cli_main(main)
+
+
+if __name__ == '__main__':
+    cli()
