@@ -606,6 +606,13 @@ class ReconLogger:
             return
         try:
             import wandb
+            # `wandb.Image(Figure)` resolves `matplotlib.pyplot` by attribute
+            # at call time and this module never imports pyplot (it draws
+            # on `Figure` directly), so in a process where nothing else has
+            # imported it the table fails with an AttributeError. MEASURED on
+            # run hy9w8te3, whose LR schedule had no reducer: the reducer's
+            # path happened to import pyplot first, which hid this.
+            import matplotlib.pyplot  # noqa: F401
             self._stage_rows.append((dict(row), figs))
             columns = list(row) + ["axial", "coronal", "sagittal"]
             data = [[*r.values(), *(wandb.Image(f[n]) for n in

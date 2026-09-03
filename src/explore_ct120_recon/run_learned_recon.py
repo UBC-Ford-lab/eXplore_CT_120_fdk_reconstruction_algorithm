@@ -454,6 +454,17 @@ terms draw complete detector rows, and the structural terms draw 2-D patches
     parser.add_argument('--lr-warmup-iters', type=int, default=500,
                         help='Linear LR warmup steps before cosine decay '
                              '(default: 500)')
+    parser.add_argument('--lr-hold-fraction', type=float, default=0.0,
+                        metavar='F',
+                        help='fraction of the post-warmup run held at the '
+                             'full rate before the cosine decay starts '
+                             '(default: 0 = decay from the first step). Only '
+                             'the open-loop schedule honours it; a plateau '
+                             'reducer owns the rate instead.')
+    parser.add_argument('--lr-floor', type=float, default=0.0, metavar='F',
+                        help='multiplier on the base LR the cosine decays TO '
+                             '(default: 0). With --lr-hold-fraction this is a '
+                             'late, floored anneal instead of a decay to zero.')
     parser.add_argument(
         '--subpixel-rays', action=argparse.BooleanOptionalAction, default=True,
         help='(default: on) Place each training ray uniformly inside its '
@@ -757,6 +768,8 @@ def main(argv=None):
         'stop_min_gain': args.stop_min_gain,
         'stop_min_delta': args.stop_min_delta,
         'lr_warmup_iters': args.lr_warmup_iters,
+        'lr_hold_fraction': args.lr_hold_fraction,
+        'lr_floor': args.lr_floor,
         'samples_per_ray': args.samples_per_ray,
         'samples_per_ray_mode': 'pinned' if args.samples_per_ray else 'auto',
         'subpixel_rays': args.subpixel_rays,
@@ -834,6 +847,8 @@ def main(argv=None):
         samples_per_ray=args.samples_per_ray,
         subpixel_rays=args.subpixel_rays,
         lr_warmup_iters=args.lr_warmup_iters,
+        lr_hold_fraction=args.lr_hold_fraction,
+        lr_floor=args.lr_floor,
         gpu_index=args.gpu_index,
         seed=args.seed,
         compile_mode=args.compile_mode,

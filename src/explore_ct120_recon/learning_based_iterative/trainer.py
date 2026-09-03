@@ -115,6 +115,8 @@ class LearnedReconstructor:
                  samples_per_ray: int | None = None,
                  subpixel_rays: bool = True,
                  lr_warmup_iters: int = 500,
+                 lr_hold_fraction: float = 0.0,
+                 lr_floor: float = 0.0,
                  gpu_index: int = 0,
                  seed: int = 0,
                  compile_mode: str = "on",
@@ -179,6 +181,11 @@ class LearnedReconstructor:
         #: Scan_1988). See ray_sampler.sample_random_rays.
         self.subpixel_rays = bool(subpixel_rays)
         self.lr_warmup_iters = int(lr_warmup_iters)
+        #: Shape of the open-loop cosine (see `training.lr_multiplier`):
+        #: fraction of the post-warmup run held at the full rate, and the
+        #: multiplier the decay ends on. Defaults are the plain cosine.
+        self.lr_hold_fraction = float(lr_hold_fraction)
+        self.lr_floor = float(lr_floor)
         self.gpu_index = int(gpu_index)
         self.seed = int(seed)
         # torch.compile fusion of the RENDERER's elementwise kernels. ON by
@@ -845,7 +852,8 @@ class LearnedReconstructor:
         # Warmup + cosine unless the caller owns the schedule. One
         # implementation, in .training, shared with every caller.
         _schedule = self._lr_schedule_fn or lr_multiplier(
-            "cosine", warmup=self.lr_warmup_iters, total=self.iterations)
+            "cosine", warmup=self.lr_warmup_iters, total=self.iterations,
+            hold=self.lr_hold_fraction, floor=self.lr_floor)
 
         # Per-group LRs are RELATIVE to `self.lr`: the schedule scales each
         # group by the same factor, so a hash grid at 10x the MLP's rate stays

@@ -146,7 +146,8 @@ LR_SCHEDULES = ("constant", "cosine", "exponential")
 
 
 def lr_multiplier(schedule: str = "cosine", *, warmup: int = 0,
-                  total: int = 1, gamma: float = 0.999, offset: int = 0):
+                  total: int = 1, gamma: float = 0.999, offset: int = 0,
+                  hold: float = 0.0, floor: float = 0.0):
     """`(iteration) -> multiplier` on each param group's OWN base LR.
 
     A multiplier, not a `torch.optim.lr_scheduler`, for two reasons that both
@@ -162,12 +163,28 @@ def lr_multiplier(schedule: str = "cosine", *, warmup: int = 0,
     Linear ramp from ~0 over `warmup` iterations, then `schedule` over the
     remaining ``total - warmup``. `offset` shifts the whole thing, for a staged
     run whose second phase starts partway through and wants its own ramp.
+
+    ``hold`` (cosine only) is the fraction of the post-warmup run spent at
+    the full rate before the decay begins, and ``floor`` the multiplier the
+    decay ends on. Both default to the plain cosine (decay from the first
+    post-warmup step, to zero). MEASURED on the Gaussian backend (run
+    ufsqlhpn): the held-out fit was still improving at 80 % of the run,
+    where the plain cosine had already cut the rate tenfold, and the last
+    15 % of the iterations bought nothing. A late, floored anneal keeps the
+    rate where the progress is being made.
     """
     if schedule not in LR_SCHEDULES:
         raise ValueError(f"lr schedule must be one of {list(LR_SCHEDULES)}, "
                          f"got {schedule!r}")
     warmup, offset = int(warmup), int(offset)
     main = max(1, int(total) - warmup)
+    hold, floor = float(hold), float(floor)
+    if not 0.0 <= hold < 1.0:
+        raise ValueError(f"lr hold fraction must be in [0, 1), got {hold}")
+    if not 0.0 <= floor <= 1.0:
+        raise ValueError(f"lr floor must be in [0, 1], got {floor}")
+    held = int(round(hold * main))
+    decay = max(1, main - held)
 
     def multiplier(iteration: int) -> float:
         k = int(iteration) - offset
@@ -175,7 +192,8 @@ def lr_multiplier(schedule: str = "cosine", *, warmup: int = 0,
             # Floored rather than exactly 0 so a logged LR is never a bare zero.
             return max(1e-8, (k + 1) / warmup)
         if schedule == "cosine":
-            return 0.5 * (1.0 + math.cos(math.pi * min(1.0, (k - warmup) / main)))
+            frac = min(1.0, max(0.0, (k - warmup - held) / decay))
+            return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * frac))
         if schedule == "exponential":
             return float(gamma) ** max(0, k - warmup)
         return 1.0
